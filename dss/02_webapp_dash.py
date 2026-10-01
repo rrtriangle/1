@@ -175,11 +175,13 @@ COMPONENTS = [
 ]
 COMP_LABEL = {c[0]: c[1] for c in COMPONENTS}
 
-ORGFOCUS = [("red", "실행·운영(기술)"), ("green", "영업·소통(마케팅)"),
-            ("yellow", "관리·재무(행정)"), ("blue", "전략·기획(설계)")]
-JOBINT = [("artistic", "예술"), ("clerical", "사무"), ("literary", "문학·언어"), ("mechanical", "기계"),
-          ("musical", "음악"), ("numerical", "수리"), ("outdoor", "야외"), ("persuasive", "설득"),
-          ("scientific", "과학"), ("social_service", "사회봉사")]
+# 버크만 조직지향점 4개 영역 (레포트 표기에 맞게 수정 가능)
+ORGFOCUS = [("red", "운영/기술"), ("green", "영업/마케팅"),
+            ("yellow", "관리/회계"), ("blue", "디자인/전략")]
+# 직업 흥미 10개 영역 (버크만 코리아 레포트 표기)
+JOBINT = [("numerical", "숫자"), ("clerical", "관리"), ("scientific", "과학"), ("literary", "문학"),
+          ("mechanical", "기술"), ("musical", "음악"), ("artistic", "예술"), ("outdoor", "야외"),
+          ("persuasive", "설득"), ("social_service", "사회복지")]
 
 # =============================================================================
 # 3. 데이터 로딩
@@ -227,7 +229,7 @@ def load_data(force=False):
             org = _norm_org(_read(ORG_DATASET))
             sc = _read(SCORES_DATASET)
             for c in sc.columns:
-                if c.startswith(("map_", "orgfocus_", "comp_", "jobint_")) and not c.endswith("_color"):
+                if c.startswith(("map_", "orgfocus_", "comp_", "jobint_")) and not c.endswith(("_color", "_bullets")):
                     sc[c] = pd.to_numeric(sc[c], errors="coerce")
             for c in ("emp_id", "email", "name"):
                 if c in sc.columns:
@@ -1156,8 +1158,14 @@ def on_person(email, scope, token):
     for l in LAYERS:
         c = color_of(r, l)
         txt = COLOR_INFO[c][l] if c else ""
-        layer_rows.append(html.Div([html.B(LAYER_INFO[l]["ko"] + "  "), chip(c), html.Span(txt, style={"fontSize": "14px"})],
-                                   style={"marginBottom": "10px", "lineHeight": "1.6"}))
+        bullets = r.get("map_%s_bullets" % l)
+        items = [b for b in str(bullets).split("\n") if b.strip()] if isinstance(bullets, str) else []
+        row = [html.B(LAYER_INFO[l]["ko"] + "  "), chip(c), html.Span(txt, style={"fontSize": "14px"})]
+        if items:
+            row.append(html.Div("레포트: " + " · ".join(items[:8]),
+                                style={"fontSize": "13px", "color": "#44505E", "background": "#F3F5F8",
+                                       "borderRadius": "6px", "padding": "4px 8px", "marginTop": "3px"}))
+        layer_rows.append(html.Div(row, style={"marginBottom": "10px", "lineHeight": "1.6"}))
     tips = []
     nc = color_of(r, "needs")
     if nc:
@@ -1173,7 +1181,13 @@ def on_person(email, scope, token):
     if sc:
         tips.append(html.Li("스트레스 신호: " + COLOR_INFO[sc]["stress"] + " 이런 모습이 보이면 위의 욕구가 채워지고 있는지 먼저 점검해 주세요.",
                             style={"color": "#8A4B08"}))
-    blocks = [
+    warn = []
+    for col, label in (("map_confidence", "버크만 맵"), ("orgfocus_confidence", "조직지향점")):
+        v = _num(r.get(col))
+        if v is not None and v < 0.8:
+            warn.append("%s는 PDF 그림에서 자동 인식한 값입니다(신뢰도 %.2f). 원 레포트와 다르면 수기 보정해 주세요." % (label, v))
+    blocks = [html.Div(w, style={"background": "#FFF6E0", "border": "1px solid #F0D58C", "borderRadius": "8px",
+                                 "padding": "8px 12px", "marginBottom": "10px", "fontSize": "13px"}) for w in warn] + [
         html.Div(style={"display": "flex", "gap": "14px", "flexWrap": "wrap"}, children=[
             html.Div(card([graph(person_map_figure(r))], "%s 님의 버크만 맵" % r["name"],
                           " · ".join([x for x in (r["team"], r["part"], r["role"], rtype + " 진단") if x])), style={"flex": "1", "minWidth": "320px"}),

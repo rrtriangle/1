@@ -17,6 +17,7 @@ from __future__ import print_function
 
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -41,6 +42,11 @@ NAME_FROM_FILENAME = r"([가-힣]{2,4})"
 MAP_SCALE = "auto"
 # 원본 y축이 위로 갈수록 값이 작아지는(화면 좌표) 형식이면 True
 MAP_Y_INVERTED = False
+# 원점(0,0)이 맵 중앙인 좌표(음수 포함, 예: x=0.835, y=-2.157)일 때 중앙에서 끝까지의 거리.
+# "auto" 이면 max(4, 전체 데이터의 최대 |좌표| 올림) 을 사용합니다.
+MAP_CENTER_HALF_RANGE = "auto"
+# 자동 인식 신뢰도(confidence)가 이 값보다 낮으면 parse_note 에 표시
+CONFIDENCE_WARN = 0.8
 
 # JSON 키 경로를 직접 지정하고 싶을 때 사용 (자동 인식보다 우선).
 # 경로는 parse_log 의 json_keys 컬럼에 나오는 표기를 그대로 사용하세요.  예)
@@ -86,7 +92,8 @@ COMPONENTS = [
 COMP_USUAL = ["usual", "평소", "평상시", "일상"]
 COMP_NEEDS = ["need", "needs", "욕구", "니즈"]
 
-ORG_FOCUS_MARK = ["organizationalfocus", "organizational", "orgfocus", "organization", "조직지향", "조직"]
+ORG_FOCUS_MARK = ["organizationalfocus", "organizational", "orgfocus", "orgorientation", "orientation",
+                  "organization", "조직지향", "조직"]
 ORG_FOCUS = {
     "red": ["operation", "technical", "technology", "implement", "실행", "운영", "기술"] + COLORS["red"],
     "green": ["sales", "marketing", "communicat", "영업", "마케팅", "소통"] + COLORS["green"],
@@ -97,15 +104,15 @@ ORG_FOCUS = {
 # 직업 흥미 10개 영역 (부수 정보)
 JOB_INTERESTS = [
     ("artistic", ["artistic", "예술"]),
-    ("clerical", ["clerical", "사무"]),
+    ("clerical", ["clerical", "사무", "관리"]),
     ("literary", ["literary", "문학", "언어"]),
-    ("mechanical", ["mechanical", "기계"]),
+    ("mechanical", ["mechanical", "기계", "기술"]),
     ("musical", ["musical", "음악"]),
     ("numerical", ["numerical", "수리", "숫자"]),
     ("outdoor", ["outdoor", "야외"]),
     ("persuasive", ["persuasive", "설득"]),
     ("scientific", ["scientific", "과학"]),
-    ("social_service", ["socialservice", "사회봉사", "봉사"]),
+    ("social_service", ["socialservice", "사회봉사", "사회복지", "봉사", "복지"]),
 ]
 
 NAME_KEYS = ["name", "fullname", "이름", "성명", "participantname", "username"]
@@ -114,16 +121,16 @@ EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
 def output_columns():
-    cols = ["emp_id", "name", "email", "report_type", "source_file"]
+    cols = ["emp_id", "name", "email", "report_type", "org_path", "source_file"]
     for layer in MAP_LAYERS:
-        cols += ["map_%s_x" % layer, "map_%s_y" % layer, "map_%s_color" % layer]
+        cols += ["map_%s_x" % layer, "map_%s_y" % layer, "map_%s_color" % layer, "map_%s_bullets" % layer]
     for c in COLORS:
         cols.append("orgfocus_%s" % c)
     for key, _ in COMPONENTS:
         cols += ["comp_%s_usual" % key, "comp_%s_needs" % key]
     for key, _ in JOB_INTERESTS:
         cols.append("jobint_%s" % key)
-    cols += ["parse_status", "parse_note"]
+    cols += ["map_confidence", "orgfocus_confidence", "parse_status", "parse_note"]
     return cols
 
 
@@ -225,6 +232,26 @@ def find_value(flat, must_groups, exclude=None, want="number", prefer=None):
     return cands[0][2], cands[0][1]
 
 
+def extract_bullets(text, limit=12):
+    """레포트 문장에서 '• 항목' 들만 뽑아 중복 제거 (줄바꿈으로 끊긴 항목은 이어붙임)"""
+    body = re.split(r"\n\s*외향\s*\n|--- page", text)[0]
+    items = []
+    for chunk in body.split("•")[1:]:
+        lines = [l.strip() for l in chunk.strip().split("\n")]
+        item = lines[0]
+        for l in lines[1:]:
+            # 다음 줄이 짧은 꼬리(예: "함")면 이어붙임, 아니면 설명문 시작으로 보고 중단
+            if l and len(l) <= 8:
+                # 한 글자(예: "원\n함")는 단어가 잘린 것 -> 붙이고, 그 외(예: "보내도록\n해줄 때")는 띄어서 연결
+                item += l if len(l) == 1 else " " + l
+            else:
+                break
+        item = re.sub(r"\s+", " ", item).strip(" .")
+        if item and item not in items and len(item) <= 60:
+            items.append(item)
+    return items[:limit]
+
+
 def lookup_path(flat, dotted):
     target = norm(dotted)
     for path, val in flat:
@@ -301,8 +328,50 @@ def parse_json_record(data):
         if "email" not in rec and isinstance(val, str) and EMAIL_RE.fullmatch(val.strip()):
             rec["email"] = val.strip().lower()
 
-    # --- 레포트 종류
-    blob = json.dumps(data, ensure_ascii=False).lower()
+    # --- 레포트 원문 문장(• 항목) : 개인별 화면에서 "레포트 원문" 으로 보여줌
+    for layer, aliases in MAP_LAYERS.items():
+        excl = [a for ol, oa in MAP_LAYERS.items() if ol != layer for a in oa]
+        texts = []
+        for path, val in flat:
+            if not isinstance(val, str) or len(val) < 30 or "•" not in val:
+                continue
+            tokens = set(norm(x) for x in path)
+            joined = norm("".join(path))
+            if any_hit(tokens, joined, aliases) and not any_hit(tokens, joined, excl):
+                texts.append(val)
+        if texts:
+            rec["map_%s_bullets" % layer] = "\n".join(extract_bullets(max(texts, key=len)))
+
+    # --- 자동 인식 신뢰도
+    confs = {"map": [], "org": []}
+    for path, val in flat:
+        tokens = set(norm(x) for x in path)
+        joined = norm("".join(path))
+        if not any_hit(tokens, joined, ["confidence", "신뢰도"]) or to_number(val) is None:
+            continue
+        if any_hit(tokens, joined, ORG_FOCUS_MARK):
+            confs["org"].append(to_number(val))
+        elif any(any_hit(tokens, joined, a) for a in MAP_LAYERS.values()):
+            confs["map"].append(to_number(val))
+    if confs["map"]:
+        rec["map_confidence"] = min(confs["map"])
+    if confs["org"]:
+        rec["orgfocus_confidence"] = min(confs["org"])
+
+    # --- 조직 경로 (예: ["경영지원센터", "인사팀"])
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if norm(k) in ("orgpath", "조직경로", "소속") and isinstance(v, list):
+                rec["org_path"] = " > ".join(str(x) for x in v)
+
+    # --- 레포트 종류: report_type 같은 명시적 키 우선, 없으면 전체 텍스트에서 추정
+    explicit = None
+    for path, val in flat:
+        if len(path) <= 2 and isinstance(val, str) and norm(path[-1]) in (
+                "reporttype", "report", "type", "진단종류", "리포트종류", "레포트종류", "버전", "version"):
+            explicit = val.lower()
+            break
+    blob = explicit if explicit else json.dumps(data, ensure_ascii=False).lower()
     if "signature" in blob or "시그니처" in blob:
         rec["report_type"] = "signature"
     elif "basic" in blob or "베이직" in blob:
@@ -425,9 +494,20 @@ def finalize(df):
     for c in xy:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     if MAP_SCALE == "auto":
-        # 파일마다 형식이 다를 수 있어 사람(행) 단위로 판단: 좌표가 모두 1 이하이면 0~1 스케일로 보고 x100
+        # 파일마다 형식이 다를 수 있어 사람(행) 단위로 판단
+        #  - 음수가 있으면 '중앙=0' 좌표 -> 50 + v / 반경 * 50
+        #  - 모두 0~1 이면 x100
+        centered = (df[xy] < 0).any(axis=1)
+        if centered.any():
+            if MAP_CENTER_HALF_RANGE == "auto":
+                half = max(4.0, math.ceil(df.loc[centered, xy].abs().max().max()))
+            else:
+                half = float(MAP_CENTER_HALF_RANGE)
+            print("[INFO] 중앙 원점 좌표 %d명 -> 반경 %.1f 기준으로 0~100 변환" % (centered.sum(), half))
+            df.loc[centered, xy] = 50 + df.loc[centered, xy] / half * 50
         row_max = df[xy].max(axis=1)
         factor = row_max.map(lambda m: 100.0 if (pd.notna(m) and m <= 1.0) else 1.0)
+        factor[centered] = 1.0
         df[xy] = df[xy].mul(factor, axis=0)
     else:
         df[xy] = df[xy] * float(MAP_SCALE)
@@ -453,7 +533,20 @@ def finalize(df):
     df.loc[df["report_type"].isna() & has_comp, "report_type"] = "signature"
     df.loc[df["report_type"].isna(), "report_type"] = "basic"
 
-    for c in ["emp_id", "name", "email", "report_type", "source_file", "parse_status", "parse_note"]:
+    for c in ("map_confidence", "orgfocus_confidence"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    low = []
+    for _, r in df.iterrows():
+        n = []
+        if pd.notna(r["map_confidence"]) and r["map_confidence"] < CONFIDENCE_WARN:
+            n.append("맵 인식 신뢰도 %.2f" % r["map_confidence"])
+        if pd.notna(r["orgfocus_confidence"]) and r["orgfocus_confidence"] < CONFIDENCE_WARN:
+            n.append("조직지향점 인식 신뢰도 %.2f" % r["orgfocus_confidence"])
+        low.append(" / ".join(n))
+    df["parse_note"] = [(" / ".join(x for x in (str(a) if pd.notna(a) else "", b) if x)) for a, b in zip(df["parse_note"], low)]
+
+    for c in ["emp_id", "name", "email", "report_type", "org_path", "source_file", "parse_status", "parse_note"] + \
+            ["map_%s_bullets" % l for l in MAP_LAYERS]:
         df[c] = df[c].astype(object).where(df[c].notna(), None)
         df[c] = df[c].map(lambda v: None if v is None else str(v))
     return df

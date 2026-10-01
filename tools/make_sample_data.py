@@ -90,6 +90,38 @@ def shape_b(emp_id, name, email, p, signature):
     return d
 
 
+KO_COLOR = {"red": "빨강", "green": "초록", "yellow": "노랑", "blue": "파랑"}
+KO_JOB = ["숫자", "관리", "과학", "문학", "기술", "음악", "예술", "야외", "설득", "사회복지"]
+
+
+def quad(x, y):
+    return ("red" if x < 50 else "green") if y >= 50 else ("yellow" if x < 50 else "blue")
+
+
+def shape_c(emp_id, name, email, p, signature):
+    """실제 사내 추출 JSON 과 같은 구조 (map_symbols 중앙 원점 좌표, org_orientation, map_texts)"""
+    def sym(layer, xy):
+        return {"type": layer, "x": round((xy[0] - 50) / 50 * 4, 3), "y": round((xy[1] - 50) / 50 * 4, 3),
+                "quadrant": KO_COLOR[quad(*xy)], "confidence": 0.99}
+    xy = {"interest": p["interest"], "usual": p["usual"], "needs": p["needs"], "stress": p["needs"]}
+    texts = {}
+    for layer, v in xy.items():
+        c = KO_COLOR[quad(*v)]
+        texts[layer] = {"raw": "설명 문장입니다. 사분면에서 %s에 위치합니다.\n표시된 위치에 따르면:\n"
+                               "• 예시 항목 하나\n• 예시 항목 둘이 줄바꿈으로\n이어짐\n• 예시 항목 셋\n외향\n사람지향\n내향\n과제지향" % c,
+                        "color": c}
+    org = dict(zip(["빨강", "초록", "노랑", "파랑"], p["org"]))
+    return {
+        "employee_id": emp_id, "name": name, "file_name": "%s_%s.pdf" % (emp_id, name),
+        "report_type": "시그니처" if signature else "베이직",
+        "map_texts": texts,
+        "interests": [{"name": n, "score": sc} for n, sc in zip(KO_JOB, p["job"])],
+        "org_path": ["테스트센터", "테스트팀"],
+        "map_symbols": {k: sym(k, v) for k, v in xy.items()},
+        "org_orientation": {"scores": org, "top_color": max(org, key=org.get), "confidence": 0.78},
+    }
+
+
 def main(base):
     rep = os.path.join(base, "reports")
     out = os.path.join(base, "out")
@@ -122,8 +154,8 @@ def main(base):
                 continue  # 미진단자
             p = make_person(n, biases[team])
             signature = (n % 5 == 0) or role == "팀장"
-            data = (shape_a if n % 2 else shape_b)(emp_id, name, email, p, signature)
-            if n % 2 == 0:
+            data = (shape_c if n % 3 == 0 else shape_a if n % 2 else shape_b)(emp_id, name, email, p, signature)
+            if n % 2 == 0 and n % 3 != 0:
                 data.pop("사번", None)  # 파일명에서 사번 읽기 테스트
             with open(os.path.join(rep, "%s_%s.json" % (emp_id, name)), "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
