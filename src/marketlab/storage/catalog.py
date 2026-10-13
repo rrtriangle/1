@@ -162,12 +162,33 @@ CREATE TABLE IF NOT EXISTS source_checks (
 """
 
 
+def _process_tmp(s: Settings):
+    """프로세스별 DuckDB 임시 폴더 (여러 프로세스가 동시에 디스크로 넘길 때 파일 이름 충돌 방지).
+    종료된 프로세스의 폴더는 정리한다."""
+    import os
+    import shutil
+
+    base = s.paths.tmp / "duckdb"
+    base.mkdir(parents=True, exist_ok=True)
+    mine = base / f"pid-{os.getpid()}"
+    if not mine.exists():
+        for d in base.glob("pid-*"):
+            try:
+                pid = int(d.name[4:])
+                os.kill(pid, 0)
+            except (ValueError, ProcessLookupError):
+                shutil.rmtree(d, ignore_errors=True)
+            except PermissionError:
+                pass
+        mine.mkdir(parents=True, exist_ok=True)
+    return mine
+
+
 def configure_connection(con: duckdb.DuckDBPyConnection, settings: Settings | None = None) -> None:
     """초기 안전 설정. 8GB RAM 맥북 기준."""
     s = settings or get_settings()
     d = s.get("duckdb", {}) or {}
-    tmp = s.paths.tmp / "duckdb"
-    tmp.mkdir(parents=True, exist_ok=True)
+    tmp = _process_tmp(s)
     con.execute(f"SET memory_limit='{d.get('memory_limit', '2GB')}'")
     con.execute(f"SET threads={int(d.get('threads', 2))}")
     con.execute(f"SET preserve_insertion_order={'true' if d.get('preserve_insertion_order') else 'false'}")

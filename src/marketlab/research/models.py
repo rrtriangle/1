@@ -58,7 +58,7 @@ class Model:
             from sklearn.preprocessing import StandardScaler
             core = {"linear": LinearRegression(), "ridge": Ridge(alpha=self.params.get("alpha", 10.0)),
                     "logistic": LogisticRegression(C=self.params.get("C", 0.1), max_iter=500)}[a]
-            self.est = make_pipeline(SimpleImputer(strategy="median"), StandardScaler(), core)
+            self.est = make_pipeline(SimpleImputer(strategy="median", keep_empty_features=True), StandardScaler(), core)
             Xc = X[self.features].clip(-1e6, 1e6)
             self.est.fit(Xc, y)
             self.backend = "sklearn"
@@ -68,7 +68,7 @@ class Model:
             from sklearn.ensemble import RandomForestRegressor
             from sklearn.impute import SimpleImputer
             from sklearn.pipeline import make_pipeline
-            self.est = make_pipeline(SimpleImputer(strategy="median"), RandomForestRegressor(
+            self.est = make_pipeline(SimpleImputer(strategy="median", keep_empty_features=True), RandomForestRegressor(
                 n_estimators=self.params.get("n_estimators", 150), max_depth=self.params.get("max_depth", 8),
                 min_samples_leaf=self.params.get("min_samples_leaf", 200), max_samples=min(0.3, 300_000 / max(1, len(X))),
                 n_jobs=threads(), random_state=seed))
