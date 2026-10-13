@@ -92,6 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     rs.add_argument("--model-id")
     rs.add_argument("--exp-ids", nargs="*")
     rs.add_argument("--force-test", action="store_true", help="최종 검증 재실행 (독립성 훼손으로 기록됨)")
+    rs.add_argument("--all", action="store_true", help="(features) 모든 연도 특징을 다시 생성")
     rs.add_argument("--winsorize", action="store_true", help="수익률 라벨 극단값을 학습구간 1%/99% 분위수로 제한해 학습")
     args = p.parse_args(argv)
 
@@ -199,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
 def _research(a) -> int:
     from ..research import analysis, experiments, features, monitor, runner
     if a.action == "features":
-        yrs = a.years or features.stale_years(a.market)
+        yrs = features.available_years(a.market) if a.all else (a.years or features.stale_years(a.market))
         _print(features.build(a.market, yrs) if yrs else "특징 파일이 최신입니다 (재생성 대상 연도 없음)")
     elif a.action == "train":
         for r in experiments.train_eval(a.market, a.horizon, a.task, a.algos, winsorize=(0.01, 0.99) if a.winsorize else None):

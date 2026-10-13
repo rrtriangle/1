@@ -56,6 +56,11 @@ for _k in (5, 20, 60):
 META = ["security_id", "market", "trade_date", "close", "open_next", "amount_20", "market_cap", "security_type",
         "eligible", "entry_ok", "quality_grade"]
 
+# 특징 계산 정의 버전 — 계산식이 바뀌면 올린다. manifest 의 버전과 다르면 stale_years() 가 모든 연도를 재생성 대상으로 돌려준다.
+# 2: 이동평균 계열 기준점(li_anchor) 버그 수정 (ma_gap_*, ma_x_y, macd, macd_signal, bb_pctb_20, bb_width_20)
+#    + macd_signal 을 연도 필터 전에 계산 (각 연도 첫 8거래일이 9일 미만으로 평균되던 문제)
+FEATURE_VERSION = 2
+
 DECISION = {"KR": ("Asia/Seoul", "15:30", 180), "US": ("America/New_York", "16:00", 240)}
 
 
@@ -237,6 +242,11 @@ def _chunk(con, market: str, year: int, start: date, end: date, where: str, last
                e.mkt_ret_1, ln(1 + coalesce(e.mkt_ret_1, 0)) AS mlr
         FROM d1 LEFT JOIN env2 e ON e.d = d1.trade_date
     """)
+    # 이동평균 계열은 exp(li) 를 그대로 평균한다(기준점 없음 → 창 안 모든 값이 같은 기준). li 는 구간 시작(year-2)에서
+    # 0 근처로 시작하는 누적 로그수익률이라 넘침 위험이 작지만, 원천 오류로 극단값이 생기면 계산을 멈춘다.
+    max_li = con.execute("SELECT max(abs(li)) FROM d2").fetchone()[0] or 0.0
+    if max_li > 600:
+        raise ValueError(f"누적 로그수익률 |li|={max_li:.0f} — exp 넘침 위험 (원천 가격 오류 의심). quality 점검 후 재시도")
     W = "PARTITION BY security_id ORDER BY trade_date"
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE f1 AS
@@ -247,14 +257,14 @@ def _chunk(con, market: str, year: int, start: date, end: date, where: str, last
             exp(li - lag(li, 20) OVER ({W})) - 1 AS ret_20,
             exp(li - lag(li, 60) OVER ({W})) - 1 AS ret_60,
             exp(li - lag(li, 120) OVER ({W})) - 1 AS ret_120,
-            exp(li - ln(avg(exp(li - li_anchor)) OVER w5) - li_anchor) - 1 AS ma_gap_5,
-            exp(li - ln(avg(exp(li - li_anchor)) OVER w20) - li_anchor) - 1 AS ma_gap_20,
-            exp(li - ln(avg(exp(li - li_anchor)) OVER w60) - li_anchor) - 1 AS ma_gap_60,
-            exp(li - ln(avg(exp(li - li_anchor)) OVER w120) - li_anchor) - 1 AS ma_gap_120,
-            avg(exp(li - li_anchor)) OVER w5 / nullif(avg(exp(li - li_anchor)) OVER w20, 0) - 1 AS ma_5_20,
-            avg(exp(li - li_anchor)) OVER w20 / nullif(avg(exp(li - li_anchor)) OVER w60, 0) - 1 AS ma_20_60,
-            avg(exp(li - li_anchor)) OVER w60 / nullif(avg(exp(li - li_anchor)) OVER w120, 0) - 1 AS ma_60_120,
-            (avg(exp(li - li_anchor)) OVER w12 - avg(exp(li - li_anchor)) OVER w26) / nullif(exp(li - li_anchor), 0) AS macd,
+            exp(li) / nullif(avg(exp(li)) OVER w5, 0) - 1 AS ma_gap_5,
+            exp(li) / nullif(avg(exp(li)) OVER w20, 0) - 1 AS ma_gap_20,
+            exp(li) / nullif(avg(exp(li)) OVER w60, 0) - 1 AS ma_gap_60,
+            exp(li) / nullif(avg(exp(li)) OVER w120, 0) - 1 AS ma_gap_120,
+            avg(exp(li)) OVER w5 / nullif(avg(exp(li)) OVER w20, 0) - 1 AS ma_5_20,
+            avg(exp(li)) OVER w20 / nullif(avg(exp(li)) OVER w60, 0) - 1 AS ma_20_60,
+            avg(exp(li)) OVER w60 / nullif(avg(exp(li)) OVER w120, 0) - 1 AS ma_60_120,
+            (avg(exp(li)) OVER w12 - avg(exp(li)) OVER w26) / nullif(exp(li), 0) AS macd,
             exp(li - max(li) OVER w252) - 1 AS pos_high_252,
             exp(li - min(li) OVER w252) - 1 AS pos_low_252,
             CASE WHEN li >= max(li) OVER w252 - 1e-9 AND count(*) OVER w252 >= 120 THEN 1 ELSE 0 END AS new_high_252,
@@ -284,11 +294,11 @@ def _chunk(con, market: str, year: int, start: date, end: date, where: str, last
             avg(lr) OVER w60 / nullif(stddev_samp(lr) OVER w60, 0) * sqrt(252) AS sharpe_60,
             ln(nullif(market_cap, 0)) AS log_mcap,
             100 - 100 / (1 + sum(greatest(lr, 0)) OVER w14 / nullif(sum(greatest(-lr, 0)) OVER w14, 0)) AS rsi_14,
-            (exp(li - li_anchor) - avg(exp(li - li_anchor)) OVER w20) / nullif(2 * stddev_samp(exp(li - li_anchor)) OVER w20, 0) AS bb_pctb_20,
-            4 * stddev_samp(exp(li - li_anchor)) OVER w20 / nullif(avg(exp(li - li_anchor)) OVER w20, 0) AS bb_width_20,
+            (exp(li) - avg(exp(li)) OVER w20) / nullif(2 * stddev_samp(exp(li)) OVER w20, 0) AS bb_pctb_20,
+            4 * stddev_samp(exp(li)) OVER w20 / nullif(avg(exp(li)) OVER w20, 0) AS bb_width_20,
             abs(li - lag(li, 14) OVER ({W})) / nullif(sum(abs(lr)) OVER w14, 0) AS er_14,
             count(*) OVER w252 AS hist_n
-        FROM (SELECT *, first_value(li) OVER ({W} ROWS BETWEEN 260 PRECEDING AND CURRENT ROW) AS li_anchor FROM d2)
+        FROM d2
         WINDOW w5 AS ({W} ROWS 4 PRECEDING), w12 AS ({W} ROWS 11 PRECEDING), w14 AS ({W} ROWS 13 PRECEDING),
                w20 AS ({W} ROWS 19 PRECEDING), w26 AS ({W} ROWS 25 PRECEDING), w60 AS ({W} ROWS 59 PRECEDING),
                w120 AS ({W} ROWS 119 PRECEDING), w252 AS ({W} ROWS 251 PRECEDING)
@@ -322,7 +332,7 @@ def _chunk(con, market: str, year: int, start: date, end: date, where: str, last
         SELECT f.security_id, f.market, f.trade_date, f.close, l.open_next, f.amount_20, f.market_cap,
                s.security_type, f.quality_grade, coalesce(l.entry_ok, false) AS entry_ok, f.hist_n,
                {sel_f},
-               CAST(avg(f.macd) OVER (PARTITION BY f.security_id ORDER BY f.trade_date ROWS 8 PRECEDING) AS FLOAT) AS macd_signal,
+               CAST(f.macd_signal AS FLOAT) AS macd_signal,
                CAST(e.mkt_ret_20 AS FLOAT) mkt_ret_20, CAST(e.mkt_ret_60 AS FLOAT) mkt_ret_60,
                CAST(e.mkt_ma200_gap AS FLOAT) mkt_ma200_gap, CAST(e.mkt_rv_20 AS FLOAT) mkt_rv_20,
                CAST(e.mkt_rv_chg AS FLOAT) mkt_rv_chg, CAST(e.mkt_adv_ratio_5 AS FLOAT) mkt_adv_ratio_5,
@@ -330,7 +340,7 @@ def _chunk(con, market: str, year: int, start: date, end: date, where: str, last
                CAST(e.vix_chg_20 AS FLOAT) vix_chg_20, CAST(e.fx_ret_20 AS FLOAT) fx_ret_20,
                CAST(e.us10y AS FLOAT) us10y, CAST(e.us10y_chg_20 AS FLOAT) us10y_chg_20, CAST(e.t10y2y AS FLOAT) t10y2y,
                {",".join(f"CASE WHEN l.y_n_{k} = 0 AND sl.last_d >= DATE '{last_day}' - INTERVAL 7 DAY THEN NULL ELSE CAST(l.y_ret_{k} AS FLOAT) END AS y_ret_{k}, CAST(l.y_vol_{k} AS FLOAT) AS y_vol_{k}, CAST(l.y_mdd_{k} AS FLOAT) AS y_mdd_{k}, CASE WHEN l.y_n_{k} < {k} AND sl.last_d >= DATE '{last_day}' - INTERVAL 7 DAY THEN NULL ELSE l.y_trunc_{k} END AS y_trunc_{k}" for k in (5, 20, 60))}
-        FROM f1 f
+        FROM (SELECT *, avg(macd) OVER (PARTITION BY security_id ORDER BY trade_date ROWS 8 PRECEDING) AS macd_signal FROM f1) f
         JOIN lab l USING (security_id, trade_date)
         JOIN sec_last sl USING (security_id)
         LEFT JOIN sec_df s USING (security_id)
@@ -387,10 +397,23 @@ def _write_manifest(market: str, res: list[dict]) -> None:
     import json
     p = features_dir(market) / "_manifest.json"
     old = json.loads(p.read_text()) if p.exists() else {}
+    if old.get("_feature_version", 1) != FEATURE_VERSION:
+        # 정의가 바뀐 경우: 이번에 다시 만든 연도만 남기고, 나머지(구버전)는 manifest 에서 제거해 섞이지 않게 한다
+        prev = old.get("_feature_version", 1)
+        old = {k: v for k, v in old.items() if k.startswith("_")}
+        # 구버전 특징으로 학습한 모델은 새 특징에 적용하지 않도록 사용 중지
+        try:
+            from .store import research_db
+            with research_db() as db:
+                db.execute("UPDATE model_registry SET status='retired', note = note || ? WHERE market=? AND status IN ('candidate','approved')",
+                           [f"; 구버전 특징(v{prev})으로 학습 — 특징 정의 변경 후 사용 중지", market])
+        except Exception as e:  # 연구 DB 가 없으면 무시
+            log_event(log, "model retire skipped", error=str(e))
     for r in res:
         old[str(r["year"])] = r
     old["_features"] = FEATURES
     old["_labels"] = LABELS
+    old["_feature_version"] = FEATURE_VERSION
     p.write_text(json.dumps(old, ensure_ascii=False, indent=1, default=str))
 
 
@@ -398,9 +421,22 @@ def feature_glob(market: str) -> str:
     return (features_dir(market) / "year=*" / "*.parquet").as_posix()
 
 
+def manifest_version(market: str) -> int | None:
+    import json
+    p = features_dir(market) / "_manifest.json"
+    if not p.exists():
+        return None
+    return json.loads(p.read_text()).get("_feature_version", 1)
+
+
 def stale_years(market: str) -> list[int]:
-    """표준화 파일이 특징 파일보다 새로우면 재생성 대상 (과거 데이터 변경 시 영향 연도만)."""
+    """재생성 대상 연도.
+    - 특징 계산 정의(FEATURE_VERSION)가 바뀌었으면 모든 연도
+    - 아니면 표준화 파일이 특징 파일보다 새로운 연도만 (과거 데이터 변경 시 영향 연도)
+    """
     s = get_settings()
+    if any(features_dir(market).glob("year=*/*.parquet")) and manifest_version(market) != FEATURE_VERSION:
+        return available_years(market)
     out = []
     for y in available_years(market):
         src = s.paths.standardized / "daily_prices" / f"country={market}" / f"year={y}" / "part-0.parquet"

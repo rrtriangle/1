@@ -12,6 +12,8 @@ import pytest
 from marketlab.collectors import base, yfinance_us
 from marketlab.storage.catalog import catalog
 
+pytestmark = pytest.mark.usefixtures("roomy")
+
 
 def _register(sid, sym):
     with catalog() as con:

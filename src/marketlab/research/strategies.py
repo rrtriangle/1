@@ -16,11 +16,16 @@ from datetime import date, datetime
 import numpy as np
 import pandas as pd
 
+import logging
+
 from ..config import get_settings
+from ..logging_setup import get_logger, log_event
 from ..storage.catalog import memory_connection
 from . import backtest as bt
 from .features import feature_glob
 from .store import jdump, research_db
+
+log = get_logger("strategies")
 
 RULES = ["buy_hold", "ma_cross", "momentum", "mean_reversion", "rsi", "vol_breakout", "volume_spike", "rel_strength"]
 ML = ["ml_top_ret", "ml_top_up", "ml_risk_adj", "ml_regime_switch", "ml_confidence_cash", "ml_plus_trend"]
@@ -161,19 +166,29 @@ def recent_rank_ic(market: str, run_id: str, horizon: int, dates: list[date]) ->
     finally:
         con.close()
     with research_db(read_only=True) as db:
-        p = db.execute("SELECT security_id, trade_date, pred_ret FROM predictions WHERE run_id=? AND algorithm='lgbm'", [run_id]).df()
+        # rank 과제 run 은 pred_rank 만, return 과제 run 은 pred_ret 만 채워져 있다 → 둘 중 있는 값을 쓴다
+        p = db.execute("SELECT security_id, trade_date, coalesce(pred_rank, pred_ret) AS pred FROM predictions "
+                       "WHERE run_id=? AND algorithm='lgbm'", [run_id]).df()
     if p.empty:
+        log_event(log, "recent_rank_ic: 예측 행이 없음", level=logging.WARNING, run_id=run_id)
+        return {}
+    if p["pred"].isna().all():
+        log_event(log, "recent_rank_ic: 예측값이 모두 비어 있음(NaN) — 현금 전환 조건을 계산할 수 없음",
+                  level=logging.WARNING, run_id=run_id, rows=len(p))
         return {}
     for x in (lab, p):
         x["trade_date"] = pd.to_datetime(x["trade_date"]).dt.date
-    m = p.merge(lab, on=["security_id", "trade_date"])
-    daily = m.groupby("trade_date")[["pred_ret", "y"]].apply(lambda g: g["pred_ret"].corr(g["y"], method="spearman")).sort_index()
+    m = p.dropna(subset=["pred"]).merge(lab, on=["security_id", "trade_date"])
+    daily = m.groupby("trade_date")[["pred", "y"]].apply(lambda g: g["pred"].corr(g["y"], method="spearman")).dropna().sort_index()
     all_days = sorted(daily.index)
     out = {}
     for d in dates:
-        known = [x for x in all_days if x < d][: max(0, len([x for x in all_days if x < d]) - (horizon + 1))]
+        past = [x for x in all_days if x < d]
+        known = past[: max(0, len(past) - (horizon + 1))]   # 결과(라벨)가 d 이전에 확정된 예측만
         if len(known) >= 20:
-            out[d] = float(daily.loc[known[-60:]].mean())
+            v = float(daily.loc[known[-60:]].mean())
+            if np.isfinite(v):
+                out[d] = v
     return out
 
 

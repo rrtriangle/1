@@ -33,3 +33,13 @@ def pytest_collection_modifyitems(config, items):
     for it in items:
         if "data" in it.keywords and not has:
             it.add_marker(skip)
+
+
+@pytest.fixture
+def roomy(isolated):
+    """저장공간 규칙과 무관한 테스트용: 실행 머신의 남은 디스크와 상관없이 DiskGuard 가 막지 않게 한다."""
+    isolated.raw.setdefault("storage", {})
+    isolated.raw["storage"]["min_free_gb"] = 0
+    isolated.raw["storage"]["project_budget_gb"] = 10_000
+    isolated.raw["storage"]["assumed_free_gb_baseline"] = 0
+    return isolated

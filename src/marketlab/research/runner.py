@@ -49,6 +49,9 @@ def save_state(market: str, st: dict) -> None:
 
 def run_all(market: str, force_test: bool = False, progress=None) -> dict:
     st = load_state(market)
+    if st.get("steps") and st.get("feature_version", 1) != F.FEATURE_VERSION:
+        st = invalidate_old_results(market, st)
+    st["feature_version"] = F.FEATURE_VERSION
     steps = st["steps"]
     t_all = time.time()
     preflight(market)
@@ -97,6 +100,21 @@ def run_all(market: str, force_test: bool = False, progress=None) -> dict:
     st["total_sec"] = round(time.time() - t_all, 1)
     save_state(market, st)
     return st
+
+
+def invalidate_old_results(market: str, st: dict) -> dict:
+    """특징 정의가 바뀌면 이전 연구 결과는 재사용하지 않는다: 상태 파일 보관, 구버전 모델 retired 처리."""
+    old_v = st.get("feature_version", 1)
+    p = _state_path(market)
+    p.with_name(f"research_{market}.featv{old_v}.json").write_text(json.dumps(st, ensure_ascii=False, indent=1, default=str))
+    rep = get_settings().paths.reports / f"research_report_{market}.md"
+    if rep.exists():
+        rep.rename(rep.with_name(f"research_report_{market}.featv{old_v}.md"))
+    with research_db() as db:
+        db.execute("UPDATE model_registry SET status='retired', note = note || ? WHERE market=? AND status IN ('candidate','approved')",
+                   [f"; 구버전 특징(v{old_v})으로 학습 — 특징 버그 수정 후 사용 중지", market])
+    log_event(log, "feature version changed: old research results archived", market=market, old=old_v, new=F.FEATURE_VERSION)
+    return {"steps": {}, "previous_feature_version": old_v}
 
 
 def preflight(market: str) -> dict:
