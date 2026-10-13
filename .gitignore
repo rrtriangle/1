@@ -1,0 +1,15 @@
+# 대용량 데이터·런타임 산출물은 Git에 커밋하지 않는다
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+logs/
+models/
+reports/*
+!reports/.gitkeep
+.env
+*.duckdb
+*.duckdb.wal
+.DS_Store
+*.egg-info/

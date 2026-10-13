@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "market-research-lab"
+version = "0.1.0"
+description = "한국·미국 주식 장기 일봉 데이터 수집·정제·검증·저장·자동 갱신 시스템"
+readme = "README.md"
+requires-python = ">=3.11"
+# 정확한 고정 버전은 requirements.lock 에 있다 (M1 arm64 휠 제공 버전).
+dependencies = [
+    "duckdb>=1.1",
+    "pyarrow>=16",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "requests>=2.31",
+    "finance-datareader>=0.9.90",
+    "yfinance>=0.2.50",
+    "exchange-calendars>=4.5",
+    "streamlit>=1.35",
+    "plotly>=5.20",
+    "psutil>=5.9",
+    "PyYAML>=6.0",
+    "scikit-learn>=1.4",
+    "lightgbm>=4.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+marketlab = "marketlab.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "network: 실제 원격 데이터 원천에 접속하는 테스트",
+    "data: 로컬에 수집된 실제 데이터가 필요한 테스트",
+]
