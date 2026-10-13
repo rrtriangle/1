@@ -46,12 +46,15 @@ def load(market: str, start: date | str, end: date | str, features: list[str] | 
         where = f"trade_date BETWEEN DATE '{start}' AND DATE '{end}' AND eligible"
         if require_label:
             where += f" AND {require_label} IS NOT NULL AND entry_ok"
-        sample = ""
         if every and every > 1:
-            sample = f"QUALIFY (dense_rank() OVER (ORDER BY trade_date) - 1) % {every} = 0"
+            # 전체 행에 창 함수를 쓰지 않고, 날짜 목록만 먼저 뽑아 N번째 날짜만 읽는다 (메모리·임시공간 절약, 같은 결과)
+            ds = [r[0] for r in con.execute(f"""SELECT DISTINCT trade_date FROM read_parquet('{feature_glob(market)}', hive_partitioning=false, union_by_name=true)
+                                                WHERE {where} ORDER BY 1""").fetchall()]
+            con.execute("CREATE OR REPLACE TEMP TABLE sample_dates AS SELECT unnest(?::DATE[]) AS trade_date", [ds[::every]])
+            where += " AND trade_date IN (SELECT trade_date FROM sample_dates)"
         df = con.execute(f"""
             SELECT {", ".join(cols)} FROM read_parquet('{feature_glob(market)}', hive_partitioning=false, union_by_name=true)
-            WHERE {where} {sample}
+            WHERE {where}
         """).df()
     finally:
         con.close()
