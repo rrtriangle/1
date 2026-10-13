@@ -273,7 +273,7 @@ def write_report(market: str, st: dict):
     if "final_test" in steps:
         ft = steps["final_test"]["result"]
         L += ["## 6. 최종 독립 검증 (선택 후 1회 적용)", "", f"- 기간: {ft['period']}" + (" — ⚠️ 재실행됨: 독립성 훼손" if ft.get("forced_rerun") else ""), "",
-              "| 전략 | 선택구간 샤프 | 검증 CAGR | 검증 샤프 | MDD | 비용0 CAGR | 비용2배 CAGR | 보수적 상폐 CAGR | 샤프 90% 구간 | 벤치마크 수익 |",
+              "| 전략 | 선택구간 샤프 | 검증 CAGR | 검증 샤프 | MDD | 비용0 CAGR | 비용2배 CAGR | 보수적 상폐 CAGR | 샤프 90% 구간 | 벤치마크 CAGR(같은 기간) |",
               "|---|---:|---:|---:|---:|---:|---:|---:|---|---|"]
         for r in sorted(ft["strategies"], key=lambda x: -(x["test"].get("sharpe") or -9)):
             t = r["test"]
@@ -281,7 +281,7 @@ def write_report(market: str, st: dict):
             L.append(f"| {r['strategy']} | {_f(r['selection_sharpe'], False, 2)} | {_f(t.get('cagr'))} | {_f(t.get('sharpe'), False, 2)} | {_f(t.get('mdd'))} | "
                      f"{_f(r['cost_sensitivity']['cost_x0'].get('cagr'))} | {_f(r['cost_sensitivity']['cost_x2'].get('cagr'))} | "
                      f"{_f(r['conservative_delisting'].get('cagr'))} | {('%.2f~%.2f' % (b[0], b[2])) if b else '-'} | "
-                     f"{', '.join(f'{k} {_f(v)}' for k, v in r['benchmark_return'].items())} |")
+                     f"{', '.join(f'{k} {_f((1 + v) ** (1 / max(t.get('years') or 1, 1e-9)) - 1)}' for k, v in r['benchmark_return'].items())} |")
         L += ["", "### 모델 최종 검증", ""]
         for m in ft["models"]:
             mt = m["metrics_test"]
@@ -319,6 +319,20 @@ def _interpret(ft: dict, steps: dict) -> list[str]:
     rule = [x for x in strat if not x["strategy"].startswith("ml_")]
     if ml and rule:
         out.append(f"- ML 전략 평균 샤프 {np.mean([x['test']['sharpe'] for x in ml]):.2f} vs 규칙 전략 평균 {np.mean([x['test']['sharpe'] for x in rule]):.2f}.")
+    hi_turn = [x for x in strat if (x["test"].get("turnover_per_year") or 0) > 30]
+    for x in hi_turn:
+        c0, c1 = x["cost_sensitivity"]["cost_x0"].get("cagr"), x["test"].get("cagr")
+        out.append(f"- {x['strategy']}: 연 회전율 {x['test']['turnover_per_year']:.0f}배 — 비용 전 CAGR {_f(c0)} → 비용 후 {_f(c1)}. "
+                   "예측력(순위 상관)이 있어도 잦은 매매 비용이 수익을 대부분 상쇄했습니다.")
+    models = ft.get("models") or []
+    rics = [m["metrics_test"].get("rank_ic") for m in models if "rank" in m["exp_id"] and "lgbm" in m["exp_id"] or "ridge" in m["exp_id"]]
+    rics = [r for r in rics if r is not None]
+    if rics:
+        out.append(f"- 모델의 최종 검증 순위상관(Rank IC)은 {min(rics):.3f}~{max(rics):.3f}로 검증 구간과 비슷하게 유지되었습니다. "
+                   "즉 '상대적으로 더 오를 종목을 고르는 통계적 신호'는 미래 구간에서도 관찰되었지만, 이를 실제 수익으로 바꾸는 전략 설계"
+                   "(회전율·비용·대형주 쏠림 장세)에서는 벤치마크를 이기지 못했습니다.")
     out.append("- 거래비용을 2배로 가정하면 수익률이 크게 줄어드는 전략(회전율 높음)은 실제 적용 시 성과가 더 낮을 수 있습니다.")
+    out.append("- 최종 검증 결과를 본 뒤 전략을 고치면 그 구간은 더 이상 독립 검증이 아닙니다. 개선 아이디어(낮은 회전율, 비용 반영 목표 등)는 "
+               "새로운 미래 구간에서 다시 검증해야 합니다.")
     out.append("- 변수 중요도는 통계적 연관성일 뿐 인과관계가 아닙니다. 과거에 통했던 패턴이 미래에도 유지된다는 보장은 없습니다.")
     return out
