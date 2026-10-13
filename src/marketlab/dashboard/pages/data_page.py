@@ -230,3 +230,19 @@ with tabs[4]:
 with tabs[5]:
     rep = S.paths.reports / "quality_report.md"
     st.markdown(rep.read_text(encoding="utf-8") if rep.exists() else "아직 검증 보고서가 없습니다. `marketlab validate` 를 실행하세요.")
+
+# ---------------------------------------------------------------- 연구 사용 가능 범위 (작업지시서 ②)
+st.divider()
+st.subheader("머신러닝 연구에 사용 가능한 데이터 범위")
+import json as _json
+from marketlab.research.features import features_dir as _fd
+for _m in ("KR", "US"):
+    _p = _fd(_m) / "_manifest.json"
+    if not _p.exists():
+        st.write(f"{_m}: 특징 파일 없음 (머신러닝 연구소에서 생성)")
+        continue
+    _man = {k: v for k, v in _json.loads(_p.read_text()).items() if not k.startswith("_")}
+    _yrs = sorted(int(y) for y in _man)
+    st.write(f"**{_m}**: {_yrs[0]}~{_yrs[-1]}년, 투자 가능(품질·유동성·가격·이력 기준 통과) 종목-일 "
+             f"{sum(v.get('eligible', 0) for v in _man.values()):,}행 / 전체 {sum(v.get('rows_all', v.get('eligible', 0)) for v in _man.values()):,}행")
+st.caption("제외: 품질 등급 X, 보통주 외 증권(우선주·신주·SPAC·ETF 등), 가격·20일 평균 거래대금 기준 미달, 이력 120거래일 미만.")

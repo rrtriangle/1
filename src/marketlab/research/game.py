@@ -81,7 +81,8 @@ def _calendar(market: str, start: date, end: date | None = None) -> list[date]:
 def _ai_run(market: str, start: date) -> tuple[str | None, str]:
     with research_db(read_only=True) as db:
         r = db.execute("""SELECT run_id, min(trade_date), max(trade_date) FROM predictions
-                          WHERE market=? AND kind LIKE 'oos_%' AND algorithm='lgbm' AND (pred_rank IS NOT NULL OR pred_ret IS NOT NULL)
+                          WHERE market=? AND kind = 'oos_expanding' AND horizon = 20 AND algorithm='lgbm'
+                            AND (pred_rank IS NOT NULL OR pred_ret IS NOT NULL)
                           GROUP BY 1 HAVING min(trade_date) <= ? ORDER BY max(trade_date) DESC LIMIT 1""", [market, start]).fetchone()
     if not r:
         return None, "이 시작일을 포함하는 walk-forward 예측이 없어 AI 투자자를 사용할 수 없습니다."

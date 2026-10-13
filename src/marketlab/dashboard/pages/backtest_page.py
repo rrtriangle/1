@@ -36,6 +36,7 @@ with t1:
     maxw = c[0].slider("단일 종목 최대 비중", 0.02, 0.5, 0.10)
     part = c[1].slider("거래대금 대비 최대 주문 비율", 0.01, 0.2, 0.05)
     scen = c[2].selectbox("상장폐지 처리", ["last_close", "conservative"], format_func=lambda x: {"last_close": "마지막 종가 청산", "conservative": "보수적(보상 근거 없으면 0원)"}[x])
+    tranches = st.slider("분할 매매 (거래일 수)", 1, 5, 1, help="1 = 한 번에 체결, 3 = 3거래일에 나눠 목표 비중으로 이동")
     capital = st.number_input("초기 자금", value=100_000_000 if market == "KR" else 100_000, step=1_000_000 if market == "KR" else 10_000)
     st.caption(f"기본 비용({market}): {bt.Costs.for_market(market).__dict__}")
     if st.button("백테스트 실행", type="primary"):
@@ -51,7 +52,8 @@ with t1:
             reg = runner._regime_by_date(market) if strat == "ml_regime_switch" else None
             tg = S.generate_targets(market, strat, start, end, params, pred, reg)
             cons = bt.Constraints(max_weight=maxw, max_participation=part, delisting_scenario=scen)
-            res = bt.run(market, tg, start, end, capital=capital, costs=bt.Costs.for_market(market, cost_mult), cons=cons, name=strat)
+            res = bt.run(market, tg, start, end, capital=capital, costs=bt.Costs.for_market(market, cost_mult), cons=cons, name=strat,
+                         tranches=tranches)
             bench = bt.benchmark_curves(market, start, end, capital)
         if period.startswith("최종"):
             with research_db() as db:
@@ -84,6 +86,9 @@ with t1:
         c2.json(boot)
         st.write("세부 지표")
         st.json(m)
+        if res["market"] == "US":
+            st.write("원화 투자자 기준 (원/달러 환율 변화 + 환전비용 반영)")
+            st.json(bt.to_krw(eq, res["trades"]))
         st.write("거래 내역")
         st.dataframe(res["trades"], hide_index=True, use_container_width=True)
         if st.button("결과 저장"):

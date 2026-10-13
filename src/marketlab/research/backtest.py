@@ -132,8 +132,9 @@ class PriceBook:
 
 def run(market: str, targets: dict[date, dict[str, float]], start: date, end: date, capital: float = 100_000_000,
         costs: Costs | None = None, cons: Constraints | None = None, name: str = "strategy",
-        prices: PriceBook | None = None) -> dict:
-    """targets: 신호일(t) → {security_id: 목표비중}. t 다음 거래일 시가에 체결."""
+        prices: PriceBook | None = None, tranches: int = 1) -> dict:
+    """targets: 신호일(t) → {security_id: 목표비중}. t 다음 거래일 시가에 체결.
+    tranches>1: 분할매수·분할매도 — 이전 목표에서 새 목표로 tranches 거래일에 걸쳐 나눠 이동."""
     costs = costs or Costs.for_market(market)
     cons = cons or Constraints.default()
     sids = sorted({s for w in targets.values() for s in w})
@@ -145,6 +146,22 @@ def run(market: str, targets: dict[date, dict[str, float]], start: date, end: da
             if t in pb.didx else next((pb.didx[d] for d in pb.dates if d > t), None)
         if nxt is not None:
             sig_by_exec[nxt] = {k: min(v, cons.max_weight) for k, v in w.items() if v > 0}
+    if tranches > 1 and sig_by_exec:
+        staged: dict[int, dict[str, float]] = {}
+        prev: dict[str, float] = {}
+        execs = sorted(sig_by_exec)
+        for n_, i0 in enumerate(execs):
+            new_t = sig_by_exec[i0]
+            nxt_sig = execs[n_ + 1] if n_ + 1 < len(execs) else None
+            for j in range(1, tranches + 1):
+                ij = i0 + j - 1
+                if nxt_sig is not None and ij >= nxt_sig:
+                    break
+                keys = set(prev) | set(new_t)
+                staged[ij] = {k: prev.get(k, 0) + (new_t.get(k, 0) - prev.get(k, 0)) * j / tranches for k in keys}
+                staged[ij] = {k: v for k, v in staged[ij].items() if v > 1e-9}
+            prev = new_t
+        sig_by_exec = staged
     from .portfolio import Portfolio
     pf = Portfolio(cash=float(capital), costs=costs, cons=cons)
     equity = []
@@ -240,6 +257,19 @@ def benchmark_curves(market: str, start: date, end: date, capital: float) -> pd.
     for iid, g in idx.groupby("indicator_id"):
         g = g.sort_values("obs_date")
         out[iid.split(":")[1]] = pd.Series((g["value"] / g["value"].iloc[0] * capital).to_numpy(), index=pd.to_datetime(g["obs_date"]).dt.date)
+    if market == "US":
+        g = (get_settings().paths.standardized / "daily_prices" / "country=US" / "year=*" / "*.parquet").as_posix()
+        con = memory_connection()
+        try:
+            spy = con.execute(f"""SELECT trade_date, adj_close_tr FROM read_parquet('{g}', hive_partitioning=true)
+                                  WHERE symbol = 'SPY' AND trade_date BETWEEN ? AND ? ORDER BY 1""", [start, end]).df()
+        except Exception:
+            spy = pd.DataFrame()
+        finally:
+            con.close()
+        if not spy.empty:
+            out["SPY(배당재투자)"] = pd.Series((spy["adj_close_tr"] / spy["adj_close_tr"].iloc[0] * capital).to_numpy(),
+                                             index=pd.to_datetime(spy["trade_date"]).dt.date)
     if not ew.empty:
         out["동일가중(투자가능종목)"] = pd.Series((np.cumprod(1 + ew["r"].fillna(0).to_numpy()) * capital), index=pd.to_datetime(ew["obs_date"]).dt.date)
     return pd.DataFrame(out)
@@ -261,3 +291,21 @@ def save(result: dict, strategy: str, params: dict, selection_period: str, note:
                     jdump(result["constraints"]), jdump(m), jdump(result.get("benchmark", {})), selection_period,
                     str(ep), str(tp), note])
     return bt_id
+
+
+def to_krw(eq: pd.DataFrame, trades: pd.DataFrame, fx_cost_bps: float | None = None) -> dict:
+    """미국 전략의 원화 기준 성과: 달러 자산 × 원/달러(KRW=X, 해당일 사용 가능 값) − 거래금액 × 환전비용."""
+    fx_bps = fx_cost_bps if fx_cost_bps is not None else float(get_settings().get("research.costs.US.fx_cost_bps", 25))
+    base = get_settings().paths.standardized / "market_indicators" / "yahoo_KRW_X.parquet"
+    if not base.exists() or eq.empty:
+        return {"note": "환율 데이터 없음"}
+    fx = pd.read_parquet(base)[["obs_date", "value"]]
+    fx["obs_date"] = pd.to_datetime(fx["obs_date"]).dt.date
+    e = eq[["date", "equity"]].merge(fx, left_on="date", right_on="obs_date", how="left").sort_values("date")
+    e["value"] = e["value"].ffill().bfill()
+    traded = trades[trades["side"].isin(["BUY", "SELL"])].groupby("date")["value"].sum() if not trades.empty else pd.Series(dtype=float)
+    fxcost = e["date"].map(traded).fillna(0).cumsum() * fx_bps / 1e4
+    e["equity_krw"] = (e["equity"] - fxcost) * e["value"]
+    m = metrics(pd.DataFrame({"date": e["date"], "equity": e["equity_krw"], "n_positions": 0}), pd.DataFrame(columns=["side"]),
+                float(e["equity_krw"].iloc[0]))
+    return {"metrics_krw": m, "fx_cost_bps": fx_bps, "fx_start": float(e["value"].iloc[0]), "fx_end": float(e["value"].iloc[-1])}

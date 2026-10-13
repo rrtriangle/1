@@ -108,7 +108,9 @@ def _metrics(task: str, df: pd.DataFrame, horizon: int) -> dict:
 
 
 def train_eval(market: str, horizon: int, task: str, algorithms: list[str] | None = None,
-               sample_every: int | None = None, progress=None) -> list[dict]:
+               sample_every: int | None = None, progress=None, winsorize: tuple | None = None) -> list[dict]:
+    """winsorize=(0.01, 0.99): 수익률 라벨의 극단값을 '학습 구간 분위수'로 잘라 학습 (평가는 원래 값). 꼬리가 두꺼운 수익률에서
+    트리 모델이 상수 예측으로 무너지는 것을 막는다."""
     """고정 분할 학습 → 검증 구간 평가. 모델·실험 기록 저장. 최종 검증 구간은 건드리지 않는다."""
     s = get_settings()
     target, kind = _target(task, horizon)
@@ -134,6 +136,10 @@ def train_eval(market: str, horizon: int, task: str, algorithms: list[str] | Non
         try:
             m = _make_model(algo, task, kind)
             y_tr = train[target].to_numpy()
+            if winsorize and kind == "regression":
+                lo, hi = np.nanquantile(y_tr, winsorize[0]), np.nanquantile(y_tr, winsorize[1])
+                y_tr = np.clip(y_tr, lo, hi)
+                m.params["winsorize"] = [float(winsorize[0]), float(winsorize[1]), float(lo), float(hi)]
             if algo in ("lgbm",):
                 # 조기 종료는 학습 구간 마지막 15% 날짜(+purge)로만 판단 → 검증 구간은 순수 평가용
                 dates = np.sort(train["trade_date"].unique())

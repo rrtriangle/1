@@ -178,13 +178,15 @@ def _final(market: str, st: dict, pred_runs: dict, forced: bool) -> dict:
         boot = bt.block_bootstrap(main["equity"])
         bench_ret = {c: float(bench[c].dropna().iloc[-1] / capital - 1) for c in bench.columns if bench[c].notna().any()}
         main["benchmark"] = bench_ret
+        krw = bt.to_krw(main["equity"], main["trades"]) if market == "US" else None
         bt_id = bt.save(main, r.strategy, {k: v for k, v in params.items() if not k.startswith("_")}, search["selection_period"],
                         note="final_test" + (" (재실행: 독립성 훼손)" if forced else ""))
         out["strategies"].append({"strategy": r.strategy, "params": {k: v for k, v in params.items() if not k.startswith("_")},
                                   "selection_sharpe": float(sel_sharpe.get(r.strategy, np.nan)),
                                   "test": main["metrics"], "cost_sensitivity": rows, "conservative_delisting": cons_res["metrics"],
                                   "bootstrap": boot, "benchmark_return": bench_ret,
-                                  "yearly": bt.yearly_returns(main["equity"]).to_dict("records"), "bt_id": bt_id})
+                                  "yearly": bt.yearly_returns(main["equity"]).to_dict("records"), "bt_id": bt_id,
+                                  "krw_view": krw})
     with research_db() as db:
         db.execute("INSERT INTO test_access_log VALUES (now(), 'runner', 'final strategy test', ?)", [f"{market}:{t0}~{t1}"])
     # 고정 분할 모델의 최종 검증 (과제·기간별 검증 성적 1위 비기준 모델)
