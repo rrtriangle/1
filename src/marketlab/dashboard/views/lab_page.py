@@ -17,7 +17,7 @@ S = get_settings()
 st.title("머신러닝 연구소")
 market = st.radio("연구 시장", ["KR", "US"], horizontal=True, format_func=lambda x: {"KR": "한국", "US": "미국"}[x])
 P = E.periods(market)
-st.caption(f"학습 {P['train_start']}~{P['train_end']} · 모델 선택 {P['valid_start']}~{P['valid_end']} · 최종 독립 검증 {P['test_start']}~ "
+st.caption(f"학습 {P['train_start']} – {P['train_end']} · 모델 선택 {P['valid_start']} – {P['valid_end']} · 최종 독립 검증 {P['test_start']} 이후 "
            "(최종 검증 구간은 모델·전략 선택에 쓰지 않습니다)")
 
 
@@ -49,7 +49,7 @@ with t1:
         launch(["run-all", "--market", market], "연구 전체 실행")
     stt = runner.load_state(market)
     if stt.get("steps"):
-        st.dataframe(pd.DataFrame([{"단계": k, "완료": v.get("done"), "초": v.get("sec"), "메모리GB": v.get("rss_gb"), "시각": v.get("at")}
+        st.dataframe(pd.DataFrame([{"단계": k, "완료": v.get("done"), "초": v.get("sec"), "단계 종료 시 메모리GB": v.get("rss_gb"), "시각": v.get("at")}
                                    for k, v in stt["steps"].items()]), hide_index=True)
     logf = S.paths.logs / "research_jobs.log"
     if logf.exists():
