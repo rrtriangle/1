@@ -129,7 +129,11 @@ research:
     valid_start: "2021-01-01"
     valid_end: "2023-12-31"
     test_start: "2024-01-01"       # 최종 독립 검증 — 모델·전략 선택에 사용 금지
+  train_start:                     # 시장별 학습 시작 (US 1995 이전은 생존 종목만 남아 표본이 얇고 편향이 커 제외)
+    KR: "1996-01-01"
+    US: "1995-01-01"
   walkforward:
+    min_test_year: {KR: 2002, US: 2003}
     first_train_years: 6
     step_months: 12
     rolling_years: 8               # 고정 길이 창 비교용

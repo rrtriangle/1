@@ -48,8 +48,13 @@ def record_live(market: str, horizons=(5, 20, 60)) -> dict:
 
 def realized_vs_predicted(market: str, horizon: int = 20, kind_like: str = "live%") -> pd.DataFrame:
     with research_db(read_only=True) as db:
+        runs = db.execute("""SELECT run_id FROM predictions WHERE market=? AND horizon=? AND kind LIKE ? AND algorithm='lgbm'
+                             AND (pred_rank IS NOT NULL OR pred_ret IS NOT NULL) GROUP BY 1 ORDER BY (run_id LIKE '%rank%') DESC, max(trade_date) DESC LIMIT 1""",
+                          [market, horizon, kind_like]).fetchall()
+        if not runs:
+            return pd.DataFrame()
         p = db.execute("""SELECT security_id, trade_date, coalesce(pred_rank, pred_ret) AS pred FROM predictions
-                          WHERE market=? AND horizon=? AND kind LIKE ?""", [market, horizon, kind_like]).df()
+                          WHERE run_id=? AND algorithm='lgbm' AND horizon=?""", [runs[0][0], horizon]).df()
     if p.empty:
         return pd.DataFrame()
     con = memory_connection()
@@ -89,8 +94,18 @@ def drift(market: str, train_start="2010-01-01", train_end="2020-12-31", recent_
                          [last - timedelta(days=int(recent_days * 1.5))]).df()
     finally:
         con.close()
-    rows = [{"feature": c, "psi": psi(tr[c].to_numpy(float), rc[c].to_numpy(float))} for c in FEATURES]
-    return pd.DataFrame(rows).sort_values("psi", ascending=False)
+    env_cols = [c for c in FEATURES if c.startswith(("mkt_", "vix", "fx_", "us10y", "t10y2y"))]
+    rows = []
+    for c in FEATURES:
+        a, b = tr[c].to_numpy(float), rc[c].to_numpy(float)
+        if c in env_cols:
+            # 시장 환경 특징은 날짜당 값이 하나라 PSI 가 무의미 → 현재 값이 학습 기간 분포의 몇 분위인지
+            cur = np.nanmedian(b[-1000:]) if len(b) else np.nan
+            pctl = float(np.mean(a[~np.isnan(a)] <= cur)) if np.isfinite(cur) else np.nan
+            rows.append({"feature": c, "kind": "market", "psi": np.nan, "current_percentile": pctl})
+        else:
+            rows.append({"feature": c, "kind": "stock", "psi": psi(a, b), "current_percentile": np.nan})
+    return pd.DataFrame(rows).sort_values("psi", ascending=False, na_position="last")
 
 
 def check(market: str, horizon: int = 20) -> dict:
@@ -112,9 +127,12 @@ def check(market: str, horizon: int = 20) -> dict:
         mod = Model.load(m["path"])
         im = mod.importance()
         imp = list(im.head(10).index) if im is not None else []
-    big = dr[(dr["psi"] > 0.25) & dr["feature"].isin(imp or FEATURES)]
+    big = dr[(dr["kind"] == "stock") & (dr["psi"] > 0.25) & dr["feature"].isin(imp or FEATURES)]
     if len(big):
-        warnings.append("주요 입력 특징 분포가 학습 기간과 크게 달라짐(PSI>0.25): " + ", ".join(big["feature"].head(5)))
+        warnings.append("주요 종목 특징 분포가 학습 기간과 크게 달라짐(PSI>0.25): " + ", ".join(big["feature"].head(5)))
+    ext = dr[(dr["kind"] == "market") & ((dr["current_percentile"] < 0.01) | (dr["current_percentile"] > 0.99))]
+    if len(ext):
+        warnings.append("현재 시장 환경이 학습 기간에 거의 없던 수준(1% 미만/99% 초과 분위): " + ", ".join(ext["feature"].head(5)))
     for w in warnings:
         raise_alert("warn", "model", f"[{market} {horizon}일 모델] {w}")
     return {"model": m, "recent_rank_ic": recent.to_dict("records") if not recent.empty else [], "source": src,

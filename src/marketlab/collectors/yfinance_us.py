@@ -80,6 +80,8 @@ def fetch_history(symbol: str, start: date | None) -> tuple[pd.DataFrame, str | 
     import yfinance as yf
 
     logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+    import warnings
+    warnings.filterwarnings("ignore", message=".*raise_errors.*")
     t = yf.Ticker(symbol)
     try:
         if start is None:
@@ -89,6 +91,13 @@ def fetch_history(symbol: str, start: date | None) -> tuple[pd.DataFrame, str | 
                            raise_errors=True)
     except Exception as e:  # yfinance 는 오류 유형이 버전마다 달라 문자열로 판단
         msg = f"{type(e).__name__}: {e}"
+        if "InvalidPeriod" in msg and start is None:
+            # 신규 상장(워런트·권리 등)은 period='max' 를 거부 → 시작일 지정으로 재시도
+            try:
+                df = t.history(start="1970-01-01", interval="1d", auto_adjust=False, actions=True, raise_errors=True)
+                return df, None
+            except Exception as e2:
+                return pd.DataFrame(), f"{type(e2).__name__}: {e2}"
         return pd.DataFrame(), msg
     return df, None
 

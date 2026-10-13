@@ -65,6 +65,9 @@ def periods(market: str) -> dict:
     s = get_settings().get("research.splits", {}) or {}
     ys = available_years(market)
     start = date(ys[0] + 1, 1, 1) if ys else date(2000, 1, 1)   # 첫 해는 특징 이력이 짧아 제외
+    cfg_start = (get_settings().get("research.train_start", {}) or {}).get(market)
+    if cfg_start:
+        start = max(start, _d(cfg_start))
     return {"train_start": start, "train_end": _d(s.get("train_end", "2020-12-31")),
             "valid_start": _d(s.get("valid_start", "2021-01-01")), "valid_end": _d(s.get("valid_end", "2023-12-31")),
             "test_start": _d(s.get("test_start", "2024-01-01")), "test_end": date.today()}
@@ -236,7 +239,8 @@ def walk_forward(market: str, horizon: int, task: str, algorithms: list[str] | N
     target, kind = _target(task, horizon)
     algos = algorithms or (["ridge", "lgbm"] if kind == "regression" else ["logistic", "lgbm"])
     ys = available_years(market)
-    first = ys[0] + 1 + int(wf.get("first_train_years", 6))
+    t0 = periods(market)["train_start"]
+    first = max(t0.year + int(wf.get("first_train_years", 6)), int((wf.get("min_test_year") or {}).get(market, 0)))
     test_years = [y for y in ys if y >= first]
     run_id = run_id or f"wf-{market}-{task}-{horizon}-{window}-{datetime.now():%Y%m%d%H%M%S}"
     with research_db() as db:
@@ -247,7 +251,7 @@ def walk_forward(market: str, horizon: int, task: str, algorithms: list[str] | N
     for fi, ty in enumerate(test_years):
         tstart, tend = date(ty, 1, 1), date(ty, 12, 31)
         tr_end = dataset.purge_cutoff(market, tstart, horizon)
-        tr_start = date(ys[0] + 1, 1, 1) if window == "expanding" else date(ty - int(wf.get("rolling_years", 8)), 1, 1)
+        tr_start = t0 if window == "expanding" else max(t0, date(ty - int(wf.get("rolling_years", 8)), 1, 1))
         if all((fi, a) in done for a in algos):
             continue
         labels = list(dict.fromkeys([target, f"y_ret_{horizon}"]))
