@@ -137,6 +137,7 @@ def run(years: list[int] | None = None, run_id: str = "manual") -> dict:
             results.append({"year": y, "rows": n[0], "securities": n[1]})
             log_event(log, "standardized", year=y, rows=n[0])
         _update_us_master(con)
+        update_calendar(con)
         _state_path().write_text(started)
     finally:
         con.close()
@@ -158,3 +159,27 @@ def _update_us_master(con) -> None:
             UPDATE securities SET first_trade_date = rng.f, last_trade_date = rng.l, updated_at = now()
             FROM rng WHERE securities.security_id = rng.security_id
         """)
+
+
+def update_calendar(con) -> int:
+    """US 거래일 = 데이터 관측일(종목 50개 이상 거래된 날) ∪ exchange_calendars(XNYS)."""
+    import exchange_calendars as xcals
+    import pandas as pd
+
+    glob = (std_dir() / "year=*" / "*.parquet").as_posix()
+    if not list(std_dir().glob("year=*/*.parquet")):
+        return 0
+    obs = {r[0] for r in con.execute(f"""SELECT trade_date FROM read_parquet('{glob}', hive_partitioning=true)
+                                         GROUP BY 1 HAVING count(*) >= 50""").fetchall()}
+    try:
+        cal = xcals.get_calendar("XNYS", start="1962-01-01")
+        xc = {d.date() for d in cal.sessions if d.date() <= date.today() + timedelta(days=370)}
+    except Exception:
+        xc = set()
+    rows = [("US", d, "America/New_York", "both" if d in obs and d in xc else ("observed" if d in obs else "exchange_calendars"))
+            for d in sorted(obs | xc)]
+    with catalog() as cat:
+        cat.register("cal_df", pd.DataFrame(rows, columns=["market", "trade_date", "tz", "source"]))
+        cat.execute("DELETE FROM trading_calendars WHERE market='US'")
+        cat.execute("INSERT INTO trading_calendars SELECT * FROM cal_df")
+    return len(rows)

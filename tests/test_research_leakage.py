@@ -26,8 +26,9 @@ def test_features_identical_when_future_removed(tmp_path, cut):
     try:
         F.build_market_env(con, "KR")
         F.build_year(con, "KR", cut.year, cutoff=cut, out_path=tmp_path / "cut.parquet")
+        F.build_year(con, "KR", cut.year, out_path=tmp_path / "full.parquet")      # 같은 코드로 전체 데이터 계산
         a = con.execute(f"SELECT * FROM read_parquet('{tmp_path / 'cut.parquet'}') WHERE trade_date = DATE '{cut}'").df()
-        b = con.execute(f"SELECT * FROM read_parquet('{F.feature_glob('KR')}') WHERE trade_date = DATE '{cut}'").df()
+        b = con.execute(f"SELECT * FROM read_parquet('{tmp_path / 'full.parquet'}') WHERE trade_date = DATE '{cut}'").df()
     finally:
         con.close()
     assert len(a) > 500 and len(a) == len(b)

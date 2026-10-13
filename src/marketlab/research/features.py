@@ -156,7 +156,7 @@ def build_market_env(con, market: str) -> None:
     """)
 
 
-def _daily_sql(market: str, start: date, end: date) -> str:
+def _daily_sql(market: str, start: date, end: date, extra_where: str = "TRUE") -> str:
     """종목 일별 수익률 기초 테이블. KR=기준가 대비, US=분할반영 종가(+배당) 대비."""
     if market == "KR":
         return f"""
@@ -169,7 +169,7 @@ def _daily_sql(market: str, start: date, end: date) -> str:
                         THEN open / coalesce(base_price, prev_close) END AS open_gap,
                    high / nullif(close, 0) AS h_rel, low / nullif(close, 0) AS l_rel
             FROM read_parquet('{std_glob(market)}', hive_partitioning=true)
-            WHERE trade_date BETWEEN DATE '{start}' AND DATE '{end}'
+            WHERE trade_date BETWEEN DATE '{start}' AND DATE '{end}' AND {extra_where}
         """
     return f"""
         SELECT security_id, market, trade_date, open, high, low, close, volume, amount, NULL::DOUBLE AS market_cap,
@@ -179,7 +179,7 @@ def _daily_sql(market: str, start: date, end: date) -> str:
                (open / nullif(split_factor, 0)) / nullif(lag(split_adj_close) OVER (PARTITION BY security_id ORDER BY trade_date), 0) AS open_gap,
                high / nullif(close, 0) AS h_rel, low / nullif(close, 0) AS l_rel
         FROM read_parquet('{std_glob(market)}', hive_partitioning=true)
-        WHERE trade_date BETWEEN DATE '{start}' AND DATE '{end}'
+        WHERE trade_date BETWEEN DATE '{start}' AND DATE '{end}' AND {extra_where}
     """
 
 
@@ -197,7 +197,34 @@ def build_year(con, market: str, year: int, cutoff: date | None = None, out_path
     if cutoff:
         end = min(end, cutoff)
     t0 = time.time()
-    con.execute(f"CREATE OR REPLACE TEMP TABLE d0 AS {_daily_sql(market, start, end)}")
+    # 연구 대상 증권 종류만 읽고(종목별 특징은 자기 이력에만 의존), 행 수에 따라 종목 해시 버킷으로 나눠 계산 → 메모리 상한 유지
+    with catalog(read_only=True) as cat:
+        sec = cat.execute("SELECT security_id, security_type, status FROM securities WHERE country = ?", [market]).df()
+    con.register("sec_df", sec)
+    types_sql = ",".join(f"'{t}'" for t in types)
+    con.execute(f"CREATE OR REPLACE TEMP TABLE sec_keep AS SELECT security_id FROM sec_df WHERE coalesce(security_type, 'common') IN ({types_sql})")
+    keep = "security_id IN (SELECT security_id FROM sec_keep)"
+    n_src, last_day = con.execute(f"""SELECT count(*), max(trade_date) FROM read_parquet('{std_glob(market)}', hive_partitioning=true)
+                                      WHERE trade_date BETWEEN DATE '{start}' AND DATE '{end}' AND {keep}""").fetchone()
+    nb = max(1, -(-int(n_src) // 2_500_000))
+    con.execute("DROP TABLE IF EXISTS out_acc")
+    for b in range(nb):
+        bucket = f"{keep} AND hash(security_id) % {nb} = {b}"
+        _chunk(con, market, year, start, end, bucket, last_day)
+        con.execute("CREATE TABLE IF NOT EXISTS out_acc AS SELECT * FROM out0 LIMIT 0")
+        con.execute("INSERT INTO out_acc SELECT * FROM out0")
+    _finish_year(con, market, year, out_path, types_sql, min_price, min_amt, min_hist, t0, nb)
+    n = con.execute(f"SELECT count(*) FROM read_parquet('{(out_path or (features_dir(market) / f'year={year}' / 'part-0.parquet')).as_posix()}')").fetchone()
+    out = out_path or (features_dir(market) / f"year={year}" / "part-0.parquet")
+    res = {"market": market, "year": year, "rows_all": int(con.execute("SELECT count(*) FROM out_acc").fetchone()[0]),
+           "eligible": n[0], "buckets": nb, "sec": round(time.time() - t0, 1), "rss_gb": round(rss_gb(), 2), "bytes": out.stat().st_size}
+    con.execute("DROP TABLE IF EXISTS out_acc")
+    log_event(log, "features built", **res)
+    return res
+
+
+def _chunk(con, market: str, year: int, start: date, end: date, where: str, last_day) -> None:
+    con.execute(f"CREATE OR REPLACE TEMP TABLE d0 AS {_daily_sql(market, start, end, where)}")
     con.execute("""
         CREATE OR REPLACE TEMP TABLE d1 AS
         SELECT d0.*, ln(1 + greatest(coalesce(r, 0), -0.99)) AS lr,
@@ -230,8 +257,8 @@ def build_year(con, market: str, year: int, cutoff: date | None = None, out_path
             (avg(exp(li - li_anchor)) OVER w12 - avg(exp(li - li_anchor)) OVER w26) / nullif(exp(li - li_anchor), 0) AS macd,
             exp(li - max(li) OVER w252) - 1 AS pos_high_252,
             exp(li - min(li) OVER w252) - 1 AS pos_low_252,
-            CASE WHEN li >= max(li) OVER w252 AND count(*) OVER w252 >= 120 THEN 1 ELSE 0 END AS new_high_252,
-            CASE WHEN li <= min(li) OVER w252 AND count(*) OVER w252 >= 120 THEN 1 ELSE 0 END AS new_low_252,
+            CASE WHEN li >= max(li) OVER w252 - 1e-9 AND count(*) OVER w252 >= 120 THEN 1 ELSE 0 END AS new_high_252,
+            CASE WHEN li <= min(li) OVER w252 + 1e-9 AND count(*) OVER w252 >= 120 THEN 1 ELSE 0 END AS new_low_252,
             ix - arg_max(ix, li + ix * 1e-12) OVER w252 AS days_since_high_252,
             avg(CASE WHEN r > 0 THEN 1.0 WHEN r < 0 THEN 0.0 ELSE 0.5 END) OVER w20 AS up_ratio_20,
             ln(1 + avg(amount) OVER w20) AS log_amount_20,
@@ -285,15 +312,10 @@ def build_year(con, market: str, year: int, cutoff: date | None = None, out_path
         FROM d2
     """)
     # 데이터 끝(최근)에서 미래가 없는 경우는 상장폐지와 구분: 해당 종목이 데이터 끝까지 거래 중이면 라벨 없음
-    last_day = con.execute("SELECT max(trade_date) FROM d2").fetchone()[0]
     con.execute("""
         CREATE OR REPLACE TEMP TABLE sec_last AS
         SELECT security_id, max(trade_date) AS last_d FROM d2 GROUP BY 1
     """)
-    with catalog(read_only=True) as cat:
-        sec = cat.execute("SELECT security_id, security_type, status FROM securities WHERE country = ?", [market]).df()
-    con.register("sec_df", sec)
-    types_sql = ",".join(f"'{t}'" for t in types)
     sel_f = ", ".join(f"CAST(f.{c} AS FLOAT) AS {c}" for c in FEATURES if not c.startswith(("rank_", "mkt_", "vix", "fx_", "us10y", "t10y2y", "macd_signal")))
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE out0 AS
@@ -318,6 +340,9 @@ def build_year(con, market: str, year: int, cutoff: date | None = None, out_path
     # 미래가 아직 오지 않은(데이터 끝) 라벨 제거
     for k in (5, 20, 60):
         con.execute(f"UPDATE out0 SET y_ret_{k} = NULL, y_vol_{k} = NULL, y_mdd_{k} = NULL WHERE y_trunc_{k} IS NULL")
+
+
+def _finish_year(con, market, year, out_path, types_sql, min_price, min_amt, min_hist, t0, nb) -> None:
     out = out_path or (features_dir(market) / f"year={year}" / "part-0.parquet")
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(".part-0.tmp")
@@ -325,9 +350,8 @@ def build_year(con, market: str, year: int, cutoff: date | None = None, out_path
         CREATE OR REPLACE TEMP TABLE out1 AS
         SELECT *, (coalesce(security_type, 'common') IN ({types_sql}) AND quality_grade IN ('A', 'B', 'C')
                    AND close >= {min_price} AND amount_20 >= {min_amt} AND hist_n >= {min_hist}) AS eligible
-        FROM out0
+        FROM out_acc
     """)
-    n_all = con.execute("SELECT count(*) FROM out1").fetchone()[0]
     # 저장은 학습·분석 대상(eligible) 행만. 횡단면 순위도 같은 날 투자 가능 종목 안에서 계산한다.
     con.execute(f"""
         COPY (
@@ -335,18 +359,13 @@ def build_year(con, market: str, year: int, cutoff: date | None = None, out_path
             CAST(percent_rank() OVER (PARTITION BY trade_date ORDER BY round(ret_20, 6)) AS FLOAT) AS rank_ret_20,
             CAST(percent_rank() OVER (PARTITION BY trade_date ORDER BY round(ret_60, 6)) AS FLOAT) AS rank_ret_60,
             CAST(percent_rank() OVER (PARTITION BY trade_date ORDER BY round(rv_20, 6)) AS FLOAT) AS rank_rv_20,
-            CAST(percent_rank() OVER (PARTITION BY trade_date ORDER BY log_amount_20) AS FLOAT) AS rank_amount_20,
-            {",".join(f"CAST(y_ret_{k} - avg(y_ret_{k}) OVER (PARTITION BY trade_date) AS FLOAT) AS y_xs_{k}, CAST(percent_rank() OVER (PARTITION BY trade_date ORDER BY y_ret_{k}) AS FLOAT) AS y_rank_{k}, CASE WHEN y_ret_{k} IS NULL THEN NULL WHEN y_ret_{k} > 0 THEN 1 ELSE 0 END::TINYINT AS y_up_{k}" for k in (5, 20, 60))}
+            CAST(percent_rank() OVER (PARTITION BY trade_date ORDER BY round(log_amount_20, 6)) AS FLOAT) AS rank_amount_20,
+            {",".join(f"CAST(y_ret_{k} - avg(y_ret_{k}) OVER (PARTITION BY trade_date) AS FLOAT) AS y_xs_{k}, CAST(percent_rank() OVER (PARTITION BY trade_date ORDER BY round(y_ret_{k}, 6)) AS FLOAT) AS y_rank_{k}, CASE WHEN y_ret_{k} IS NULL THEN NULL WHEN y_ret_{k} > 0 THEN 1 ELSE 0 END::TINYINT AS y_up_{k}" for k in (5, 20, 60))}
           FROM out1 WHERE eligible
           ORDER BY trade_date, security_id
         ) TO '{tmp.as_posix()}' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)
     """)
     atomic_replace(tmp, out)
-    n = con.execute(f"SELECT count(*) FROM read_parquet('{out.as_posix()}')").fetchone()
-    res = {"market": market, "year": year, "rows_all": n_all, "eligible": n[0], "sec": round(time.time() - t0, 1),
-           "rss_gb": round(rss_gb(), 2), "bytes": out.stat().st_size}
-    log_event(log, "features built", **res)
-    return res
 
 
 def build(market: str, years: list[int] | None = None) -> list[dict]:
