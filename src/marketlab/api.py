@@ -96,7 +96,7 @@ class MarketData:
                    s.first_trade_date, s.last_trade_date, s.delisting_date
             FROM securities s LEFT JOIN symbol_history h USING (security_id)
             WHERE s.name ILIKE ? OR h.name ILIKE ? OR h.symbol ILIKE ? OR s.security_id ILIKE ?
-            ORDER BY s.status = 'listed' DESC, s.last_trade_date DESC NULLS LAST LIMIT ?
+            ORDER BY s.status = 'listed' DESC, s.security_type = 'common' DESC, s.last_trade_date DESC NULLS LAST LIMIT ?
         """, [q, q, q, q, limit]).df()
 
     def resolve(self, symbol: str, on: str | date | None = None, country: str | None = None) -> str | None:

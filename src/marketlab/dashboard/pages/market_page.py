@@ -33,7 +33,7 @@ c[2].metric("시장 변동성(연)", pct(r["mkt_rv_20"], 0), help=f"과거 대�
 c[3].metric("5일 상승 종목 비율", pct(sm.get("adv_ratio_5"), 0))
 
 st.subheader("주요 지수")
-st.dataframe([{"지수": k.split(":")[1], "기준일": v["last_date"], "값": round(v["value"], 2), "20일": pct(v["ret_20"]), "60일": pct(v["ret_60"])}
+st.dataframe([{"지수": k.split(":")[1], "기준일": str(v["last_date"])[:10], "값": round(v["value"], 2), "20일": pct(v["ret_20"]), "60일": pct(v["ret_60"])}
               for k, v in sm["index_trends"].items()], hide_index=True)
 
 env = sm["env"].tail(750)
@@ -46,7 +46,10 @@ st.plotly_chart(fig, use_container_width=True)
 
 st.subheader("국면별 과거 통계 (이후 20거래일 시장 수익률)")
 st.caption("국면 이름은 이해를 돕기 위한 규칙 기반 설명이며, '좋은/나쁜 시장'이라는 판정이 아닙니다. 과거 통계는 미래를 보장하지 않습니다.")
-st.dataframe(sm["regime_stats"].rename(columns={"regime_rule": "국면", "n": "거래일 수", "fwd_ret_20": "평균 수익률", "fwd_ret_20_pos": "상승 비율"}),
+rs = sm["regime_stats"].copy()
+rs["fwd_ret_20"] = rs["fwd_ret_20"].map(lambda x: pct(x, 2))
+rs["fwd_ret_20_pos"] = rs["fwd_ret_20_pos"].map(lambda x: pct(x, 0))
+st.dataframe(rs.rename(columns={"regime_rule": "국면", "n": "거래일 수", "fwd_ret_20": "평균 수익률", "fwd_ret_20_pos": "상승 비율"}),
              hide_index=True)
 with st.expander("통계 군집(GMM) 특성 — 학습 구간으로만 적합"):
     st.dataframe(sm["cluster_profile"], hide_index=True)

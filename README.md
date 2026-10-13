@@ -144,7 +144,7 @@ md.indicators(["KRX:KS11", "MARCAP:KOSPI_ADV_RATIO"], "2020-01-01", "2020-12-31"
 ## 8. 검증
 
 ```bash
-.venv/bin/python -m pytest -q          # 27개: 실제 데이터 검증(data) + 로직 + 네트워크(network)
+.venv/bin/python -m pytest -q          # 실제 데이터 검증(data) + 로직 + 네트워크(network)
 ```
 실제 데이터 테스트는 수집된 데이터가 있을 때만 실행됩니다. 확인 항목: marcap 1995·최신 연도 로딩, 원본과 표준화 행 수 일치, 삼성전자 실제 종가, 2018 액면분할의 시점별 조정, 코드 재사용 구분과 상장폐지 상태, KOSPI 지수 값과 사용 가능 시점, 중복 없음, 증분 멱등성, DuckDB 메모리 설정.
 US 로직 테스트는 Yahoo 응답 함수만 대체하고, 재개·중지·서킷 브레이커·분할 역산·멱등성은 실제 코드 경로로 확인합니다.
@@ -189,3 +189,23 @@ src/marketlab/
 data/  raw | standardized | curated | metadata | quarantine | tmp     (Git 제외)
 reports/ logs/ models/                                               (Git 제외)
 ```
+
+---
+
+## 머신러닝 투자 연구 시스템 (작업지시서 ②)
+
+같은 데이터를 써서 **패턴 탐색 → 머신러닝 학습 → 전략 검증 → 최신 분석 → 과거 시장 게임**까지 연결합니다.
+실거래 주문, 자동매매, 레버리지 기능은 없습니다. 자세한 설계는 [docs/research_guide.md](docs/research_guide.md) 를 보세요.
+
+```bash
+marketlab research run-all --market KR     # 연구 전체 (특징→학습→walk-forward→전략 탐색→최종 검증 1회→보고서), 재개 가능
+marketlab research run-all --market US     # 미국 (US 주가 수집 후)
+marketlab dashboard                        # 7개 메뉴: 데이터·시장·종목·연구소·백테스트·게임·시스템
+marketlab dashboard --lan                  # 같은 와이파이의 갤럭시·아이패드에서 접속 (보안 안내 표시)
+marketlab research monitor --market KR     # 최신 예측 저장 + 성과 약화·분포 변화 경고
+marketlab research models / promote --model-id <ID>   # 모델은 사용자가 승인해야 기본 모델이 됨
+```
+
+- **미래정보 누출 방지**: t일 마감 정보로 신호를 만들고 t+1일 시가에 체결하며, 라벨도 같은 기준으로 계산합니다. 경계마다 purge 를 적용하고, 최종 검증 구간은 한 번만 쓰도록 기록·통제합니다. 특정 날짜 이후 데이터를 지우고 다시 계산했을 때 특징 62개가 모두 같은지 자동으로 검사합니다.
+- **결과 보고서**: `reports/research_report_KR.md` (US 도 같은 형식)
+- **메모리**: 학습 전에 예상 메모리를 계산하고, 실행 중에는 4GB 를 넘으면 자동 중단합니다. 실측 최대 약 2.2GB 로 M1 8GB 에서 실행할 수 있습니다.

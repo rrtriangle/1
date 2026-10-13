@@ -51,6 +51,7 @@ def run_all(market: str, force_test: bool = False, progress=None) -> dict:
     st = load_state(market)
     steps = st["steps"]
     t_all = time.time()
+    preflight(market)
 
     def step(name, fn):
         if name in steps and steps[name].get("done"):
@@ -96,6 +97,17 @@ def run_all(market: str, force_test: bool = False, progress=None) -> dict:
     st["total_sec"] = round(time.time() - t_all, 1)
     save_state(market, st)
     return st
+
+
+def preflight(market: str) -> dict:
+    """학습 전 저장공간 점검 (수집+연구 합산 예산). 위험하면 StorageRisk 로 중단하고 storage_advice.md 작성."""
+    from ..storage.diskguard import GB, DiskGuard, dir_size
+    feat_exist = dir_size(F.features_dir(market))
+    n_years = len(F.available_years(market))
+    feat_need = 0 if feat_exist else int(n_years * 60e6)          # 실측: 연 40~95MB
+    planned = feat_need + int(0.3 * GB) + int(0.8 * GB) + int(0.3 * GB)  # 모델 + 예측 DB + 백테스트
+    a = DiskGuard(f"머신러닝 연구({market})", planned, peak_temp_bytes=int(2 * GB)).preflight()
+    return {"planned_gb": planned / GB, "free_gb": a.disk_free_gb}
 
 
 def _regime(market: str) -> dict:
