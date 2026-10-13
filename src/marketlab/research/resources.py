@@ -86,3 +86,16 @@ def estimate_training_memory(n_rows: int, n_features: int) -> dict:
 
 def threads() -> int:
     return int((get_settings().get("research.resources", {}) or {}).get("threads", 2))
+
+
+def release_memory() -> None:
+    """fold 사이에 호출: 파이썬 GC + (Linux) 해제된 힙을 운영체제에 반환해 RSS 누적을 막는다."""
+    import gc
+    import sys
+    gc.collect()
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass

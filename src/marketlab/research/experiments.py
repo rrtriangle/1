@@ -28,7 +28,7 @@ from .dataset import sample_every_for
 from .evaluation import classification_metrics, regression_metrics
 from .features import FEATURES, available_years
 from .models import Model
-from .resources import MemoryMonitor, estimate_training_memory
+from .resources import MemoryMonitor, estimate_training_memory, release_memory
 from .store import jdump, research_db
 
 log = get_logger("experiments")
@@ -304,6 +304,7 @@ def walk_forward(market: str, horizon: int, task: str, algorithms: list[str] | N
                             "rank_ic": met.get("rank_ic"), "auc": met.get("auc"), "peak_rss_gb": round(mon.peak_rss_gb, 2)})
             log_event(log, "wf fold", run_id=run_id, year=ty, algo=algo, rank_ic=met.get("rank_ic"))
         del train, test
+        release_memory()
     if progress:
         progress(1.0, "완료")
     return {"run_id": run_id, "folds": summary}

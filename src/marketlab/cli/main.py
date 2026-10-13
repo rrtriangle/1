@@ -82,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("standardize", help="원본으로부터 표준화 데이터 전체 재생성")
     rs = sub.add_parser("research", help="머신러닝 연구 (작업지시서 ②)")
     rs.add_argument("action", choices=["features", "train", "walkforward", "regime", "search", "final-test", "run-all",
-                                       "analyze", "rank", "monitor", "promote", "report", "models", "refit"])
+                                       "analyze", "rank", "monitor", "promote", "report", "models", "refit", "audit"])
     rs.add_argument("--market", default="KR", choices=["KR", "US"])
     rs.add_argument("--horizon", type=int, default=20)
     rs.add_argument("--task", default="rank", choices=["return", "rank", "up", "risk"])
@@ -92,6 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     rs.add_argument("--model-id")
     rs.add_argument("--exp-ids", nargs="*")
     rs.add_argument("--force-test", action="store_true", help="최종 검증 재실행 (독립성 훼손으로 기록됨)")
+    rs.add_argument("--run-id", help="(audit) walk-forward run_id")
     rs.add_argument("--all", action="store_true", help="(features) 모든 연도 특징을 다시 생성")
     rs.add_argument("--winsorize", action="store_true", help="수익률 라벨 극단값을 학습구간 1%/99% 분위수로 제한해 학습")
     args = p.parse_args(argv)
@@ -242,6 +243,12 @@ def _research(a) -> int:
                     print("refit", t, h, r["exp_id"], "학습 마지막", r["trained_until"])
                 except Exception as e:
                     print("refit 실패", t, h, e)
+    elif a.action == "audit":
+        from ..research import audit
+        rid = a.run_id or f"wf-{a.market}-rank-{a.horizon}-expanding"
+        res = audit.audit(a.market, rid, a.horizon)
+        print("보고서:", audit.write_report(res))
+        _print({k: res[k] for k in ("overall", "diagnostics")})
     elif a.action == "models":
         from ..research.store import research_db
         with research_db(read_only=True) as db:
