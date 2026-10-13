@@ -151,6 +151,8 @@ def collect() -> dict:
         run.items_ok = len(frames)
         df = pd.concat(frames, ignore_index=True)
         df = df[df["symbol"].str.len() > 0].drop_duplicates("symbol")
+        if not cfg.get("include_test_issues", False):
+            df = df[df["test_issue"] != "Y"]   # 거래소 시스템 테스트용 종목 (ZVZZT 등) 제외
         types = df.apply(lambda r: classify(r["name"], r["etf"]), axis=1, result_type="expand")
         df["security_type"], df["type_method"] = types[0], types[1]
         df["yahoo_symbol"] = df["symbol"].map(to_yahoo)
@@ -191,7 +193,10 @@ def register_us_securities(df: pd.DataFrame, snapshot_date: str, source: str = "
             SELECT 'US-' || replace(n.symbol, '$', '_P') || '-{sd}' AS security_id, n.*
             FROM snap n ANTI JOIN active a ON a.symbol = n.symbol
         """).df()
-        gone = cat.execute("""SELECT a.* FROM active a ANTI JOIN snap n ON a.symbol = n.symbol""").df()
+        # 같은 원천으로 등록된 증권끼리만 비교 (미러로 등록된 종목을 Nasdaq Trader 기준으로 폐지 판정하지 않음)
+        gone = cat.execute("""SELECT a.* FROM active a JOIN securities s USING (security_id)
+                              ANTI JOIN snap n ON a.symbol = n.symbol
+                              WHERE s.sources = ?""", [source]).df()
         cat.register("new_df", new)
         cat.execute(f"""
             INSERT OR IGNORE INTO securities
