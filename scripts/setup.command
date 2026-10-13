@@ -33,6 +33,18 @@ else
 fi
 
 [ -f .env ] || cp .env.example .env
+# SEC EDGAR 정책: 연락 가능한 User-Agent 필요 (공개 저장소에 올리지 않도록 .env 에만 저장)
+if ! grep -q '^MARKETLAB_SEC_USER_AGENT=.*@' .env; then
+  echo
+  echo "SEC EDGAR 수집에는 이름과 이메일이 필요합니다 (SEC 정책, .env 에만 저장되며 Git 에 올라가지 않음)."
+  read -r -p "영문 이름 (예: SEOKKI HONG): " SEC_NAME
+  read -r -p "이메일: " SEC_EMAIL
+  if [ -n "$SEC_NAME" ] && [ -n "$SEC_EMAIL" ]; then
+    grep -v '^MARKETLAB_SEC_USER_AGENT=' .env > .env.tmp || true
+    echo "MARKETLAB_SEC_USER_AGENT=\"$SEC_NAME $SEC_EMAIL\"" >> .env.tmp
+    mv .env.tmp .env
+  fi
+fi
 echo
 echo "== 환경 점검 =="
 .venv/bin/marketlab doctor | head -80

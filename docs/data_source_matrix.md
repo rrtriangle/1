@@ -54,6 +54,8 @@
 - 상장폐지: 티커가 현재 기업을 가리키므로 폐지 종목 이력은 대부분 조회되지 않는다. 티커 재사용 시 과거 기업 이력은 사라짐
 - 대체: Stooq, Tiingo(무료 키), 유료(Norgate, CRSP, Sharadar)
 - 개발환경: 정책상 접속 차단 → 맥북에서 `ingest --market US` 로 수집해야 함
+- **주의**: 접속이 막혀도 yfinance 는 네트워크 오류 대신 `YFTzMissingError: possibly delisted` 를 돌려줍니다(개발환경에서 확인).
+  그래서 수집기는 SPY 조회로 실제 응답 여부를 확인한 뒤 진행하고, 차단 중의 빈 응답을 상장폐지로 기록하지 않습니다.
 
 ### 5. Stooq — https://stooq.com/dbh/ , https://stooq.com/db/h/
 - 종목별 CSV(`/q/d/l/?s=aapl.us&i=d`)는 2026년 3월경부터 사이트에서 CAPTCHA 로 발급받는 API 키를 요구한다는 보고가 있음(pandas-datareader 이슈). 일일 호출 한도 존재
@@ -65,6 +67,9 @@
 - `nasdaqlisted.txt`(NASDAQ), `otherlisted.txt`(NYSE, NYSE American, NYSE Arca, Cboe BZX, IEX): 티커, 이름, 거래소, ETF 여부, 테스트 종목 여부
 - **현재 상장 목록이며 과거 상장폐지 전체 목록이 아니다.** 본 시스템은 실행마다 스냅샷을 보관해, 도입 이후 목록에서 사라진 종목만 폐지(추정)로 기록한다
 - ADR/우선주/SPAC/워런트 구분은 이름 기반 추정(type_method='heuristic'). ETF 여부만 거래소 제공값
+
+- 대체 경로: GitHub 미러 https://github.com/rreichel3/US-Stock-Symbols (Nasdaq 종목 스크리너 데이터를 매일 적재). 2026-10-13 개발환경에서 접근에 성공했습니다(NASDAQ 4,020, NYSE 2,689, AMEX 294 = 7,003종목).
+  ETF 플래그와 NYSE Arca·Cboe 상장 종목이 없습니다. 우선주는 `^`, 클래스주는 `/` 로 표기되어 있어 ACT 표기(`$`, `.`)로 변환합니다.
 
 ### 7. KRX 정보데이터시스템 — https://data.krx.co.kr/
 - 공식 원천이지만 자동 다운로드에 로그인(회원) 세션이 필요해졌다(FDR 캐시 전환이 그 증거). 로그인 자동화나 우회를 하지 않는다

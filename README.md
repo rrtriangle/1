@@ -23,7 +23,8 @@ cd ~/market-research-lab          # 저장소를 받은 위치
 1. Apple Silicon 네이티브 터미널인지 확인합니다(Rosetta 이면 경고).
 2. `uv` 가 있으면 Python 3.12 가상환경을 만들고, 없으면 Python 3.11 이상을 찾아 `.venv` 를 만듭니다.
 3. `requirements.lock` 의 고정 버전을 설치합니다. 모두 M1 arm64 휠이 제공되는 버전입니다.
-4. `.env.example` 을 `.env` 로 복사합니다.
+4. `.env.example` 을 `.env` 로 복사하고, SEC 정책에 필요한 영문 이름과 이메일을 물어 `.env` 에 저장합니다.
+   이 저장소는 공개 저장소이므로 이메일은 `.env`(Git 제외)에만 저장하고 커밋하지 않습니다.
 5. `doctor`(환경), `sources`(원천 접근), `disk-plan`(저장공간)을 차례로 실행합니다.
 
 Python 3.11 이상이 없다면 다음 중 하나로 설치합니다: `curl -LsSf https://astral.sh/uv/install.sh | sh` (권장) 또는 `brew install python@3.12`
@@ -31,7 +32,7 @@ Python 3.11 이상이 없다면 다음 중 하나로 설치합니다: `curl -LsS
 `.env` 에서 선택적으로 설정하는 값:
 ```bash
 MARKETLAB_DATA_DIR=                       # 비우면 ./data (외장 SSD 로 옮길 때 사용)
-MARKETLAB_SEC_USER_AGENT="홍길동 you@example.com"   # SEC 수집 시 필수 (SEC 정책)
+MARKETLAB_SEC_USER_AGENT="영문이름 email@example.com"   # SEC 수집 시 필수 (SEC 정책). setup.command 가 처음 실행 때 물어봄
 DART_API_KEY=                             # OpenDART (선택)
 ```
 
@@ -81,6 +82,10 @@ Python 을 몰라도 쓸 수 있도록 `scripts/` 에 더블클릭 실행 파일
 - **증분·멱등**: 원격 blob sha 가 같으면 다시 받지 않습니다. US 는 마지막 성공일에서 최근 N 거래일 앞부터 다시 받아 덮어쓰고, 표준화 단계에서 키 기준으로 최신본 하나만 남깁니다.
 - **재개**: 종목 단위 상태(`ingestion_items`)와 실행 기록(`ingestion_runs`)을 남깁니다. 비정상 종료된 실행은 다음 실행 때 `interrupted` 로 정리합니다.
 - **재검증**: US 는 종목마다 `revalidate_every_days`(30일) 주기로 전체 이력을 다시 받아 과거 값 변경을 `data_quality_issues(source_revision)` 에 기록합니다. KR 은 원격 해시 비교로 과거 연도 수정을 감지합니다.
+- **미국 종목 목록 대체 경로**: Nasdaq Trader 에 접속할 수 없으면 GitHub 미러(rreichel3/US-Stock-Symbols, NASDAQ/NYSE/AMEX, 매일 갱신)로 자동 전환합니다.
+  미러에는 ETF·NYSE Arca 가 없어 범위가 좁으므로, 미러를 쓴 날에는 목록에서 사라진 종목을 상장폐지로 판정하지 않습니다.
+- **Yahoo 차단 오판 방지**: yfinance 는 접속이 막혀도 `possibly delisted` 를 돌려줍니다. 그래서 시작 전과 빈 응답이 20건 이어질 때마다 SPY 로 실제 응답 여부를 확인하고,
+  응답이 없으면 차단으로 판단해 중단합니다. 차단 중에 받은 빈 응답은 상장폐지로 기록하지 않습니다.
 - **호출 제한**: 원천별 최소 간격을 `config/settings.yaml` 에서 정합니다. 429·5xx 는 지수 백오프로 재시도하고, 차단이 계속되면 서킷 브레이커가 해당 원천만 안전하게 중단합니다. 로그인·CAPTCHA 는 우회하지 않습니다.
 - **메모리**: DuckDB `memory_limit=2GB`, `threads=2`, `preserve_insertion_order=false`, 임시공간 4GB 상한으로 시작합니다. 연도 단위로 스트리밍 처리합니다(실측: 한국 전체 표준화 4분).
 - **날짜**: 거래일은 거래소 현지 날짜입니다. 지표에는 실제 사용 가능 시각(`available_at`, UTC)이 붙으며 서머타임을 반영합니다. 장 마감과 지연 시간이 지나지 않은 일봉은 `is_final=false` 로 둡니다.
@@ -139,7 +144,7 @@ md.indicators(["KRX:KS11", "MARCAP:KOSPI_ADV_RATIO"], "2020-01-01", "2020-12-31"
 ## 8. 검증
 
 ```bash
-.venv/bin/python -m pytest -q          # 24개: 실제 데이터 검증(data) + 로직 + 네트워크(network)
+.venv/bin/python -m pytest -q          # 27개: 실제 데이터 검증(data) + 로직 + 네트워크(network)
 ```
 실제 데이터 테스트는 수집된 데이터가 있을 때만 실행됩니다. 확인 항목: marcap 1995·최신 연도 로딩, 원본과 표준화 행 수 일치, 삼성전자 실제 종가, 2018 액면분할의 시점별 조정, 코드 재사용 구분과 상장폐지 상태, KOSPI 지수 값과 사용 가능 시점, 중복 없음, 증분 멱등성, DuckDB 메모리 설정.
 US 로직 테스트는 Yahoo 응답 함수만 대체하고, 재개·중지·서킷 브레이커·분할 역산·멱등성은 실제 코드 경로로 확인합니다.

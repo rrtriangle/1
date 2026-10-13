@@ -15,3 +15,9 @@ def test_security_type_rules():
     assert classify("Acme Corp - Warrant", "N")[0] == "warrant"
     assert classify("Foo Acquisition Corp - Units", "N")[0] == "unit"
     assert classify("Bar Inc 6.5% Series A Cumulative Preferred Stock", "N")[0] == "preferred"
+
+
+def test_mirror_symbol_normalization_matches_act_format():
+    import pandas as pd
+    sym = pd.Series(["ABR^D", "BRK/A", "AAPL"]).str.replace("^", "$", regex=False).str.replace("/", ".", regex=False)
+    assert [to_yahoo(s) for s in sym] == ["ABR-PD", "BRK-A", "AAPL"]

@@ -81,7 +81,11 @@ def collect_tickers() -> dict:
     cfg = s.source(SOURCE)
     c = _client()
     run = Run(SOURCE, "US", "tickers").start()
-    r = c.get(cfg["tickers_url"])
+    try:
+        r = c.get(cfg["tickers_url"])
+    except Exception as e:
+        run.finish("failed", f"접속 실패: {str(e)[:300]}")
+        raise
     if r.status_code != 200:
         run.finish("failed", f"HTTP {r.status_code}")
         raise RuntimeError(f"SEC tickers HTTP {r.status_code}")

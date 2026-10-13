@@ -52,7 +52,7 @@ def test_collect_resume_split_reconstruction_and_idempotency(isolated, monkeypat
     # 재개: 전체 수집을 다시 실행하면 이미 받은 종목은 건너뛴다
     calls.clear()
     yfinance_us.collect(mode="full")
-    assert [c[0] for c in calls] == ["BBB"]
+    assert [c[0] for c in calls if c[0] != "SPY"] == ["BBB"]
 
     # 표준화: 분할(4:1, 2024-06-05) 이전 가격은 ×4 로 당시 거래가 역산
     from marketlab.transforms import us_prices
@@ -101,3 +101,32 @@ def test_rate_limit_circuit_breaker(isolated, monkeypatch):
     get_settings().raw["http"]["circuit_breaker_threshold"] = 2
     r = yfinance_us.collect(mode="full")
     assert r["status"] == "blocked"
+
+
+def test_blocked_yahoo_does_not_mark_delisted(isolated, monkeypatch):
+    """Yahoo 접속 불가 시 yfinance 는 'possibly delisted' 를 돌려준다 → 상장폐지로 기록하지 않고 중단해야 한다."""
+    for i in range(3):
+        _register(f"US-B{i}-20240101", f"B{i}")
+    monkeypatch.setattr(yfinance_us, "fetch_history",
+                        lambda s, st: (pd.DataFrame(), f"YFTzMissingError: ${s}: possibly delisted; no timezone found"))
+    r = yfinance_us.collect(mode="full")
+    assert r["status"] == "blocked"
+    assert base.get_item_states("yfinance") == {}
+
+
+def test_empty_streak_with_dead_probe_is_forgotten(isolated, monkeypatch):
+    for i in range(25):
+        _register(f"US-E{i:02d}-20240101", f"E{i:02d}")
+    state = {"probe_calls": 0}
+
+    def fake(symbol, start):
+        if symbol == "SPY":
+            state["probe_calls"] += 1
+            return (_frame(), None) if state["probe_calls"] == 1 else (pd.DataFrame(), "dead")
+        return pd.DataFrame(), "YFTzMissingError: possibly delisted"
+
+    monkeypatch.setattr(yfinance_us, "fetch_history", fake)
+    monkeypatch.setattr("time.sleep", lambda x: None)
+    r = yfinance_us.collect(mode="full")
+    assert r["status"] == "blocked"
+    assert not any(v["status"] == "empty" for v in base.get_item_states("yfinance").values())

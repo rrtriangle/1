@@ -93,6 +93,25 @@ def fetch_history(symbol: str, start: date | None) -> tuple[pd.DataFrame, str | 
     return df, None
 
 
+def yahoo_alive(probe: str = "SPY") -> tuple[bool, str]:
+    """Yahoo 접속 확인. yfinance 는 접속 실패를 'possibly delisted' 로 감추므로
+    항상 존재하는 종목을 조회해 실제 응답 여부를 판정한다."""
+    df, err = fetch_history(probe, date.today() - timedelta(days=14))
+    return (not df.empty), (err or ("ok" if not df.empty else "empty response"))
+
+
+def _forget_items(sids: list[str]) -> None:
+    with catalog() as cat:
+        cat.execute("DELETE FROM ingestion_items WHERE source = ? AND item_key IN (SELECT unnest(?::VARCHAR[]))",
+                    [SOURCE, sids])
+
+
+def _is_network_failure(err: str | None) -> bool:
+    keys = ("ProxyError", "ConnectionError", "Failed to perform", "Could not resolve", "Connection refused",
+            "SSLError", "curl: (", "Timeout", "timed out", "403 Forbidden")
+    return bool(err) and any(k in err for k in keys)
+
+
 def _is_rate_limited(err: str | None) -> bool:
     return bool(err) and any(k in err for k in ("RateLimit", "Too Many Requests", "429", "rate limit"))
 
@@ -208,11 +227,17 @@ def collect(mode: str = "incremental", symbols: list[str] | None = None, limit: 
     planned = int(est_rows * measured_bytes_per_row() * 2.2)  # 원본 + 표준화
     guard = DiskGuard("yfinance 미국 일봉", planned)
     buf: list[pd.DataFrame] = []
-    part_no, written, consecutive_rl = 0, 0, 0
+    part_no, written, consecutive_rl, consecutive_net = 0, 0, 0, 0
     item_updates: list[tuple] = []
     import time as _t
+    consecutive_empty = 0
+    empty_streak: list[str] = []
     try:
         guard.preflight()
+        if todo:
+            alive, why = yahoo_alive()
+            if not alive:
+                raise SourceBlocked(f"Yahoo 응답 없음 (SPY 조회 실패: {why[:200]}) - 접속 차단/네트워크 확인 후 재개하세요")
         for i, (sid, sym, st) in enumerate(todo):
             if stop_requested():
                 raise StopRequested("사용자 중지 요청")
@@ -240,6 +265,25 @@ def collect(mode: str = "incremental", symbols: list[str] | None = None, limit: 
                 _t.sleep(wait)
                 continue
             consecutive_rl = 0
+            if _is_network_failure(err):
+                consecutive_net += 1
+                if consecutive_net >= int(s.get("http.circuit_breaker_threshold", 8)):
+                    item_updates.append((sid, "blocked", None, None, 0, err[:300]))
+                    run.items_failed += 1
+                    raise SourceBlocked(f"Yahoo 접속 불가가 {consecutive_net}회 연속 - 네트워크/차단 확인 후 재개하세요: {err[:200]}")
+            else:
+                consecutive_net = 0
+            if err or df.empty:
+                consecutive_empty += 1
+                empty_streak.append(sid)
+                if consecutive_empty % 20 == 0:
+                    alive, why = yahoo_alive()
+                    if not alive:
+                        # 직전 연속 빈 응답은 접속 문제였을 가능성이 높으므로 상장폐지로 기록하지 않는다
+                        raise SourceBlocked(f"연속 {consecutive_empty}건 빈 응답 + SPY 조회 실패 - 차단으로 판단, 중단")
+            else:
+                consecutive_empty = 0
+                empty_streak = []
             if err or df.empty:
                 status = "empty" if (not err or "No data" in err or "delisted" in err.lower()) else "failed"
                 item_updates.append((sid, status, None, None, 0, (err or "no rows")[:300]))
@@ -276,6 +320,8 @@ def collect(mode: str = "incremental", symbols: list[str] | None = None, limit: 
         try:
             _flush(buf, run, part_no)
             upsert_items(SOURCE, item_updates)
+            if isinstance(e, SourceBlocked) and empty_streak:
+                _forget_items(empty_streak)   # 차단 중의 빈 응답은 상장폐지 판정에서 제외 (다음 실행에서 재시도)
         finally:
             status = "stopped" if isinstance(e, (StopRequested, StorageRisk)) else "blocked"
             run.finish(status, str(e))
