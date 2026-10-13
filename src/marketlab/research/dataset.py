@@ -19,6 +19,11 @@ def trading_days(market: str) -> list[date]:
                                           [market]).fetchall()]
 
 
+def sample_every_for(market: str) -> int:
+    v = get_settings().get("research.sampling_every_n_days", 5)
+    return int(v.get(market, 5)) if isinstance(v, dict) else int(v)
+
+
 def purge_cutoff(market: str, boundary: date, horizon: int) -> date:
     """boundary 이전 학습 행 중 라벨 기간(t+1 ~ t+horizon)이 boundary 이후로 넘어가는 행을 제거하기 위한 마지막 허용일."""
     days = [d for d in trading_days(market) if d < boundary]
@@ -33,7 +38,7 @@ def load(market: str, start: date | str, end: date | str, features: list[str] | 
     s = get_settings()
     feats = features or FEATURES
     labs = labels or []
-    every = sample_every if sample_every is not None else int(s.get("research.sampling_every_n_days", 5))
+    every = sample_every if sample_every is not None else sample_every_for(market)
     cols = KEYS + ["market", "close", "amount_20", "market_cap", "entry_ok"] + (extra or []) + feats + labs
     cols = list(dict.fromkeys(cols))
     con = memory_connection()

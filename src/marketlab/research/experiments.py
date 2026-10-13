@@ -24,6 +24,7 @@ import pandas as pd
 from ..config import get_settings
 from ..logging_setup import get_logger, log_event
 from . import dataset
+from .dataset import sample_every_for
 from .evaluation import classification_metrics, regression_metrics
 from .features import FEATURES, available_years
 from .models import Model
@@ -122,7 +123,7 @@ def train_eval(market: str, horizon: int, task: str, algorithms: list[str] | Non
     tr_end = min(P["train_end"], dataset.purge_cutoff(market, P["valid_start"], horizon))
     va_end = min(P["valid_end"], dataset.purge_cutoff(market, P["test_start"], horizon))
     labels = list(dict.fromkeys([target, f"y_ret_{horizon}"]))
-    n_est = dataset.count_rows(market, P["train_start"], tr_end, target, sample_every or int(s.get("research.sampling_every_n_days", 5)))
+    n_est = dataset.count_rows(market, P["train_start"], tr_end, target, sample_every or sample_every_for(market))
     mem = estimate_training_memory(n_est, len(FEATURES))
     if not mem["fits"]:
         raise MemoryError(f"예상 메모리 {mem['estimated_peak_gb']:.1f}GB > 목표. 표본 간격을 늘리거나(sample_every) 기간을 나누세요. "
@@ -190,7 +191,7 @@ def train_eval(market: str, horizon: int, task: str, algorithms: list[str] | Non
                         "best_iteration": m.best_iteration}), jdump(FEATURES),
                         jdump(get_settings().get("research.universe")), jdump({k: str(v) for k, v in P.items()} | {"train_end_purged": str(tr_end), "valid_end_purged": str(va_end)}),
                         jdump(data_version(market)), seed, len(train), len(eval_df), secs, mon.peak_rss_gb,
-                        jdump(rec), str(path), code_version(), jdump({"sample_every": sample_every or s.get("research.sampling_every_n_days")})])
+                        jdump(rec), str(path), code_version(), jdump({"sample_every": sample_every or sample_every_for(market)})])
             db.execute("INSERT OR REPLACE INTO model_registry VALUES (?, now(), ?, ?, ?, ?, ?, ?, 'candidate', ?, ?)",
                        [exp_id, market, horizon, algo, tr_end, exp_id, str(path), jdump(met), f"task={task}"])
         log_event(log, "experiment done", exp_id=exp_id, rank_ic=met.get("rank_ic"), auc=met.get("auc"))

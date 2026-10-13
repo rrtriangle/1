@@ -123,7 +123,9 @@ research:
     min_avg_amount_krw: 300000000  # 20일 평균 거래대금 3억원
     min_avg_amount_usd: 1000000    # 20일 평균 거래대금 100만달러
     min_history_days: 120
-  sampling_every_n_days: 5         # 학습 표본: N거래일마다 (메모리·라벨 중첩 완화)
+  sampling_every_n_days:           # 학습 표본: N거래일마다 (메모리·라벨 중첩 완화)
+    KR: 5
+    US: 10                         # US 는 종목 수가 많아 walk-forward 후반 fold 가 4GB 한도를 넘음(실측 4.11GB) → 10일 간격
   splits:
     train_end: "2020-12-31"
     valid_start: "2021-01-01"

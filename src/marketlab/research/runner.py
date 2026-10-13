@@ -224,7 +224,7 @@ def write_report(market: str, st: dict):
     L += [f"- 특징 파일 연도: {min(int(y) for y in man)}~{max(int(y) for y in man)}, 투자 가능(학습 대상) 행 {sum(v or 0 for v in man.values()):,}",
           f"- 학습 {P['train_start']}~{P['train_end']} / 모델 선택(검증) {P['valid_start']}~{P['valid_end']} / 최종 독립 검증 {P['test_start']}~",
           f"- 학습 대상 기준: {s.get('research.universe')}",
-          f"- 학습 표본: {s.get('research.sampling_every_n_days')}거래일 간격 추출 (메모리 절약·라벨 중첩 완화). 경계마다 라벨 기간만큼 purge.",
+          f"- 학습 표본: {E.sample_every_for(market)}거래일 간격 추출 (메모리 절약·라벨 중첩 완화). 경계마다 라벨 기간만큼 purge.",
           "- 제외: 우선주·신주·SPAC·ETF 등 보통주 외, 품질 등급 X, 가격/거래대금 기준 미달, 이력 120거래일 미만 종목-일."]
     if market == "KR":
         L += ["- 한계: 배당 데이터 없음(총수익률 과소), 업종 분류의 시점 이력 없음(업종 특징 미사용), 재무정보 없음(OpenDART 키 필요)."]
