@@ -6,6 +6,7 @@
 - 수량: 정수 주. 현금 부족 시 매수 불가(무차입). 공매도·레버리지 없음.
 - 주문 한도: 체결일 거래대금 × max_participation 이하 (부분 체결).
 - 비용: 수수료(양방향) + 슬리피지 + 매도세(시점별 표) (+ 원화 기준 시 환전비용).
+  슬리피지는 slippage_tiers 를 설정하면 체결일까지의 20일 평균 거래대금 구간별로 다르게 적용(소형주일수록 크게).
 - 기업행위: KR 기준가 조정일에 보유 수량 ÷ 조정계수(분할·병합은 정확, 유·무상증자는 가치 보존 근사),
   US 분할일 수량 × 분할비율, 배당락일 현금 배당 입금(분할 반영 전 주당 금액으로 환산).
   KR 은 원천에 배당 정보가 없어 배당 수익이 빠진다(성과 과소평가 요인).
@@ -38,12 +39,34 @@ class Costs:
     sell_tax_schedule: list = field(default_factory=list)
     fx_cost_bps: float = 0.0
     multiplier: float = 1.0
+    # [{min_amount, bps}, ...] — 20일 평균 거래대금(현지 통화)이 min_amount 이상인 구간 중 가장 높은 구간의 bps 적용.
+    # 비어 있으면 모든 종목에 slippage_bps. 거래대금을 모르면(신규 상장 등) 가장 낮은 구간(가장 비싼 쪽).
+    slippage_tiers: list = field(default_factory=list)
+
+    def __post_init__(self):
+        tiers = sorted(({"min_amount": float(t["min_amount"]), "bps": float(t["bps"])} for t in self.slippage_tiers or []),
+                       key=lambda t: t["min_amount"])
+        if tiers and tiers[0]["min_amount"] > 0:
+            raise ValueError("slippage_tiers 의 첫 구간은 min_amount: 0 이어야 합니다 (모든 종목이 어느 구간엔가 속하도록).")
+        self.slippage_tiers = tiers
 
     @staticmethod
     def for_market(market: str, multiplier: float = 1.0) -> "Costs":
         c = dict(get_settings().get(f"research.costs.{market}", {}) or {})
         return Costs(commission_bps=float(c.get("commission_bps", 0)), slippage_bps=float(c.get("slippage_bps", 0)),
-                     sell_tax_schedule=c.get("sell_tax_schedule", []) or [], fx_cost_bps=0.0, multiplier=multiplier)
+                     sell_tax_schedule=c.get("sell_tax_schedule", []) or [], fx_cost_bps=0.0, multiplier=multiplier,
+                     slippage_tiers=c.get("slippage_tiers", []) or [])
+
+    def slip_for(self, avg_amount: float | None) -> float:
+        """종목의 20일 평균 거래대금에 맞는 슬리피지 비율."""
+        if not self.slippage_tiers:
+            return self.slip
+        bps = self.slippage_tiers[0]["bps"]
+        if avg_amount is not None and not math.isnan(avg_amount):
+            for t in self.slippage_tiers:
+                if avg_amount >= t["min_amount"]:
+                    bps = t["bps"]
+        return bps * self.multiplier / 1e4
 
     def sell_tax(self, d: date) -> float:
         bps = 0.0
@@ -94,6 +117,12 @@ class PriceBook:
                 FROM read_parquet('{g}', hive_partitioning=true) p JOIN ids USING (security_id)
                 WHERE p.trade_date BETWEEN DATE '{start}' AND DATE '{end}'
             """).df()
+            # 슬리피지 구간용 20일 평균 거래대금의 초기값: 시작일 전 약 2개월 거래대금
+            pre = con.execute(f"""
+                SELECT p.security_id, p.trade_date, {amt} AS amount
+                FROM read_parquet('{g}', hive_partitioning=true) p JOIN ids USING (security_id)
+                WHERE p.trade_date >= DATE '{start}' - INTERVAL 45 DAY AND p.trade_date < DATE '{start}'
+            """).df()
             with catalog(read_only=True) as cat:
                 cal = [r[0] for r in cat.execute("SELECT trade_date FROM trading_calendars WHERE market=? AND trade_date BETWEEN ? AND ? "
                                                   "AND source IN ('both','observed') ORDER BY 1", [market, start, end]).fetchall()]
@@ -115,10 +144,23 @@ class PriceBook:
             a[r, c] = df[col].to_numpy(dtype=dtype)
             return a
         self.open, self.close, self.amount = arr("open"), arr("close"), arr("amount")
+        # 슬리피지 구간 판단용: 체결일 직전까지의 20거래일 평균 거래대금 (체결일 당일 값은 장 시작 시 모르므로 제외)
+        pre_a = np.empty((0, N), dtype=np.float32)
+        if len(pre):
+            pv = pre.pivot_table(index="trade_date", columns="security_id", values="amount", aggfunc="last").sort_index()
+            pre_a = pv.reindex(columns=self.sids).to_numpy(dtype=np.float32)
+        self.amount_avg20 = self._lagged_avg(np.vstack([pre_a, self.amount]), 20)[len(pre_a):]
         # 조정계수·분할비율은 float64 (0.02 같은 값의 float32 오차로 수량이 950.00000x 가 되는 것 방지)
         self.adj, self.split, self.div = arr("adj", 1.0, np.float64), arr("split", 1.0, np.float64), arr("div", 0.0, np.float64)
         self.last_idx = {s: self.didx[d] for s, d in df.groupby("security_id")["trade_date"].max().items()}
         self.meta = meta.set_index("security_id").to_dict("index")
+
+    @staticmethod
+    def _lagged_avg(a: np.ndarray, n: int) -> np.ndarray:
+        """각 날짜 i 에 대해 i-n ~ i-1 의 평균(값이 있는 날만). 조회 구간 첫날은 이전 값이 없어 NaN."""
+        if a.size == 0:
+            return a.copy()
+        return pd.DataFrame(a).rolling(n, min_periods=1).mean().shift(1).to_numpy(dtype=np.float32)
 
     TERMINATED_STATUS = ("delisted", "merged")
 

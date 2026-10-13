@@ -43,3 +43,37 @@ def roomy(isolated):
     isolated.raw["storage"]["project_budget_gb"] = 10_000
     isolated.raw["storage"]["assumed_free_gb_baseline"] = 0
     return isolated
+
+
+@pytest.fixture
+def synthetic_up(isolated, monkeypatch):
+    """합성 특징·라벨(2016~2023, 8종목)로 dataset.load 등을 대체 — 학습·walk-forward 로직 테스트용."""
+    import numpy as np
+    import pandas as pd
+    from marketlab.research import dataset
+    from marketlab.research.features import FEATURES
+    days = list(pd.bdate_range("2016-01-04", "2023-12-29").date)
+    rng = np.random.default_rng(0)
+    n = 8
+    D = np.repeat(np.array(days, dtype=object), n)
+    X = rng.normal(size=(len(D), len(FEATURES))).astype(np.float32)
+    ret = 0.02 * X[:, 0] + rng.normal(scale=0.05, size=len(D))
+    base = pd.DataFrame(X, columns=FEATURES)
+    base.insert(0, "security_id", np.tile([f"KR-T{i:03d}" for i in range(n)], len(days)))
+    base.insert(1, "trade_date", D)
+    base["y_ret_20"] = ret.astype(np.float32)
+    base["y_up_20"] = (ret > 0).astype(float)
+
+    def fake_load(market, start, end, features=None, labels=None, sample_every=None, extra=None, require_label=None):
+        s, e = pd.Timestamp(start).date(), pd.Timestamp(end).date()
+        out = base[(base["trade_date"] >= s) & (base["trade_date"] <= e)]
+        if sample_every and sample_every > 1:
+            keep = sorted(out["trade_date"].unique())[::sample_every]
+            out = out[out["trade_date"].isin(keep)]
+        return out.reset_index(drop=True)
+
+    monkeypatch.setattr(dataset, "load", fake_load)
+    monkeypatch.setattr(dataset, "count_rows", lambda *a, **k: 1000)
+    monkeypatch.setattr(dataset, "trading_days", lambda market: days)
+    isolated.raw.setdefault("research", {})["train_start"] = {"KR": "2016-01-01"}
+    return days

@@ -75,6 +75,13 @@ class Portfolio:
             v += q * (o if o > 0 and not math.isnan(o) else self.last_px.get(s, 0.0))
         return v
 
+    def _slip(self, pb, i: int, s: str) -> float:
+        """종목·날짜별 슬리피지 (거래대금 구간 설정이 없으면 고정값)."""
+        if not getattr(self.costs, "slippage_tiers", None):
+            return self.costs.slip
+        avg = getattr(pb, "amount_avg20", None)
+        return self.costs.slip_for(float(avg[i, pb.sidx[s]]) if avg is not None and s in pb.sidx else None)
+
     def _price(self, pb, i, s):
         if s not in pb.sidx:
             return 0.0
@@ -100,7 +107,8 @@ class Portfolio:
         if q <= 0:
             self._defer(s, qty)
             return 0
-        exec_px = px * (1 - self.costs.slip)
+        slip = self._slip(pb, i, s)
+        exec_px = px * (1 - slip)
         value = q * exec_px
         fee = value * (self.costs.comm + self.costs.sell_tax(d))
         avg = self.cost_basis.get(s, 0) / have
@@ -114,7 +122,7 @@ class Portfolio:
         elif qty > q:
             self._defer(s, qty - q)   # 남은 수량만 다음 날 재시도
         self.trades.append({"date": d, "security_id": s, "side": "SELL", "shares": q, "price": exec_px, "value": value,
-                            "cost": fee + q * px * self.costs.slip, "pnl": value - fee - avg * q, "note": note})
+                            "cost": fee + q * px * slip, "pnl": value - fee - avg * q, "note": note})
         return q
 
     def buy(self, pb, i: int, d: date, s: str, qty: float, note: str = "") -> float:
@@ -123,7 +131,8 @@ class Portfolio:
             return 0
         j = pb.sidx[s]
         cap = float(pb.amount[i, j]) * self.cons.max_participation if pb.amount[i, j] > 0 else 0.0
-        exec_px = px * (1 + self.costs.slip)
+        slip = self._slip(pb, i, s)
+        exec_px = px * (1 + slip)
         q = min(math.floor(qty), math.floor(cap / px) if cap > 0 else 0,
                 math.floor(self.cash / (exec_px * (1 + self.costs.comm))))
         if q <= 0:
@@ -134,7 +143,7 @@ class Portfolio:
         self.shares[s] = self.shares.get(s, 0) + q
         self.cost_basis[s] = self.cost_basis.get(s, 0) + value + fee
         self.trades.append({"date": d, "security_id": s, "side": "BUY", "shares": q, "price": exec_px, "value": value,
-                            "cost": fee + q * px * self.costs.slip, "pnl": 0.0, "note": note})
+                            "cost": fee + q * px * slip, "pnl": 0.0, "note": note})
         return q
 
     def retry_pending(self, pb, i: int, d: date, note: str = "미체결 매도 재시도") -> None:
@@ -160,7 +169,7 @@ class Portfolio:
             px = self._price(pb, i, s)
             if px <= 0:
                 continue
-            want = math.floor(eq * min(w, self.cons.max_weight) / (px * (1 + self.costs.slip)))
+            want = math.floor(eq * min(w, self.cons.max_weight) / (px * (1 + self._slip(pb, i, s))))
             plan.append((s, want - self.shares.get(s, 0)))
         for s, dq in sorted(plan, key=lambda x: x[1]):
             if dq < 0:

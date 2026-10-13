@@ -93,7 +93,8 @@ def _predict(m: Model, X: pd.DataFrame) -> np.ndarray:
     return m.predict(X)
 
 
-def _metrics(task: str, df: pd.DataFrame, horizon: int) -> dict:
+def _metrics(task: str, df: pd.DataFrame, horizon: int, sample_every: int = 1) -> dict:
+    """sample_every: 평가 행의 날짜 간격(거래일). 순위상관 t값의 Newey-West 라그 = ceil(horizon/sample_every)."""
     if task == "up":
         out = classification_metrics(df, "pred", "y")
         # 투자 관점: 상승 확률 상위 20% 의 실현 수익률
@@ -104,11 +105,11 @@ def _metrics(task: str, df: pd.DataFrame, horizon: int) -> dict:
         return out
     if task == "rank":
         # 순위 모델은 실현 수익률과의 순위 상관으로 평가
-        out = regression_metrics(df.assign(y=df[f"y_ret_{horizon}"]), "pred", "y")
+        out = regression_metrics(df.assign(y=df[f"y_ret_{horizon}"]), "pred", "y", horizon, sample_every)
         for k in ("mae", "rmse", "direction_acc"):
             out.pop(k, None)
         return out
-    return regression_metrics(df, "pred", "y")
+    return regression_metrics(df, "pred", "y", horizon, sample_every)
 
 
 def train_eval(market: str, horizon: int, task: str, algorithms: list[str] | None = None,
@@ -171,7 +172,7 @@ def train_eval(market: str, horizon: int, task: str, algorithms: list[str] | Non
             ev["y"] = eval_df[target].to_numpy()
             if f"y_ret_{horizon}" not in ev:
                 ev[f"y_ret_{horizon}"] = eval_df[f"y_ret_{horizon}"].to_numpy()
-            met = _metrics(task, ev, horizon)
+            met = _metrics(task, ev, horizon, sample_every or sample_every_for(market))
             if kind == "regression" and task != "rank":
                 res = (ev["y"] - ev["pred"]).dropna()
                 met["resid_q"] = [float(res.quantile(q)) for q in (0.1, 0.5, 0.9)]
@@ -218,7 +219,7 @@ def final_test(exp_ids: list[str], purpose: str = "final evaluation") -> list[di
         ev = test[["security_id", "trade_date", f"y_ret_{horizon}"]].copy()
         ev["pred"] = _predict(m, test)
         ev["y"] = test[target].to_numpy()
-        met = _metrics(task, ev, horizon)
+        met = _metrics(task, ev, horizon, sample_every_for(market))
         n_prev = prev.get(exp_id, 0)
         rec = {"exp_id": exp_id, "metrics_test": met, "n_test": len(test), "test_period": f"{P['test_start']}~{test['trade_date'].max()}",
                "previous_accesses": n_prev,
@@ -232,24 +233,45 @@ def final_test(exp_ids: list[str], purpose: str = "final evaluation") -> list[di
 
 
 # ---------------------------------------------------------------------------- walk-forward
+def wf_test_years(market: str, through: str = "valid") -> list[int]:
+    """walk-forward 예측 연도. through='valid'(기본): 연말이 valid_end 이하인 해까지 — 최종 검증 구간을 건드리지 않는다.
+    through='test': 데이터가 있는 마지막 해까지 (최종 검증 단계 전용)."""
+    if through not in ("valid", "test"):
+        raise ValueError(f"through 는 'valid' 또는 'test': {through}")
+    wf = get_settings().get("research.walkforward", {}) or {}
+    P = periods(market)
+    first = max(P["train_start"].year + int(wf.get("first_train_years", 6)), int((wf.get("min_test_year") or {}).get(market, 0)))
+    ys = [y for y in available_years(market) if y >= first]
+    if through == "valid":
+        ys = [y for y in ys if date(y, 12, 31) <= P["valid_end"]]
+    return ys
+
+
 def walk_forward(market: str, horizon: int, task: str, algorithms: list[str] | None = None,
                  window: str = "expanding", run_id: str | None = None, sample_every: int | None = None,
-                 save_predictions: bool = True, progress=None) -> dict:
-    """연 단위 walk-forward. 각 fold 모델은 test 시작 전(라벨 purge 반영) 데이터만으로 학습한다."""
+                 save_predictions: bool = True, progress=None, through: str = "valid") -> dict:
+    """연 단위 walk-forward. 각 fold 모델은 test 시작 전(라벨 purge 반영) 데이터만으로 학습한다.
+
+    through='valid'(기본)는 valid_end 연도까지만 예측한다. 최종 검증 구간의 예측은 최종 검증 단계에서
+    through='test' 로 같은 run_id 를 이어서 계산하며(앞 연도 fold 는 재사용), 그 사용이 test_access_log 에 기록된다."""
     s = get_settings()
     wf = s.get("research.walkforward", {}) or {}
     target, kind = _target(task, horizon)
     algos = algorithms or (["ridge", "lgbm"] if kind == "regression" else ["logistic", "lgbm"])
-    ys = available_years(market)
     t0 = periods(market)["train_start"]
-    first = max(t0.year + int(wf.get("first_train_years", 6)), int((wf.get("min_test_year") or {}).get(market, 0)))
-    test_years = [y for y in ys if y >= first]
+    test_years = wf_test_years(market, through)   # 앞부분(연도 순서)은 through 와 무관하게 같다 → fold 번호 유지
     run_id = run_id or f"wf-{market}-{task}-{horizon}-{window}-{datetime.now():%Y%m%d%H%M%S}"
     with research_db() as db:
         done = {(r[0], r[1]) for r in db.execute("SELECT fold, algorithm FROM fold_results WHERE run_id=? AND wf_window=?",
                                                   [run_id, window]).fetchall()}
     seed = int(s.get("research.seed", 42))
     summary = []
+    valid_years = set(wf_test_years(market, "valid"))
+    beyond = [y for i, y in enumerate(test_years) if y not in valid_years and not all((i, a) in done for a in algos)]
+    if beyond:
+        with research_db() as db:
+            db.execute("INSERT INTO test_access_log VALUES (now(), 'walk_forward', ?, ?)",
+                       [f"walk-forward 예측(최종 검증 구간) {beyond[0]}~{beyond[-1]}", run_id])
     for fi, ty in enumerate(test_years):
         tstart, tend = date(ty, 1, 1), date(ty, 12, 31)
         tr_end = dataset.purge_cutoff(market, tstart, horizon)
@@ -285,7 +307,7 @@ def walk_forward(market: str, horizon: int, task: str, algorithms: list[str] | N
             ev = test[["security_id", "trade_date", f"y_ret_{horizon}"]].copy()
             ev["pred"] = pred
             ev["y"] = test[target].to_numpy()
-            met = _metrics(task, ev.dropna(subset=["y"]), horizon)
+            met = _metrics(task, ev.dropna(subset=["y"]), horizon, 1)
             with research_db() as db:
                 db.execute("INSERT OR REPLACE INTO fold_results VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, now())",
                            [run_id, fi, market, horizon, algo, window, tr_start, tr_end, tstart, tend, len(train), len(test), jdump(met)])

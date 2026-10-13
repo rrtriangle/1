@@ -165,37 +165,7 @@ def test_buy_hold_us_without_market_cap_uses_traded_value(isolated):
 
 
 # ---------------------------------------------------------------- experiments (up 과제)
-@pytest.fixture
-def synthetic_up(isolated, monkeypatch):
-    from marketlab.research import dataset
-    from marketlab.research.features import FEATURES
-    days = list(pd.bdate_range("2016-01-04", "2023-12-29").date)
-    rng = np.random.default_rng(0)
-    n = 8
-    D = np.repeat(np.array(days, dtype=object), n)
-    X = rng.normal(size=(len(D), len(FEATURES))).astype(np.float32)
-    ret = 0.02 * X[:, 0] + rng.normal(scale=0.05, size=len(D))
-    base = pd.DataFrame(X, columns=FEATURES)
-    base.insert(0, "security_id", np.tile([f"KR-T{i:03d}" for i in range(n)], len(days)))
-    base.insert(1, "trade_date", D)
-    base["y_ret_20"] = ret.astype(np.float32)
-    base["y_up_20"] = (ret > 0).astype(float)
-
-    def fake_load(market, start, end, features=None, labels=None, sample_every=None, extra=None, require_label=None):
-        s, e = pd.Timestamp(start).date(), pd.Timestamp(end).date()
-        out = base[(base["trade_date"] >= s) & (base["trade_date"] <= e)]
-        if sample_every and sample_every > 1:
-            keep = sorted(out["trade_date"].unique())[::sample_every]
-            out = out[out["trade_date"].isin(keep)]
-        return out.reset_index(drop=True)
-
-    monkeypatch.setattr(dataset, "load", fake_load)
-    monkeypatch.setattr(dataset, "count_rows", lambda *a, **k: 1000)
-    monkeypatch.setattr(dataset, "trading_days", lambda market: days)
-    isolated.raw.setdefault("research", {})["train_start"] = {"KR": "2016-01-01"}
-    return days
-
-
+# synthetic_up 픽스처는 conftest.py
 def test_train_eval_up_all_models_share_eval_period(synthetic_up):
     from marketlab.research import experiments as E
     res = E.train_eval("KR", 20, "up", ["always_up", "momentum", "logistic"], sample_every=5)

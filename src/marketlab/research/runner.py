@@ -89,12 +89,14 @@ def run_all(market: str, force_test: bool = False, progress=None) -> dict:
         save_state(market, st)
         step(key, lambda task=task, h=h, algos=algos, window=window, rid=rid:
              E.walk_forward(market, h, task, algos, window=window, run_id=rid)["run_id"])
+    # walk-forward 는 기본으로 valid_end 연도까지만 예측한다. 전략이 쓰는 run 의 최종 검증 구간 예측은 _final 에서 이어서 계산.
     pred_runs = {"ret": wf_runs.get("wf_rank_20_expanding"), "up": wf_runs.get("wf_up_20_expanding"),
                  "vol": wf_runs.get("wf_risk_20_expanding")}
+    wf_spec = {wf_runs[f"wf_{t}_{h}_{w}"]: (t, h, a, w) for t, h, a, w in WF if f"wf_{t}_{h}_{w}" in wf_runs}
     step("strategy_search", lambda: _search(market, pred_runs))
     if force_test or not steps.get("final_test", {}).get("done"):
         steps.pop("final_test", None)
-        step("final_test", lambda: _final(market, st, pred_runs, force_test))
+        step("final_test", lambda: _final(market, st, pred_runs, force_test, wf_spec))
     rep = write_report(market, st)
     st["report"] = str(rep)
     st["total_sec"] = round(time.time() - t_all, 1)
@@ -160,13 +162,19 @@ def _search(market: str, pred_runs: dict) -> dict:
         out = bt.run(market, tg, date.fromisoformat(a), date.fromisoformat(b), name=r.strategy)
         bt.save(out, r.strategy, {k: v for k, v in params.items() if not k.startswith("_")}, res["selection_period"], note="selection best")
     return {"search_id": res["search_id"], "n_trials": res["n_trials"], "selection_period": res["selection_period"],
-            "trials": res["trials"].to_dict("records"), "best": best.to_dict("records")}
+            "trials": res["trials"].to_dict("records"), "best": best.to_dict("records"),
+            "deflated_sharpe": res.get("deflated_sharpe")}
 
 
-def _final(market: str, st: dict, pred_runs: dict, forced: bool) -> dict:
-    """최종 독립 검증: 선택 구간에서 고른 전략·모델을 test 구간에 한 번 적용."""
+def _final(market: str, st: dict, pred_runs: dict, forced: bool, wf_spec: dict | None = None) -> dict:
+    """최종 독립 검증: 선택 구간에서 고른 전략·모델을 test 구간에 한 번 적용.
+    전략이 쓰는 walk-forward run 은 여기서 처음으로 최종 검증 구간까지 이어서 예측한다(앞 연도 fold 는 재사용)."""
     from .experiments import final_test, periods
     P = periods(market)
+    for rid in {r for r in pred_runs.values() if r}:
+        if wf_spec and rid in wf_spec:
+            task, h, algos, window = wf_spec[rid]
+            E.walk_forward(market, h, task, algos, window=window, run_id=rid, through="test")
     search = st["steps"]["strategy_search"]["result"]
     best = pd.DataFrame(search["best"])
     sel_sharpe = best.set_index("strategy")["sharpe"]
@@ -249,20 +257,23 @@ def write_report(market: str, st: dict):
     else:
         L += ["- 한계: 상장폐지 종목 대부분 누락 → 생존편향. 결과는 '현재까지 살아남은 종목' 기준이며 실제보다 좋게 나올 수 있음."]
     L += ["", "## 2. 예측 모델 비교 (검증 구간)", "",
-          "| 과제 | 기간 | 모델 | Rank IC | t값 | 상위-하위 10% 차이 | AUC | Brier(기준) | RMSE |", "|---|---|---|---:|---:|---:|---:|---:|---:|"]
+          "| 과제 | 기간 | 모델 | Rank IC | t값 | NW t값 | 상위-하위 10% 차이 | AUC | Brier(기준) | RMSE |", "|---|---|---|---:|---:|---:|---:|---:|---:|---:|"]
     for k, v in steps.items():
         if not k.startswith("fixed_") or not v.get("done"):
             continue
         _, task, h = k.split("_")
         for r in v["result"]:
             m = r["metrics_valid"]
-            L.append(f"| {task} | {h}일 | {r['algorithm']} | {_f(m.get('rank_ic'), False, 3)} | {_f(m.get('rank_ic_t'), False, 1)} | "
+            L.append(f"| {task} | {h}일 | {r['algorithm']} | {_f(m.get('rank_ic'), False, 3)} | {_f(m.get('rank_ic_t'), False, 1)} | {_f(m.get('rank_ic_t_nw'), False, 1)} | "
                      f"{_f(m.get('top_bottom_spread'))} | {_f(m.get('auc'), False, 3)} | {_f(m.get('brier'), False, 4)}({_f(m.get('brier_baseline'), False, 4)}) | {_f(m.get('rmse'), False, 4)} |")
     L += ["", "※ Rank IC: 같은 날 종목들의 예측 순위와 실제 수익률 순위의 상관(날짜 평균). 0 이면 예측력 없음. "
+          "NW t값은 라벨 기간이 겹쳐 생기는 날짜 간 상관을 Newey-West(라그 = 기간 ÷ 표본 간격)로 보정한 값으로, 보통 t값보다 보수적이다. "
           "Brier 는 확률 예측 오차(낮을수록 좋음), 괄호는 '과거 평균 상승비율'만 쓴 기준값.", ""]
-    L += ["## 3. Walk-forward (매년 과거만으로 재학습 → 다음 해 예측)", ""]
+    L += ["## 3. Walk-forward (매년 과거만으로 재학습 → 다음 해 예측, 모델 선택 구간까지)", ""]
     for key, rid in (st.get("wf_runs") or {}).items():
         df = E.wf_summary(rid)
+        if not df.empty:   # 최종 검증 단계에서 이어 계산한 연도는 여기서 빼고 선택 구간까지만 요약
+            df = df[pd.to_datetime(df["test_start"]).dt.date <= P["valid_end"]]
         if df.empty:
             continue
         col = "auc" if "_up_" in key else "rank_ic"
@@ -284,9 +295,15 @@ def write_report(market: str, st: dict):
         sr = steps["strategy_search"]["result"]
         L += ["## 5. 전략 탐색 (선택 구간에서만 비교)", "", f"- 선택 구간: {sr['selection_period']}, 시도한 전략·파라미터 조합: **{sr['n_trials']}개** "
               "(많이 시도할수록 우연히 좋은 결과가 나올 확률이 커짐)", "",
-              "| 전략 | 파라미터 | CAGR | 샤프 | MDD | 거래수 |", "|---|---|---:|---:|---:|---:|"]
+              "| 전략 | 파라미터 | CAGR | 샤프 | DSR | MDD | 거래수 |", "|---|---|---:|---:|---:|---:|---:|"]
         for r in sorted(sr["best"], key=lambda x: -(x.get("sharpe") or -9)):
-            L.append(f"| {r['strategy']} | {r['params']} | {_f(r['cagr'])} | {_f(r['sharpe'], False, 2)} | {_f(r['mdd'])} | {r['n_trades']} |")
+            L.append(f"| {r['strategy']} | {r['params']} | {_f(r['cagr'])} | {_f(r['sharpe'], False, 2)} | {_f(r.get('dsr'), False, 2)} | "
+                     f"{_f(r['mdd'])} | {r['n_trades']} |")
+        ds = sr.get("deflated_sharpe")
+        if ds:
+            L += ["", f"- Deflated Sharpe: 같은 선택 구간 누적 시도 {ds['n_trials']}개를 감안하면, 아무 예측력이 없어도 최고 샤프가 "
+                  f"연 {ds['sr0_annual']:.2f} 정도 나올 수 있습니다. DSR 은 그 값을 넘었을 확률(0.95 이상이면 유의)이며, "
+                  f"최고 샤프 전략 {ds['best_strategy']} 의 DSR 은 {_f(ds['best_dsr'], False, 2)} 입니다."]
         L += [""]
     if "final_test" in steps:
         ft = steps["final_test"]["result"]
@@ -303,7 +320,7 @@ def write_report(market: str, st: dict):
         L += ["", "### 모델 최종 검증", ""]
         for m in ft["models"]:
             mt = m["metrics_test"]
-            L.append(f"- {m['exp_id']}: Rank IC {_f(mt.get('rank_ic'), False, 3)} (t {_f(mt.get('rank_ic_t'), False, 1)}), AUC {_f(mt.get('auc'), False, 3)}, "
+            L.append(f"- {m['exp_id']}: Rank IC {_f(mt.get('rank_ic'), False, 3)} (t {_f(mt.get('rank_ic_t'), False, 1)}, NW t {_f(mt.get('rank_ic_t_nw'), False, 1)}), AUC {_f(mt.get('auc'), False, 3)}, "
                      f"n={m['n_test']:,}" + (f" ⚠️ {m['warning']}" if m.get("warning") else ""))
         L += ["", "## 7. 해석과 주의", "", *_interpret(ft, steps), ""]
     L += ["## 8. 자원 사용", ""]

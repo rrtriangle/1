@@ -63,7 +63,7 @@ with t2:
     else:
         m = pd.json_normalize(ex["metrics"].map(json.loads))
         mv = pd.json_normalize(m["metrics_valid"]) if "metrics_valid" in m else pd.DataFrame()
-        tbl = pd.concat([ex.drop(columns="metrics"), mv[[c for c in ("rank_ic", "rank_ic_t", "top_bottom_spread", "auc", "brier", "brier_baseline", "rmse", "mae") if c in mv]]], axis=1)
+        tbl = pd.concat([ex.drop(columns="metrics"), mv[[c for c in ("rank_ic", "rank_ic_t", "rank_ic_t_nw", "top_bottom_spread", "auc", "brier", "brier_baseline", "rmse", "mae") if c in mv]]], axis=1)
         tgt = st.selectbox("예측 대상", sorted(tbl["target"].unique()))
         sub = tbl[tbl["target"] == tgt].drop_duplicates("algorithm")
         st.dataframe(sub, hide_index=True, use_container_width=True)

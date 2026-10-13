@@ -22,6 +22,7 @@ from ..config import get_settings
 from ..logging_setup import get_logger, log_event
 from ..storage.catalog import memory_connection
 from . import backtest as bt
+from .evaluation import deflated_sharpe, expected_max_sharpe, return_moments
 from .features import feature_glob
 from .store import jdump, research_db
 
@@ -237,7 +238,9 @@ def search(market: str, strategies: list[str], grid: dict | None = None, budget:
             continue
         res = bt.run(market, tg, sel_start, sel_end, costs=costs, name=s)
         m = res["metrics"]
-        rows.append({"strategy": s, "params": {k: v for k, v in c.items()}, **{k: m.get(k) for k in ("cagr", "sharpe", "mdd", "n_trades", "turnover_per_year", "total_cost")}})
+        mom = return_moments(res["equity"]["equity"].pct_change()) if not res["equity"].empty else {}
+        rows.append({"strategy": s, "params": {k: v for k, v in c.items()}, **{k: m.get(k) for k in ("cagr", "sharpe", "mdd", "n_trades", "turnover_per_year", "total_cost")},
+                     "sr_daily": mom.get("sr"), "skew": mom.get("skew"), "kurt": mom.get("kurt"), "n_obs": mom.get("n_obs")})
         with research_db() as db:
             db.execute("INSERT INTO strategy_search_log VALUES (?,?,?,?,?,?,?,?,?,?,FALSE, now())",
                        [search_id, s, market, jdump(c), f"{sel_start}~{sel_end}", metric, m.get(metric),
@@ -245,13 +248,35 @@ def search(market: str, strategies: list[str], grid: dict | None = None, budget:
     df = pd.DataFrame(rows)
     if df.empty:
         return {"search_id": search_id, "trials": df}
+    dsr_info = _deflate(df, market, f"{sel_start}~{sel_end}")
+    with research_db() as db:
+        for r in df.itertuples():
+            db.execute("UPDATE strategy_search_log SET risk = json_merge_patch(risk, ?) WHERE search_id=? AND strategy_id=? AND params=?",
+                       [jdump({"dsr": r.dsr}), search_id, r.strategy, jdump(r.params)])
     best = df.sort_values(metric, ascending=False).groupby("strategy").head(1)
     with research_db() as db:
         for r in best.itertuples():
             db.execute("UPDATE strategy_search_log SET selected = TRUE WHERE search_id=? AND strategy_id=? AND params=?",
                        [search_id, r.strategy, jdump(r.params)])
     return {"search_id": search_id, "trials": df, "best_per_strategy": best, "n_trials": len(df),
-            "selection_period": f"{sel_start}~{sel_end}"}
+            "selection_period": f"{sel_start}~{sel_end}", "deflated_sharpe": dsr_info}
+
+
+def _deflate(df: pd.DataFrame, market: str, period: str) -> dict:
+    """각 시도에 deflated Sharpe(df['dsr'])를 붙인다 (제자리 수정).
+    시도 횟수 N 은 같은 시장·같은 선택 구간에서 지금까지 기록된 모든 시도(이번 탐색 포함) — 탐색을 여러 번 돌린 것도 시도다.
+    SR0(우연히 나올 최대 샤프)의 분산은 이번 탐색 시도들의 일간 샤프 분산으로 추정한다."""
+    with research_db(read_only=True) as db:
+        n_logged = db.execute("SELECT count(*) FROM strategy_search_log WHERE market=? AND period=?", [market, period]).fetchone()[0]
+    n_trials = max(int(n_logged), len(df))
+    srs = df["sr_daily"].tolist()
+    df["dsr"] = [deflated_sharpe(r.sr_daily, r.n_obs, r.skew, r.kurt, srs, n_trials) for r in df.itertuples()]
+    sr0 = expected_max_sharpe(srs, n_trials)
+    top = df.loc[df["sharpe"].astype(float).idxmax()] if df["sharpe"].notna().any() else None
+    return {"n_trials": n_trials, "n_trials_this_search": len(df), "sr0_daily": sr0, "sr0_annual": sr0 * np.sqrt(252),
+            "best_strategy": None if top is None else top["strategy"], "best_sharpe": None if top is None else top["sharpe"],
+            "best_dsr": None if top is None else top["dsr"],
+            "note": "DSR = 다중 시도를 감안해 '우연히 나올 최대 샤프'(SR0)를 넘었을 확률. 0.95 이상이면 유의하다고 본다."}
 
 
 def _first_pred_date(pred_runs: dict | None) -> date:

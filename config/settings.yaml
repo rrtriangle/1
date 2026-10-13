@@ -160,6 +160,11 @@ research:
     KR:
       commission_bps: 1.5          # 매수·매도 각각
       slippage_bps: 10
+      # 거래대금 구간별 슬리피지 (체결일 직전 20일 평균 거래대금, 원). 설정하면 slippage_bps 대신 사용. 예:
+      # slippage_tiers:
+      #   - {min_amount: 0, bps: 40}               # 20억 미만 소형·저유동성
+      #   - {min_amount: 2000000000, bps: 20}      # 20억~100억
+      #   - {min_amount: 10000000000, bps: 10}     # 100억 이상
       sell_tax_schedule:           # 증권거래세(+농특세) 매도 시, 시점별 가정
         - {from: "1995-01-01", bps: 30}
         - {from: "2019-06-03", bps: 25}
@@ -171,6 +176,10 @@ research:
     US:
       commission_bps: 0.0
       slippage_bps: 5
+      # slippage_tiers:                          # (달러) 예시
+      #   - {min_amount: 0, bps: 25}
+      #   - {min_amount: 5000000, bps: 10}
+      #   - {min_amount: 50000000, bps: 5}
       sell_tax_schedule: []
       fx_cost_bps: 25              # 원화 투자자 환전 비용 (원화 기준 성과 계산 시)
   portfolio:
