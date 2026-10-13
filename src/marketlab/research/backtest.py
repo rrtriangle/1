@@ -109,8 +109,8 @@ class PriceBook:
 
         def arr(col, fill=np.nan, dtype=np.float32):
             a = np.full((T, N), fill, dtype=dtype)
-            r = df["trade_date"].map(self.didx).to_numpy()
-            c = df["security_id"].map(self.sidx).to_numpy()
+            r = df["trade_date"].map(self.didx).to_numpy(dtype=np.int64) if len(df) else np.array([], dtype=np.int64)
+            c = df["security_id"].map(self.sidx).to_numpy(dtype=np.int64) if len(df) else np.array([], dtype=np.int64)
             a[r, c] = df[col].to_numpy(dtype=dtype)
             return a
         self.open, self.close, self.amount = arr("open"), arr("close"), arr("amount")

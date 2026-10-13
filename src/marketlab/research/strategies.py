@@ -25,7 +25,7 @@ from .store import jdump, research_db
 RULES = ["buy_hold", "ma_cross", "momentum", "mean_reversion", "rsi", "vol_breakout", "volume_spike", "rel_strength"]
 ML = ["ml_top_ret", "ml_top_up", "ml_risk_adj", "ml_regime_switch", "ml_confidence_cash", "ml_plus_trend"]
 DESCRIPTIONS = {
-    "buy_hold": "시작일 시가총액 상위 N종목을 같은 비중으로 사서 끝까지 보유",
+    "buy_hold": "시작일 시가총액(US 는 거래대금) 상위 N종목을 같은 비중으로 사서 끝까지 보유",
     "ma_cross": "20일 이동평균이 60일 이동평균 위인 종목 중 거래대금 상위 N종목",
     "momentum": "최근 120거래일 수익률 상위 N종목 (최근 5일 제외 효과 없음, 단순 모멘텀)",
     "mean_reversion": "장기 상승 추세(120일선 위)에서 최근 5일 낙폭이 큰 N종목",
@@ -109,7 +109,9 @@ def generate_targets(market: str, strategy: str, start: date, end: date, params:
     for d, g in sig.groupby("trade_date"):
         if strategy == "buy_hold":
             if hold is None:
-                hold = _topn(g, "market_cap", n)
+                # 시가총액이 없는 시장(US 무료 원천)은 20일 평균 거래대금을 규모 대용으로 사용
+                size_col = "market_cap" if g["market_cap"].notna().any() else "amount_20"
+                hold = _topn(g, size_col, n)
                 out[d] = {s: 1 / len(hold) for s in hold} if hold else {}
             continue
         if strategy == "ma_cross":
