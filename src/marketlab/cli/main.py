@@ -68,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--ack", action="store_true", help="보류 경고 확인 처리")
     db = sub.add_parser("dashboard")
     db.add_argument("--port", type=int, default=8501)
+    db.add_argument("--lan", action="store_true", help="같은 네트워크(와이파이)의 다른 기기에서 접속 허용 (보안 주의)")
     sc = sub.add_parser("schedule")
     sc.add_argument("action", choices=["install", "uninstall", "status"])
     sc.add_argument("--times", nargs="*")
@@ -79,6 +80,18 @@ def main(argv: list[str] | None = None) -> int:
     se.add_argument("--submissions", action="store_true")
     se.add_argument("--approve-large", action="store_true")
     sub.add_parser("standardize", help="원본으로부터 표준화 데이터 전체 재생성")
+    rs = sub.add_parser("research", help="머신러닝 연구 (작업지시서 ②)")
+    rs.add_argument("action", choices=["features", "train", "walkforward", "regime", "search", "final-test", "run-all",
+                                       "analyze", "rank", "monitor", "promote", "report", "models"])
+    rs.add_argument("--market", default="KR", choices=["KR", "US"])
+    rs.add_argument("--horizon", type=int, default=20)
+    rs.add_argument("--task", default="rank", choices=["return", "rank", "up", "risk"])
+    rs.add_argument("--algos", nargs="*")
+    rs.add_argument("--window", default="expanding", choices=["expanding", "rolling"])
+    rs.add_argument("--years", nargs="*", type=int)
+    rs.add_argument("--model-id")
+    rs.add_argument("--exp-ids", nargs="*")
+    rs.add_argument("--force-test", action="store_true", help="최종 검증 재실행 (독립성 훼손으로 기록됨)")
     args = p.parse_args(argv)
 
     from ..config import get_settings
@@ -137,8 +150,19 @@ def main(argv: list[str] | None = None) -> int:
         _print(summary())
     elif args.cmd == "dashboard":
         app = Path(__file__).resolve().parents[1] / "dashboard" / "app.py"
+        addr = "127.0.0.1"
+        if args.lan:
+            addr = "0.0.0.0"
+            import socket
+            try:
+                s_ = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s_.connect(("8.8.8.8", 80)); ip = s_.getsockname()[0]; s_.close()
+            except OSError:
+                ip = "(이 컴퓨터의 IP)"
+            print("⚠️  LAN 접속 허용: 같은 네트워크의 모든 기기가 이 화면(수집 시작·중지 포함)에 접근할 수 있습니다.")
+            print("    집처럼 신뢰할 수 있는 와이파이에서만 사용하고, 끝나면 Ctrl+C 로 종료하세요.")
+            print(f"    휴대폰/태블릿 브라우저 주소: http://{ip}:{args.port}")
         return subprocess.call([sys.executable, "-m", "streamlit", "run", str(app), "--server.port", str(args.port),
-                                "--server.address", "127.0.0.1", "--browser.gatherUsageStats", "false"])
+                                "--server.address", addr, "--browser.gatherUsageStats", "false"])
     elif args.cmd == "schedule":
         from ..scheduling import launchd
         if args.action == "install":
@@ -158,6 +182,8 @@ def main(argv: list[str] | None = None) -> int:
             _print(sec_edgar.build_submissions(approve_large=args.approve_large))
         if args.facts:
             _print(sec_edgar.build_companyfacts(approve_large=args.approve_large))
+    elif args.cmd == "research":
+        return _research(args)
     elif args.cmd == "standardize":
         from ..transforms import kr_breadth, kr_prices, us_prices
         r = kr_prices.run()
@@ -166,6 +192,49 @@ def main(argv: list[str] | None = None) -> int:
         _print(kr_breadth.run())
         u = us_prices.run(years=None)
         _print({k: v for k, v in u.items() if k != "per_year"})
+    return 0
+
+
+def _research(a) -> int:
+    from ..research import analysis, experiments, features, monitor, runner
+    if a.action == "features":
+        yrs = a.years or features.stale_years(a.market)
+        _print(features.build(a.market, yrs) if yrs else "특징 파일이 최신입니다 (재생성 대상 연도 없음)")
+    elif a.action == "train":
+        for r in experiments.train_eval(a.market, a.horizon, a.task, a.algos):
+            print(r["algorithm"], json.dumps(r["metrics_valid"], ensure_ascii=False, default=str)[:400])
+    elif a.action == "walkforward":
+        r = experiments.walk_forward(a.market, a.horizon, a.task, a.algos, window=a.window)
+        print(experiments.wf_summary(r["run_id"]).to_string())
+    elif a.action == "regime":
+        from ..research.regime import analyze
+        r = analyze(a.market)
+        _print(r["current"])
+        print(r["rule_stats"].to_string())
+    elif a.action == "final-test":
+        _print(experiments.final_test(a.exp_ids or [], purpose="cli"))
+    elif a.action == "run-all":
+        st = runner.run_all(a.market, force_test=a.force_test, progress=lambda s: print("▶", s, flush=True))
+        print("보고서:", st.get("report"))
+    elif a.action == "analyze":
+        sm = analysis.market_summary(a.market)
+        print(analysis.describe_market(sm))
+    elif a.action == "rank":
+        df, info = analysis.candidate_ranking(a.market, a.horizon)
+        print(df.head(30).to_string())
+        _print(info)
+    elif a.action == "monitor":
+        _print(monitor.record_live(a.market))
+        r = monitor.check(a.market, a.horizon)
+        _print({k: v for k, v in r.items() if k != "model"})
+    elif a.action == "promote":
+        _print(monitor.promote(a.model_id))
+    elif a.action == "report":
+        print("보고서:", runner.write_report(a.market, runner.load_state(a.market)))
+    elif a.action == "models":
+        from ..research.store import research_db
+        with research_db(read_only=True) as db:
+            print(db.execute("SELECT model_id, status, trained_until, valid_metrics->>'rank_ic' ric, valid_metrics->>'auc' auc FROM model_registry ORDER BY created_at DESC LIMIT 50").df().to_string())
     return 0
 
 

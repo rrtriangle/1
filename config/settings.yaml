@@ -108,3 +108,66 @@ validation:
   big_move_threshold: 0.35      # 일간 |수익률| 이 이를 넘으면 기업행위 대조 대상
   stale_days_warn: 7
   cross_source_tolerance: 0.005 # 원천 간 종가 차이 허용 비율
+
+# ---------------------------------------------------------------- 작업지시서 ② 연구 시스템
+research:
+  db: research.duckdb              # data/metadata/ 아래 (수집 카탈로그와 분리 → 잠금 충돌 없음)
+  features_dir: features           # data/ 아래
+  models_dir: research_models      # data/ 아래
+  lookback_buffer_days: 400        # 특징 계산용 과거 버퍼(달력일)
+  horizons: [5, 20, 60]            # 예측 기간(거래일)
+  universe:                        # 학습 대상 (품질·유동성 기준; 제외 내역은 실험 기록에 남김)
+    security_types: [common]
+    min_price_krw: 1000
+    min_price_usd: 1.0
+    min_avg_amount_krw: 300000000  # 20일 평균 거래대금 3억원
+    min_avg_amount_usd: 1000000    # 20일 평균 거래대금 100만달러
+    min_history_days: 120
+  sampling_every_n_days: 5         # 학습 표본: N거래일마다 (메모리·라벨 중첩 완화)
+  splits:
+    train_end: "2020-12-31"
+    valid_start: "2021-01-01"
+    valid_end: "2023-12-31"
+    test_start: "2024-01-01"       # 최종 독립 검증 — 모델·전략 선택에 사용 금지
+  walkforward:
+    first_train_years: 6
+    step_months: 12
+    rolling_years: 8               # 고정 길이 창 비교용
+  resources:
+    threads: 2
+    soft_memory_gb: 3.0            # 목표
+    hard_memory_gb: 4.0            # 초과 시 중단
+    min_available_gb: 1.0          # 시스템 가용 메모리가 이보다 작으면 중단
+  lightgbm:
+    num_leaves: 31
+    learning_rate: 0.03
+    n_estimators: 600
+    min_child_samples: 200
+    subsample: 0.8
+    subsample_freq: 1
+    colsample_bytree: 0.8
+    reg_lambda: 1.0
+    early_stopping_rounds: 50
+  seed: 42
+  costs:                           # 거래비용 기본 시나리오 (출처·가정은 docs/research_guide.md)
+    KR:
+      commission_bps: 1.5          # 매수·매도 각각
+      slippage_bps: 10
+      sell_tax_schedule:           # 증권거래세(+농특세) 매도 시, 시점별 가정
+        - {from: "1995-01-01", bps: 30}
+        - {from: "2019-06-03", bps: 25}
+        - {from: "2021-01-01", bps: 23}
+        - {from: "2023-01-01", bps: 20}
+        - {from: "2024-01-01", bps: 18}
+        - {from: "2025-01-01", bps: 15}
+        - {from: "2026-01-01", bps: 20}
+    US:
+      commission_bps: 0.0
+      slippage_bps: 5
+      sell_tax_schedule: []
+      fx_cost_bps: 25              # 원화 투자자 환전 비용 (원화 기준 성과 계산 시)
+  portfolio:
+    max_weight: 0.10
+    max_participation: 0.05        # 주문금액 ≤ 해당 종목 체결일 거래대금의 5%
+    cash_buffer: 0.0
+    delisting_scenario: last_close # last_close | conservative (상장폐지 사유 미확인 시 0원)
