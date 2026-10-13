@@ -153,6 +153,7 @@ research:
     reg_lambda: 1.0
     early_stopping_rounds: 50
   seed: 42
+  refit_every_days: 30             # 자동 갱신 시 운영 모델 재학습 주기 (새 모델은 candidate, 자동 승인 없음)
   costs:                           # 거래비용 기본 시나리오 (출처·가정은 docs/research_guide.md)
     KR:
       commission_bps: 1.5          # 매수·매도 각각

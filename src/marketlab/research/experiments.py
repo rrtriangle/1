@@ -317,3 +317,66 @@ def wf_summary(run_id: str) -> pd.DataFrame:
         return df
     m = pd.json_normalize(df["metrics"].map(json.loads))
     return pd.concat([df.drop(columns="metrics"), m], axis=1)
+
+
+def refit_live(market: str, horizon: int, task: str, source_exp_id: str | None = None) -> dict:
+    """운영용 재학습: 검증으로 선택된 실험과 같은 알고리즘·설정을, 라벨이 확정된 최신 날짜까지의 데이터로 다시 학습.
+
+    독립 검증 성적이 없으므로 원 실험의 검증 지표를 함께 기록하고 note 에 'refit' 을 남긴다.
+    분석 화면은 승인 모델 → 최신 refit → 검증 최고 후보 순으로 사용한다(자동 승인 없음).
+    """
+    from .analysis import pick_model
+    s = get_settings()
+    target, kind = _target(task, horizon)
+    src = None
+    with research_db(read_only=True) as db:
+        if source_exp_id:
+            src = db.execute("SELECT exp_id, algorithm, params, metrics FROM experiments WHERE exp_id=?", [source_exp_id]).fetchone()
+    if src is None:
+        m = pick_model(market, horizon, task, include_refit=False)
+        if not m:
+            raise RuntimeError("먼저 고정 분할 학습으로 검증된 모델이 필요합니다.")
+        with research_db(read_only=True) as db:
+            src = db.execute("SELECT exp_id, algorithm, params, metrics FROM experiments WHERE exp_id=?", [m["model_id"]]).fetchone()
+    exp_src, algo, params_json, metrics_json = src
+    import json as _json
+    valid_metrics = _json.loads(metrics_json).get("metrics_valid", {})
+    P = periods(market)
+    last = max(d for d in dataset.trading_days(market) if d <= date.today())
+    tr_end = dataset.purge_cutoff(market, last, horizon)
+    labels = list(dict.fromkeys([target, f"y_ret_{horizon}"]))
+    train = dataset.load(market, P["train_start"], tr_end, labels=labels, require_label=target)
+    mon = MemoryMonitor().start()
+    t0 = time.time()
+    try:
+        m = _make_model(algo, task, kind)
+        y = train[target].to_numpy()
+        if algo == "lgbm":
+            dates = np.sort(train["trade_date"].unique())
+            cut = dates[int(len(dates) * 0.9)]
+            fm = (train["trade_date"] <= dataset.purge_cutoff(market, cut, horizon)).to_numpy()
+            em = (train["trade_date"] >= cut).to_numpy()
+            m.fit(train[fm], y[fm], train[em], y[em], seed=int(s.get("research.seed", 42)))
+        elif algo != "hist_vol":
+            m.fit(train, y, seed=int(s.get("research.seed", 42)))
+        if kind == "classification" and algo in ("logistic", "lgbm"):
+            # 보정: 최근 2년(학습에 포함되지만 별도 적합 불가) 대신 원 실험의 보정기를 재사용
+            src_model = Model.load(s.paths.data / s.get("research.models_dir", "research_models") / f"{exp_src}.pkl")
+            m.calibrator = src_model.calibrator
+        mon.check()
+    finally:
+        mon.stop()
+    exp_id = f"{market}-{task}-{horizon}-{algo}-refit-{datetime.now():%Y%m%d%H%M%S}"
+    path = s.paths.data / s.get("research.models_dir", "research_models") / f"{exp_id}.pkl"
+    m.save(path)
+    rec = {"exp_id": exp_id, "source_exp": exp_src, "metrics_valid": valid_metrics, "n_train": len(train),
+           "train_seconds": round(time.time() - t0, 1), "peak_rss_gb": round(mon.peak_rss_gb, 2), "trained_until": str(tr_end)}
+    with research_db() as db:
+        db.execute("INSERT INTO experiments VALUES (?, now(), 'refit', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, 'done', ?)",
+                   [exp_id, market, target, horizon, algo, params_json, jdump(FEATURES), jdump(s.get("research.universe")),
+                    jdump({"train_start": str(P["train_start"]), "train_end_purged": str(tr_end)}), jdump(data_version(market)),
+                    int(s.get("research.seed", 42)), len(train), rec["train_seconds"], mon.peak_rss_gb, jdump(rec), str(path),
+                    code_version(), f"refit of {exp_src}"])
+        db.execute("INSERT OR REPLACE INTO model_registry VALUES (?, now(), ?, ?, ?, ?, ?, ?, 'candidate', ?, ?)",
+                   [exp_id, market, horizon, algo, tr_end, exp_id, str(path), jdump(valid_metrics), f"task={task}; refit of {exp_src}"])
+    return rec

@@ -7,7 +7,7 @@ from pathlib import Path
 import streamlit as st
 
 st.set_page_config(page_title="market-research-lab", layout="wide", initial_sidebar_state="auto")
-P = Path(__file__).parent / "pages"
+P = Path(__file__).parent / "views"
 nav = st.navigation([
     st.Page(P / "data_page.py", title="1. 데이터 현황", icon="🗂️", default=True),
     st.Page(P / "market_page.py", title="2. 시장 분석", icon="🌐"),

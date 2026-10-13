@@ -82,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("standardize", help="원본으로부터 표준화 데이터 전체 재생성")
     rs = sub.add_parser("research", help="머신러닝 연구 (작업지시서 ②)")
     rs.add_argument("action", choices=["features", "train", "walkforward", "regime", "search", "final-test", "run-all",
-                                       "analyze", "rank", "monitor", "promote", "report", "models"])
+                                       "analyze", "rank", "monitor", "promote", "report", "models", "refit"])
     rs.add_argument("--market", default="KR", choices=["KR", "US"])
     rs.add_argument("--horizon", type=int, default=20)
     rs.add_argument("--task", default="rank", choices=["return", "rank", "up", "risk"])
@@ -232,6 +232,15 @@ def _research(a) -> int:
         _print(monitor.promote(a.model_id))
     elif a.action == "report":
         print("보고서:", runner.write_report(a.market, runner.load_state(a.market)))
+    elif a.action == "refit":
+        tasks = [a.task] if a.task else ["rank"]
+        for t in (["rank", "return", "up", "risk"] if a.algos == ["all"] else tasks):
+            for h in ([5, 20, 60] if t != "risk" else [20]):
+                try:
+                    r = experiments.refit_live(a.market, h, t)
+                    print("refit", t, h, r["exp_id"], "학습 마지막", r["trained_until"])
+                except Exception as e:
+                    print("refit 실패", t, h, e)
     elif a.action == "models":
         from ..research.store import research_db
         with research_db(read_only=True) as db:

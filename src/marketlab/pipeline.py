@@ -80,6 +80,26 @@ def ingest_us(mode: str = "full", summary: dict | None = None, limit: int | None
     return summary
 
 
+def research_live(summary: dict) -> None:
+    """수집 후(같은 프로세스에서 순차 실행 → 메모리 중첩 없음): 특징 갱신 → 주기적 재학습 → 최신 예측 저장 → 모니터링."""
+    from datetime import date as _date
+    from .research import experiments, features, monitor
+    from .research.store import research_db
+    for m in ("KR", "US"):
+        if not any(features.features_dir(m).glob("year=*/*.parquet")):
+            continue
+        _step(summary, f"features_{m}", lambda m=m: features.build(m, features.stale_years(m)) if features.stale_years(m) else "up-to-date")
+        every = int(get_settings().get("research.refit_every_days", 30))
+        with research_db(read_only=True) as db:
+            last = db.execute("SELECT max(created_at) FROM experiments WHERE kind='refit' AND market=?", [m]).fetchone()[0]
+        if last is None or (_date.today() - last.date()).days >= every:
+            for t in ("rank", "return", "up", "risk"):
+                for h in ((5, 20, 60) if t != "risk" else (20,)):
+                    _step(summary, f"refit_{m}_{t}_{h}", lambda m=m, t=t, h=h: experiments.refit_live(m, h, t)["exp_id"])
+        _step(summary, f"live_predictions_{m}", lambda m=m: monitor.record_live(m))
+        _step(summary, f"monitor_{m}", lambda m=m: monitor.check(m, 20)["warnings"])
+
+
 def ingest_indicators(summary: dict | None = None) -> dict:
     summary = summary if summary is not None else {"steps": []}
     _step(summary, "fred", indicators.collect_fred)
@@ -120,6 +140,7 @@ def run_job(kind: str, market: str | None = None, mode: str = "incremental", **k
                 ingest_kr("incremental", summary)
                 ingest_us("incremental", summary, revalidate=True)
                 ingest_indicators(summary)
+                research_live(summary)
             elif kind == "retry":
                 _step(summary, "yfinance_retry", yfinance_us.collect, mode="incremental", retry_failed_only=True)
                 _step(summary, "us_standardize", lambda: _compact(us_prices.run()))

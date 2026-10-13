@@ -39,22 +39,26 @@ def freshness(market: str) -> dict:
     return {"data_date": d, "sessions_behind": behind, "is_fresh": behind is not None and behind <= 2}
 
 
-def pick_model(market: str, horizon: int, task: str) -> dict | None:
-    """승인(approved) 모델 우선, 없으면 검증 성적이 가장 좋은 후보(candidate) — 후보임을 표시."""
+def pick_model(market: str, horizon: int, task: str, include_refit: bool = True) -> dict | None:
+    """우선순위: 승인(approved) → 최신 운영용 재학습(refit) → 검증 성적 최고 후보(candidate)."""
     prefix = {"return": "y_ret", "rank": "y_rank", "up": "y_up", "risk": "y_vol"}[task]
     with research_db(read_only=True) as db:
         rows = db.execute("""
-            SELECT r.model_id, r.status, r.trained_until, r.path, r.valid_metrics, r.algorithm, e.target
+            SELECT r.model_id, r.status, r.trained_until, r.path, r.valid_metrics, r.algorithm, e.target, e.kind
             FROM model_registry r JOIN experiments e ON e.exp_id = r.exp_id
             WHERE r.market=? AND r.horizon=? AND e.target = ? AND r.status IN ('approved', 'candidate')
               AND r.algorithm NOT IN ('zero', 'hist_mean', 'always_up', 'hist_vol')
         """, [market, horizon, f"{prefix}_{horizon}"]).fetchall()
     if not rows:
         return None
+    if not include_refit:
+        rows = [r for r in rows if r[7] != "refit"]
+    if not rows:
+        return None
     def score(r):
         m = json.loads(r[4])
         key = m.get("auc") if task == "up" else (m.get("rank_ic") if task in ("rank", "return") else -(m.get("rmse") or 9))
-        return (r[1] == "approved", key if key is not None else -9)
+        return (r[1] == "approved", r[7] == "refit", str(r[2]) if r[7] == "refit" else "", key if key is not None else -9)
     best = max(rows, key=score)
     return {"model_id": best[0], "status": best[1], "trained_until": best[2], "path": best[3],
             "valid_metrics": json.loads(best[4]), "algorithm": best[5]}
