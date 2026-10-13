@@ -132,6 +132,15 @@ def train_eval(market: str, horizon: int, task: str, algorithms: list[str] | Non
     valid = dataset.load(market, P["valid_start"], va_end, labels=labels, sample_every=sample_every, require_label=target)
     results = []
     seed = int(s.get("research.seed", 42))
+    if kind == "classification":
+        # 확률 보정: 검증 구간 앞 절반(+purge)으로 보정, 뒤 절반으로 평가. 보정 여부와 관계없이 모든 모델(기준 모델 포함)을
+        # 같은 뒤쪽 절반으로 평가해야 AUC·Brier 를 서로 비교할 수 있다.
+        vd = np.sort(valid["trade_date"].unique())
+        half = vd[len(vd) // 2]
+        cal_mask = valid["trade_date"] < dataset.purge_cutoff(market, half, horizon)
+        eval_df = valid[valid["trade_date"] >= half]
+    else:
+        cal_mask, eval_df = None, valid
     for i, algo in enumerate(algos):
         if progress:
             progress(i / len(algos), f"{algo} 학습 중")
@@ -156,15 +165,7 @@ def train_eval(market: str, horizon: int, task: str, algorithms: list[str] | Non
                 m.fit(train, y_tr, seed=seed)
             mon.check()
             if kind == "classification" and algo in ("logistic", "lgbm"):
-                # 확률 보정: 검증 구간 앞 절반으로 보정, 뒤 절반으로 평가 (보정 데이터와 평가 데이터 분리)
-                vd = np.sort(valid["trade_date"].unique())
-                half = vd[len(vd) // 2]
-                cal_mask = valid["trade_date"] < dataset.purge_cutoff(market, half, horizon)
-                raw = m.predict(valid[cal_mask])
-                m.calibrate(raw, valid.loc[cal_mask, target].to_numpy())
-                eval_df = valid[valid["trade_date"] >= half]
-            else:
-                eval_df = valid
+                m.calibrate(m.predict(valid[cal_mask]), valid.loc[cal_mask, target].to_numpy())
             ev = eval_df[["security_id", "trade_date", f"y_ret_{horizon}"]].copy() if f"y_ret_{horizon}" != target else eval_df[["security_id", "trade_date"]].copy()
             ev["pred"] = _predict(m, eval_df)
             ev["y"] = eval_df[target].to_numpy()
@@ -321,10 +322,15 @@ def wf_summary(run_id: str) -> pd.DataFrame:
     return pd.concat([df.drop(columns="metrics"), m], axis=1)
 
 
+CALIB_DAYS = 252   # refit 보정용으로 학습에서 떼어 두는 최근 거래일 수 (약 1년)
+
+
 def refit_live(market: str, horizon: int, task: str, source_exp_id: str | None = None) -> dict:
     """운영용 재학습: 검증으로 선택된 실험과 같은 알고리즘·설정을, 라벨이 확정된 최신 날짜까지의 데이터로 다시 학습.
 
     독립 검증 성적이 없으므로 원 실험의 검증 지표를 함께 기록하고 note 에 'refit' 을 남긴다.
+    분류 모델은 최근 CALIB_DAYS 거래일을 학습에서 떼어 그 구간으로 새로 확률 보정한다(보정 구간이 부족하면 보정 없음).
+    trained_until 은 보정 구간까지 포함한 '라벨을 본 마지막 날'이다.
     분석 화면은 승인 모델 → 최신 refit → 검증 최고 후보 순으로 사용한다(자동 승인 없음).
     """
     from .analysis import pick_model
@@ -344,10 +350,24 @@ def refit_live(market: str, horizon: int, task: str, source_exp_id: str | None =
     import json as _json
     valid_metrics = _json.loads(metrics_json).get("metrics_valid", {})
     P = periods(market)
-    last = max(d for d in dataset.trading_days(market) if d <= date.today())
-    tr_end = dataset.purge_cutoff(market, last, horizon)
+    days = [d for d in dataset.trading_days(market) if d <= date.today()]
+    tr_end = dataset.purge_cutoff(market, max(days), horizon)
     labels = list(dict.fromkeys([target, f"y_ret_{horizon}"]))
     train = dataset.load(market, P["train_start"], tr_end, labels=labels, require_label=target)
+    calibration = None
+    if kind == "classification" and algo in ("logistic", "lgbm"):
+        # 보정: 옛 모델의 보정기는 다른 모델의 점수 분포에 맞춰져 있어 재사용할 수 없다.
+        # 최근 구간(CALIB_DAYS 거래일)을 학습에서 떼어(purge 포함) 그 구간으로 새로 보정한다.
+        cal_days = sorted(d for d in train["trade_date"].unique())
+        if len(cal_days) > 2 * CALIB_DAYS:
+            cal_start = cal_days[-CALIB_DAYS]
+            fit_end = dataset.purge_cutoff(market, cal_start, horizon)
+            cal = train[train["trade_date"] >= cal_start]
+            if cal[target].nunique() >= 2:
+                calibration = {"cal_start": str(cal_start), "cal_end": str(cal_days[-1]), "fit_end": str(fit_end), "n_cal": len(cal)}
+                train = train[train["trade_date"] <= fit_end]
+        if calibration is None:
+            calibration = {"note": "최근 보정 구간 부족 — 보정 없이 원 점수 사용"}
     mon = MemoryMonitor().start()
     t0 = time.time()
     try:
@@ -361,10 +381,8 @@ def refit_live(market: str, horizon: int, task: str, source_exp_id: str | None =
             m.fit(train[fm], y[fm], train[em], y[em], seed=int(s.get("research.seed", 42)))
         elif algo != "hist_vol":
             m.fit(train, y, seed=int(s.get("research.seed", 42)))
-        if kind == "classification" and algo in ("logistic", "lgbm"):
-            # 보정: 최근 2년(학습에 포함되지만 별도 적합 불가) 대신 원 실험의 보정기를 재사용
-            src_model = Model.load(s.paths.data / s.get("research.models_dir", "research_models") / f"{exp_src}.pkl")
-            m.calibrator = src_model.calibrator
+        if calibration and "cal_start" in calibration:
+            m.calibrate(m.predict(cal), cal[target].to_numpy())
         mon.check()
     finally:
         mon.stop()
@@ -372,7 +390,8 @@ def refit_live(market: str, horizon: int, task: str, source_exp_id: str | None =
     path = s.paths.data / s.get("research.models_dir", "research_models") / f"{exp_id}.pkl"
     m.save(path)
     rec = {"exp_id": exp_id, "source_exp": exp_src, "metrics_valid": valid_metrics, "n_train": len(train),
-           "train_seconds": round(time.time() - t0, 1), "peak_rss_gb": round(mon.peak_rss_gb, 2), "trained_until": str(tr_end)}
+           "train_seconds": round(time.time() - t0, 1), "peak_rss_gb": round(mon.peak_rss_gb, 2),
+           "trained_until": str(tr_end), "calibration": calibration}
     with research_db() as db:
         db.execute("INSERT INTO experiments VALUES (?, now(), 'refit', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, 'done', ?)",
                    [exp_id, market, target, horizon, algo, params_json, jdump(FEATURES), jdump(s.get("research.universe")),

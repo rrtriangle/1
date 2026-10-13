@@ -108,7 +108,7 @@ md.listing_status("KR-000030-20141119", on="2016-01-04")              # as_of �
 md.sql("SELECT * FROM listing_events WHERE security_id = ?", [sid])
 ```
 상장폐지 종목의 청산·합병 보상가치는 원천에 없습니다. 마지막 거래 이후의 가치를 0원이나 직전 종가로 확정하지 않습니다.
-백테스트에서는 `status in ('delisted','merged','unknown')` 이고 `last_trade_date` 이후 보유 중인 포지션을 '가치 미확정'으로 따로 처리해야 합니다(예: 정리매매 마지막 종가로 청산하는 가정을 명시적으로 선택).
+백테스트에서는 `status in ('delisted','merged','unknown')` 이고 `last_trade_date` 이후 보유 중인 포지션을 '가치 미확정'으로 따로 처리해야 합니다(예: 정리매매 마지막 종가로 청산하는 가정을 명시적으로 선택). 내장 백테스트 엔진은 상장폐지가 확정된 `delisted`·`merged` 만 청산하고, `unknown`·거래정지 종목은 기간과 무관하게 마지막 가격으로 계속 보유·평가합니다.
 
 ## 6. 임의의 과거 시점 데이터 조회 (point-in-time)
 ```python

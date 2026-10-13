@@ -314,17 +314,50 @@ def write_report(market: str, st: dict):
     return p
 
 
+def _cagr_from_total(total: float | None, years: float | None) -> float | None:
+    if total is None or not years or years <= 0 or 1 + total <= 0:
+        return None
+    return (1 + total) ** (1 / years) - 1
+
+
+def _exp_task_algo(exp_id: str) -> tuple[str, str]:
+    """exp_id = '{market}-{task}-{horizon}-{algo}-...' → (task, algo)."""
+    parts = exp_id.split("-")
+    return (parts[1], parts[3]) if len(parts) >= 4 else ("", "")
+
+
 def _interpret(ft: dict, steps: dict) -> list[str]:
+    """최종 검증 수치를 비교해 결론 문장을 고른다 (고정 문구 없음)."""
     out = []
     strat = [x for x in ft["strategies"] if x["test"].get("sharpe") is not None]
     if not strat:
         return ["- 최종 검증 결과가 없습니다."]
     best = max(strat, key=lambda x: x["test"]["sharpe"])
     b = best["bootstrap"].get("sharpe_p05_p50_p95") if isinstance(best["bootstrap"], dict) else None
-    bench = best["benchmark_return"]
     out.append(f"- 최종 검증에서 샤프지수가 가장 높은 전략은 **{best['strategy']}** (CAGR {_f(best['test']['cagr'])}, 샤프 {best['test']['sharpe']:.2f}, MDD {_f(best['test']['mdd'])}).")
     if b and b[0] <= 0:
         out.append(f"- 그러나 블록 부트스트랩 90% 구간({b[0]:.2f}~{b[2]:.2f})이 0 을 포함 → 검증 기간이 짧아 통계적으로 확실하다고 볼 수 없습니다.")
+    elif b:
+        out.append(f"- 블록 부트스트랩 90% 구간({b[0]:.2f}~{b[2]:.2f})이 0 보다 커서, 이 기간 안에서는 우연만으로 설명하기 어려운 성과입니다.")
+
+    # 벤치마크 비교 (같은 기간 CAGR)
+    years = best["test"].get("years")
+    bench = {k: _cagr_from_total(v, years) for k, v in (best.get("benchmark_return") or {}).items()}
+    bench = {k: v for k, v in bench.items() if v is not None}
+    cagr = best["test"].get("cagr")
+    beat_bench = None
+    if bench and cagr is not None:
+        won = [k for k, v in bench.items() if cagr > v]
+        lost = [k for k, v in bench.items() if cagr <= v]
+        beat_bench = len(won) == len(bench)
+        detail = ", ".join(f"{k} {_f(v)}" for k, v in bench.items())
+        if beat_bench:
+            out.append(f"- {best['strategy']} 의 CAGR {_f(cagr)} 는 모든 벤치마크({detail})보다 높았습니다.")
+        elif won:
+            out.append(f"- {best['strategy']} 의 CAGR {_f(cagr)} 는 {', '.join(won)} 보다는 높았지만 {', '.join(lost)} 보다는 낮았습니다 ({detail}).")
+        else:
+            out.append(f"- {best['strategy']} 의 CAGR {_f(cagr)} 는 어느 벤치마크({detail})도 이기지 못했습니다.")
+
     held = [x for x in strat if (x["selection_sharpe"] or 0) > 0.5 and (x["test"]["sharpe"] or 0) > 0.5]
     dropped = [x["strategy"] for x in strat if (x["selection_sharpe"] or 0) > 0.5 and (x["test"]["sharpe"] or 0) <= 0.3]
     if held:
@@ -336,20 +369,63 @@ def _interpret(ft: dict, steps: dict) -> list[str]:
     ml = [x for x in strat if x["strategy"].startswith("ml_")]
     rule = [x for x in strat if not x["strategy"].startswith("ml_")]
     if ml and rule:
-        out.append(f"- ML 전략 평균 샤프 {np.mean([x['test']['sharpe'] for x in ml]):.2f} vs 규칙 전략 평균 {np.mean([x['test']['sharpe'] for x in rule]):.2f}.")
-    hi_turn = [x for x in strat if (x["test"].get("turnover_per_year") or 0) > 30]
-    for x in hi_turn:
+        a, r = np.mean([x["test"]["sharpe"] for x in ml]), np.mean([x["test"]["sharpe"] for x in rule])
+        cmp = "높았습니다" if a > r + 0.05 else ("낮았습니다" if a < r - 0.05 else "비슷했습니다")
+        out.append(f"- ML 전략 평균 샤프 {a:.2f} vs 규칙 전략 평균 {r:.2f} — ML 쪽이 {cmp}.")
+
+    # 회전율이 높은 전략: 비용 전후 CAGR 을 실제로 비교
+    for x in [x for x in strat if (x["test"].get("turnover_per_year") or 0) > 30]:
         c0, c1 = x["cost_sensitivity"]["cost_x0"].get("cagr"), x["test"].get("cagr")
-        out.append(f"- {x['strategy']}: 연 회전율 {x['test']['turnover_per_year']:.0f}배 — 비용 전 CAGR {_f(c0)} → 비용 후 {_f(c1)}. "
-                   "예측력(순위 상관)이 있어도 잦은 매매 비용이 수익을 대부분 상쇄했습니다.")
-    models = ft.get("models") or []
-    rics = [m["metrics_test"].get("rank_ic") for m in models if "rank" in m["exp_id"] and "lgbm" in m["exp_id"] or "ridge" in m["exp_id"]]
-    rics = [r for r in rics if r is not None]
-    if rics:
-        out.append(f"- 모델의 최종 검증 순위상관(Rank IC)은 {min(rics):.3f}~{max(rics):.3f}로 검증 구간과 비슷하게 유지되었습니다. "
-                   "즉 '상대적으로 더 오를 종목을 고르는 통계적 신호'는 미래 구간에서도 관찰되었지만, 이를 실제 수익으로 바꾸는 전략 설계"
-                   "(회전율·비용·대형주 쏠림 장세)에서는 벤치마크를 이기지 못했습니다.")
-    out.append("- 거래비용을 2배로 가정하면 수익률이 크게 줄어드는 전략(회전율 높음)은 실제 적용 시 성과가 더 낮을 수 있습니다.")
+        msg = f"- {x['strategy']}: 연 회전율 {x['test']['turnover_per_year']:.0f}배 — 비용 전 CAGR {_f(c0)} → 비용 후 {_f(c1)}."
+        if c0 is not None and c1 is not None:
+            if c0 > 0 and c1 <= c0 * 0.5:
+                msg += " 잦은 매매 비용이 비용 전 수익의 절반 이상을 상쇄했습니다."
+            elif c1 < c0:
+                msg += f" 비용으로 연 {_f(c0 - c1)}p 줄었습니다."
+        out.append(msg)
+
+    # 모델 순위상관: 검증 구간(고정 분할) 값과 최종 검증 값을 비교
+    valid_ic = {r["exp_id"]: (r.get("metrics_valid") or {}).get("rank_ic")
+                for k, v in steps.items() if k.startswith("fixed_") and v.get("done") for r in v.get("result") or []}
+    pairs = []
+    for m in ft.get("models") or []:
+        task, algo = _exp_task_algo(m["exp_id"])
+        if task == "rank" and algo in ("lgbm", "ridge"):
+            t_ic = m["metrics_test"].get("rank_ic")
+            if t_ic is not None:
+                pairs.append((m["exp_id"], valid_ic.get(m["exp_id"]), t_ic))
+    if pairs:
+        t_ics = [p[2] for p in pairs]
+        v_ics = [p[1] for p in pairs if p[1] is not None]
+        rng = f"{min(t_ics):.3f}~{max(t_ics):.3f}"
+        vtxt = f" (검증 구간 {min(v_ics):.3f}~{max(v_ics):.3f})" if v_ics else ""
+        held_ic = [p for p in pairs if p[1] is not None and p[1] > 0 and p[2] >= 0.5 * p[1]]
+        if max(t_ics) <= 0:
+            sig = "ic_gone"
+            out.append(f"- 순위 모델의 최종 검증 Rank IC 는 {rng}{vtxt}로, 미래 구간에서는 종목 순위 예측력이 관찰되지 않았습니다.")
+        elif v_ics and len(held_ic) == len(pairs):
+            sig = "ic_held"
+            out.append(f"- 순위 모델의 최종 검증 Rank IC 는 {rng}{vtxt}로 검증 구간 값의 절반 이상이 유지되었습니다.")
+        else:
+            sig = "ic_weak"
+            out.append(f"- 순위 모델의 최종 검증 Rank IC 는 {rng}{vtxt}로 양(+)이지만 검증 구간보다 약해졌습니다.")
+        if sig != "ic_gone" and beat_bench is not None:
+            if beat_bench:
+                out.append("- 통계적 신호가 미래 구간에서도 남아 있었고, 가장 좋은 전략은 같은 기간 벤치마크도 넘었습니다.")
+            else:
+                out.append("- 통계적 신호는 미래 구간에서도 남아 있었지만, 이를 실제 수익으로 바꾸는 전략 설계(회전율·비용·종목 쏠림)에서는 "
+                           "벤치마크를 모두 이기지는 못했습니다.")
+
+    # 비용 2배 민감도: 실제로 크게 줄어든 전략만 이름을 든다
+    sens = []
+    for x in strat:
+        c1, c2 = x["test"].get("cagr"), x["cost_sensitivity"].get("cost_x2", {}).get("cagr")
+        if c1 is not None and c2 is not None and c1 - c2 > 0.02:
+            sens.append(f"{x['strategy']}({_f(c1)}→{_f(c2)})")
+    if sens:
+        out.append("- 거래비용을 2배로 가정하면 CAGR 이 2%p 넘게 줄어드는 전략: " + ", ".join(sens) + " — 실제 적용 시 성과가 더 낮을 수 있습니다.")
+    else:
+        out.append("- 거래비용을 2배로 가정해도 CAGR 감소가 2%p 이하로, 비용 가정에 크게 흔들리지 않았습니다.")
     out.append("- 최종 검증 결과를 본 뒤 전략을 고치면 그 구간은 더 이상 독립 검증이 아닙니다. 개선 아이디어(낮은 회전율, 비용 반영 목표 등)는 "
                "새로운 미래 구간에서 다시 검증해야 합니다.")
     out.append("- 변수 중요도는 통계적 연관성일 뿐 인과관계가 아닙니다. 과거에 통했던 패턴이 미래에도 유지된다는 보장은 없습니다.")

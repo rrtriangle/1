@@ -40,7 +40,7 @@ DESCRIPTIONS = {
     "rel_strength": "60일 수익률의 시장 내 순위 상위 N종목",
     "ml_top_ret": "머신러닝 예상 수익률 상위 N종목",
     "ml_top_up": "머신러닝 상승 확률 상위 N종목",
-    "ml_risk_adj": "예상 수익률 ÷ 예상 변동성 상위 N종목",
+    "ml_risk_adj": "예상 수익률(순위 점수면 날짜별 표준화) ÷ 예상 변동성 상위 N종목",
     "ml_regime_switch": "ML 상위 N종목, 단 하락 추세·변동성 확대 국면에서는 비중 50%",
     "ml_confidence_cash": "최근(이미 결과가 확인된) 예측 순위상관이 음수면 현금 보유",
     "ml_plus_trend": "20일선>60일선 종목 중 ML 예상 수익률 상위 N종목",
@@ -77,12 +77,17 @@ def load_predictions(market: str, run_ids: dict[str, str], dates: list[date]) ->
             if not rid:
                 continue
             col = {"ret": "coalesce(pred_ret, pred_rank)", "up": "pred_up", "vol": "pred_vol", "rank": "pred_rank"}[key]
-            p = db.execute(f"""SELECT security_id, trade_date, algorithm, {col} AS {key}, model_trained_until FROM predictions
+            sel, cols = f"{col} AS {key}", [key]
+            if key == "ret":
+                # rank 과제 run 이면 ret 은 수익률이 아니라 0~1 순위 점수 → 표시해 두고 크기를 쓰는 전략에서 표준화한다
+                sel += ", (pred_ret IS NULL AND pred_rank IS NOT NULL) AS ret_is_rank"
+                cols.append("ret_is_rank")
+            p = db.execute(f"""SELECT security_id, trade_date, algorithm, {sel}, model_trained_until FROM predictions
                                WHERE run_id = ? AND trade_date IN (SELECT unnest(?::DATE[]))""", [rid, dates]).df()
             if not p.empty:
                 assert (pd.to_datetime(p["model_trained_until"]) < pd.to_datetime(p["trade_date"])).all(), "미래 학습 모델 예측 혼입"
                 algo = "lgbm" if (p["algorithm"] == "lgbm").any() else p["algorithm"].iloc[0]
-                parts.append(p[p["algorithm"] == algo][["security_id", "trade_date", key]].set_index(["security_id", "trade_date"]))
+                parts.append(p[p["algorithm"] == algo][["security_id", "trade_date", *cols]].set_index(["security_id", "trade_date"]))
     if not parts:
         return pd.DataFrame(columns=["security_id", "trade_date"])
     out = pd.concat(parts, axis=1).reset_index()
@@ -93,6 +98,19 @@ def load_predictions(market: str, run_ids: dict[str, str], dates: list[date]) ->
 def _topn(g: pd.DataFrame, col: str, n: int, ascending=False) -> list[str]:
     g = g.dropna(subset=[col])
     return g.sort_values(col, ascending=ascending).head(n)["security_id"].tolist()
+
+
+def risk_adjusted(g: pd.DataFrame) -> pd.DataFrame:
+    """같은 날 종목들의 '예측 ÷ 예상 변동성' (ra).
+    rank 과제 예측(0~1 순위 점수)은 크기에 의미가 없어 그대로 나누면 변동성 낮은 종목만 고르게 된다
+    → 그날 단면에서 표준화(z)한 뒤 나눈다. 기대값이 0 이하인 종목은 변동성으로 나누면 순서가 뒤집히므로 제외한다."""
+    score = g["ret"].astype(float)
+    if "ret_is_rank" in g and g["ret_is_rank"].fillna(False).astype(bool).any():
+        sd = score.std()
+        score = (score - score.mean()) / sd if sd and sd > 0 else score * np.nan
+    vol = g["vol"] if "vol" in g else g["rv_20"]
+    ra = score / vol.astype(float).clip(lower=0.05)
+    return g.assign(ra=ra.where(score > 0))
 
 
 def generate_targets(market: str, strategy: str, start: date, end: date, params: dict,
@@ -139,8 +157,7 @@ def generate_targets(market: str, strategy: str, start: date, end: date, params:
         elif strategy == "ml_top_up":
             pick = _topn(g, "up", n)
         elif strategy == "ml_risk_adj":
-            g = g.assign(ra=g["ret"] / g["vol"].clip(lower=0.05)) if "vol" in g else g.assign(ra=g["ret"] / g["rv_20"].clip(lower=0.05))
-            pick = _topn(g, "ra", n)
+            pick = _topn(risk_adjusted(g), "ra", n)
         elif strategy in ("ml_regime_switch",):
             pick = _topn(g, "ret", n)
         elif strategy == "ml_confidence_cash":

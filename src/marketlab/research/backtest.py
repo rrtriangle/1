@@ -9,8 +9,9 @@
 - 기업행위: KR 기준가 조정일에 보유 수량 ÷ 조정계수(분할·병합은 정확, 유·무상증자는 가치 보존 근사),
   US 분할일 수량 × 분할비율, 배당락일 현금 배당 입금(분할 반영 전 주당 금액으로 환산).
   KR 은 원천에 배당 정보가 없어 배당 수익이 빠진다(성과 과소평가 요인).
-- 상장폐지: 마지막 거래일 이후 시세가 없으면 last_close(마지막 종가로 청산) 또는
+- 상장폐지: 상장폐지·합병이 확정된(status delisted/merged) 종목만, 마지막 거래일 이후 시세가 없으면 last_close(마지막 종가로 청산) 또는
   conservative(합병·완전자회사화 등 보상 근거가 있는 사유가 아니면 0원) 시나리오로 처리하고 거래내역에 표시.
+  거래정지(시세 공백)는 기간과 무관하게 청산하지 않고 마지막 가격으로 보유·평가한다.
 """
 from __future__ import annotations
 
@@ -119,15 +120,19 @@ class PriceBook:
         self.last_idx = {s: self.didx[d] for s, d in df.groupby("security_id")["trade_date"].max().items()}
         self.meta = meta.set_index("security_id").to_dict("index")
 
+    TERMINATED_STATUS = ("delisted", "merged")
+
     def is_terminated(self, sid: str, i: int) -> bool:
-        """i 시점 이후 더 이상 시세가 없고, 상장폐지·병합·사유불명 종목인가."""
+        """i 시점 이후 더 이상 시세가 없고, 상장폐지·합병이 확정된 종목인가.
+        시세 공백(거래정지)만으로는 청산하지 않는다 — 30일 넘게 정지됐다가 재개되는 종목도 있고,
+        사유불명(unknown) 종목은 상장폐지가 확정되지 않았으므로 마지막 가격으로 계속 보유·평가한다."""
+        st = (self.meta.get(sid) or {}).get("status")
+        if st not in self.TERMINATED_STATUS:
+            return False
         li = self.last_idx.get(sid)
         if li is None:   # 조회 구간에 시세가 전혀 없음 = 이미 거래 종료된 보유 종목
-            return (self.meta.get(sid) or {}).get("status") in ("delisted", "merged", "unknown")
-        if i <= li:
-            return False
-        st = (self.meta.get(sid) or {}).get("status")
-        return st in ("delisted", "merged", "unknown") or (li < len(self.dates) - 1 and i - li > 30)
+            return True
+        return i > li
 
 
 def run(market: str, targets: dict[date, dict[str, float]], start: date, end: date, capital: float = 100_000_000,
