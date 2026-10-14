@@ -247,7 +247,9 @@ def _research(a) -> int:
                     print("refit 실패", t, h, e)
     elif a.action == "audit":
         from ..research import audit
-        rid = a.run_id or f"wf-{a.market}-rank-{a.horizon}-expanding"
+        from ..research import runner
+        rid = a.run_id or runner.load_state(a.market).get("wf_runs", {}).get(f"wf_rank_{a.horizon}_expanding") \
+            or runner.wf_run_id(a.market, "rank", a.horizon, "expanding")
         res = audit.audit(a.market, rid, a.horizon)
         print("보고서:", audit.write_report(res))
         _print({k: res[k] for k in ("overall", "diagnostics")})

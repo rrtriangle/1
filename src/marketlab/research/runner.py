@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -32,6 +32,34 @@ WF = [("rank", 20, ["ridge", "lgbm"], "expanding"), ("rank", 20, ["lgbm"], "roll
       ("rank", 5, ["lgbm"], "expanding"), ("rank", 60, ["lgbm"], "expanding")]
 
 
+# 연구 로직 버전: 특징이 아니라 학습·평가·백테스트 규칙이 바뀌어 이전 결과를 재사용하면 안 될 때 올린다.
+#  1: 초기  2: 2단계(미체결 매도·상장폐지·up 평가 기간·보정·ml_risk_adj)
+#  3: 3단계(walk-forward 는 valid_end 까지, NW t값, deflated Sharpe, 거래대금 구간별 슬리피지 기본 적용)
+RESEARCH_VERSION = 3
+
+
+def versions() -> dict:
+    return {"feature_version": F.FEATURE_VERSION, "research_version": RESEARCH_VERSION}
+
+
+def is_stale(st: dict) -> bool:
+    """이전 실행 결과가 있고, 그때의 특징·연구 로직 버전이 지금과 다르면 True (버전 기록이 없으면 v1 로 본다)."""
+    return bool(st.get("steps")) and any(st.get(k, 1) != v for k, v in versions().items())
+
+
+def prior_final_runs(market: str, test_start: date) -> tuple[int, str | None]:
+    """같은 시장·같은 시작일의 최종 전략 검증을 예전에 몇 번 실행했는지 (test_access_log)."""
+    with research_db(read_only=True) as db:
+        n, first = db.execute("SELECT count(*), min(accessed_at) FROM test_access_log WHERE purpose='final strategy test' AND ref LIKE ?",
+                              [f"{market}:{test_start}~%"]).fetchone()
+    return int(n or 0), (str(first) if first else None)
+
+
+def wf_run_id(market: str, task: str, h: int, window: str) -> str:
+    """버전이 run_id 에 들어가야 무효화 뒤에 예전 fold 결과(fold_results·predictions)를 다시 쓰지 않는다."""
+    return f"wf-{market}-{task}-{h}-{window}-f{F.FEATURE_VERSION}r{RESEARCH_VERSION}"
+
+
 def _state_path(market: str):
     p = get_settings().paths.state_dir / f"research_{market}.json"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -49,9 +77,9 @@ def save_state(market: str, st: dict) -> None:
 
 def run_all(market: str, force_test: bool = False, progress=None) -> dict:
     st = load_state(market)
-    if st.get("steps") and st.get("feature_version", 1) != F.FEATURE_VERSION:
+    if is_stale(st):
         st = invalidate_old_results(market, st)
-    st["feature_version"] = F.FEATURE_VERSION
+    st.update(versions())
     steps = st["steps"]
     t_all = time.time()
     preflight(market)
@@ -84,7 +112,7 @@ def run_all(market: str, force_test: bool = False, progress=None) -> dict:
     wf_runs = st.setdefault("wf_runs", {})
     for task, h, algos, window in WF:
         key = f"wf_{task}_{h}_{window}"
-        rid = wf_runs.get(key) or f"wf-{market}-{task}-{h}-{window}"
+        rid = wf_runs.get(key) or wf_run_id(market, task, h, window)
         wf_runs[key] = rid
         save_state(market, st)
         step(key, lambda task=task, h=h, algos=algos, window=window, rid=rid:
@@ -105,18 +133,25 @@ def run_all(market: str, force_test: bool = False, progress=None) -> dict:
 
 
 def invalidate_old_results(market: str, st: dict) -> dict:
-    """특징 정의가 바뀌면 이전 연구 결과는 재사용하지 않는다: 상태 파일 보관, 구버전 모델 retired 처리."""
-    old_v = st.get("feature_version", 1)
+    """특징 정의나 연구 로직이 바뀌면 이전 연구 결과는 재사용하지 않는다: 상태 파일·보고서 보관, 구버전 모델 retired 처리.
+    walk-forward run_id 에 버전이 들어가므로 예전 fold 결과도 새 실행에서 다시 쓰이지 않는다."""
+    old = {k: st.get(k, 1) for k in versions()}
+    tag = f"featv{old['feature_version']}-resv{old['research_version']}"
     p = _state_path(market)
-    p.with_name(f"research_{market}.featv{old_v}.json").write_text(json.dumps(st, ensure_ascii=False, indent=1, default=str))
+    p.with_name(f"research_{market}.{tag}.json").write_text(json.dumps(st, ensure_ascii=False, indent=1, default=str))
     rep = get_settings().paths.reports / f"research_report_{market}.md"
     if rep.exists():
-        rep.rename(rep.with_name(f"research_report_{market}.featv{old_v}.md"))
+        rep.rename(rep.with_name(f"research_report_{market}.{tag}.md"))
+    why = []
+    if old["feature_version"] != F.FEATURE_VERSION:
+        why.append(f"특징 v{old['feature_version']}→v{F.FEATURE_VERSION}")
+    if old["research_version"] != RESEARCH_VERSION:
+        why.append(f"연구 로직 v{old['research_version']}→v{RESEARCH_VERSION}")
     with research_db() as db:
         db.execute("UPDATE model_registry SET status='retired', note = note || ? WHERE market=? AND status IN ('candidate','approved')",
-                   [f"; 구버전 특징(v{old_v})으로 학습 — 특징 버그 수정 후 사용 중지", market])
-    log_event(log, "feature version changed: old research results archived", market=market, old=old_v, new=F.FEATURE_VERSION)
-    return {"steps": {}, "previous_feature_version": old_v}
+                   [f"; 이전 버전으로 학습({', '.join(why)}) — 사용 중지", market])
+    log_event(log, "research version changed: old results archived", market=market, old=old, new=versions())
+    return {"steps": {}, "previous_versions": old}
 
 
 def preflight(market: str) -> dict:
@@ -166,6 +201,21 @@ def _search(market: str, pred_runs: dict) -> dict:
             "deflated_sharpe": res.get("deflated_sharpe")}
 
 
+def forward_start(market: str) -> date | None:
+    """설정(research.splits.forward_start_<시장> 또는 forward_start)이 있으면 그 날짜, 없으면 None."""
+    sp = get_settings().get("research.splits", {}) or {}
+    v = sp.get(f"forward_start_{market}") or sp.get("forward_start")
+    return date.fromisoformat(str(v)) if v else None
+
+
+def _sel_dsr(search: dict, strategy: str):
+    for b in search.get("best") or []:
+        if b.get("strategy") == strategy:
+            v = b.get("dsr")
+            return None if v is None or (isinstance(v, float) and np.isnan(v)) else float(v)
+    return None
+
+
 def _final(market: str, st: dict, pred_runs: dict, forced: bool, wf_spec: dict | None = None) -> dict:
     """최종 독립 검증: 선택 구간에서 고른 전략·모델을 test 구간에 한 번 적용.
     전략이 쓰는 walk-forward run 은 여기서 처음으로 최종 검증 구간까지 이어서 예측한다(앞 연도 fold 는 재사용)."""
@@ -179,14 +229,21 @@ def _final(market: str, st: dict, pred_runs: dict, forced: bool, wf_spec: dict |
     best = pd.DataFrame(search["best"])
     sel_sharpe = best.set_index("strategy")["sharpe"]
     t0, t1 = P["test_start"], P["test_end"]
-    out = {"period": f"{t0}~{t1}", "forced_rerun": forced, "strategies": [], "models": []}
+    # 같은 시장·같은 시작일의 최종 검증을 예전에 돌린 적이 있으면(다른 버전 포함) 이번 결과는 재검증 — 독립성 훼손으로 표시
+    n_prior, first_prior = prior_final_runs(market, t0)
+    out = {"period": f"{t0}~{t1}", "forced_rerun": forced, "prior_test_runs": n_prior, "first_test_run_at": first_prior,
+           "compromised": bool(forced or n_prior), "strategies": [], "models": [],
+           # 전향 검증: 이번 최종 검증으로 연구 결정이 고정된 다음 날부터의 실운영 예측만 '진짜 미검증' 구간으로 본다
+           "forward_start": str(forward_start(market) or (date.today() + timedelta(days=1)))}
     reg = _regime_by_date(market)
     capital = 100_000_000 if market == "KR" else 100_000
     bench = bt.benchmark_curves(market, t0, t1, capital)
     for r in best.itertuples():
         params = dict(r.params)
+        cash_signal = None
         if r.strategy == "ml_confidence_cash":
             params["_recent_ic"] = S.recent_rank_ic(market, pred_runs["ret"], 20, S.rebalance_dates(market, t0, t1, int(params["rebalance"])))
+            cash_signal = {"n_dates": len(params["_recent_ic"]), "n_cash": sum(v < 0 for v in params["_recent_ic"].values())}
         tg = S.generate_targets(market, r.strategy, t0, t1, params, pred_runs, reg)
         if not tg:
             continue
@@ -210,7 +267,8 @@ def _final(market: str, st: dict, pred_runs: dict, forced: bool, wf_spec: dict |
         out["strategies"].append({"strategy": r.strategy, "params": {k: v for k, v in params.items() if not k.startswith("_")},
                                   "selection_sharpe": float(sel_sharpe.get(r.strategy, np.nan)),
                                   "test": main["metrics"], "cost_sensitivity": rows, "conservative_delisting": cons_res["metrics"],
-                                  "bootstrap": boot, "benchmark_return": bench_ret,
+                                  "bootstrap": boot, "benchmark_return": bench_ret, "cash_signal": cash_signal,
+                                  "selection_dsr": _sel_dsr(search, r.strategy),
                                   "yearly": bt.yearly_returns(main["equity"]).to_dict("records"), "bt_id": bt_id,
                                   "krw_view": krw})
     with research_db() as db:
@@ -307,7 +365,8 @@ def write_report(market: str, st: dict):
         L += [""]
     if "final_test" in steps:
         ft = steps["final_test"]["result"]
-        L += ["## 6. 최종 독립 검증 (선택 후 1회 적용)", "", f"- 기간: {ft['period']}" + (" — ⚠️ 재실행됨: 독립성 훼손" if ft.get("forced_rerun") else ""), "",
+        L += ["## 6. 최종 독립 검증 (선택 후 1회 적용)", "", f"- 기간: {ft['period']}" + (" — ⚠️ 재실행됨: 독립성 훼손" if ft.get("forced_rerun") else ""),
+              *_compromise_note(ft), "",
               "| 전략 | 선택구간 샤프 | 검증 CAGR | 검증 샤프 | MDD | 비용0 CAGR | 비용2배 CAGR | 보수적 상폐 CAGR | 샤프 90% 구간 | 벤치마크 CAGR(같은 기간) |",
               "|---|---:|---:|---:|---:|---:|---:|---:|---|---|"]
         for r in sorted(ft["strategies"], key=lambda x: -(x["test"].get("sharpe") or -9)):
@@ -323,12 +382,91 @@ def write_report(market: str, st: dict):
             L.append(f"- {m['exp_id']}: Rank IC {_f(mt.get('rank_ic'), False, 3)} (t {_f(mt.get('rank_ic_t'), False, 1)}, NW t {_f(mt.get('rank_ic_t_nw'), False, 1)}), AUC {_f(mt.get('auc'), False, 3)}, "
                      f"n={m['n_test']:,}" + (f" ⚠️ {m['warning']}" if m.get("warning") else ""))
         L += ["", "## 7. 해석과 주의", "", *_interpret(ft, steps), ""]
-    L += ["## 8. 자원 사용", ""]
+        L += ["## 8. 전향 검증 (연구 결정 고정 이후의 실운영 예측)", "", *_forward_section(market, ft), ""]
+    L += ["## 9. 점검 요약 (자동)", "", *_checklist(st), ""]
+    L += ["## 10. 자원 사용", ""]
     for k, v in steps.items():
         L.append(f"- {k}: {v.get('sec', 0):.0f}초, 프로세스 메모리 {v.get('rss_gb')}GB")
     p = s.paths.reports / f"research_report_{market}.md"
     p.write_text("\n".join(L) + "\n", encoding="utf-8")
     return p
+
+
+def _compromise_note(ft: dict) -> list[str]:
+    n = ft.get("prior_test_runs") or 0
+    if not n:
+        return []
+    return [f"- ⚠️ **재검증**: 이 시장·구간의 최종 검증을 이전에 {n}번 실행했습니다(처음 {ft.get('first_test_run_at')}). "
+            "그 결과를 본 뒤 코드·설정을 고쳤을 수 있으므로 이번 수치는 독립 검증이 아닙니다. 참고용으로만 보고, "
+            "판단은 8장의 전향 검증 결과로 하세요."]
+
+
+def _forward_section(market: str, ft: dict) -> list[str]:
+    since = date.fromisoformat(ft["forward_start"]) if ft.get("forward_start") else None
+    if not since:
+        return ["- 전향 검증 시작일이 없습니다."]
+    from .monitor import forward_ic
+    try:
+        f = forward_ic(market, since, 20)
+    except Exception as e:   # 예측 테이블·특징 파일이 없는 환경
+        return [f"- 전향 검증 계산 불가: {e}"]
+    L = [f"- 시작: {since} (이 날 이후 매일 업데이트가 저장한 실운영 예측만 사용, 모델 refit 포함). "
+         f"예측 {f['n_pred_dates']}일, 20일 결과가 확정된 날 {f['n_dates']}일."]
+    if not f["n_dates"]:
+        return L + ["- 아직 결과가 확정된 예측이 없습니다. `update` 를 매일 실행해 예측을 쌓으면 보고서를 다시 만들 때 채워집니다."]
+    t = f["rank_ic_t_nw"]
+    L.append(f"- Rank IC 평균 {f['rank_ic']:.3f} (NW t {_f(t, False, 1)})")
+    if not f["enough"]:
+        L.append("- 아직 표본이 부족합니다(60거래일 미만). 결론을 내리지 마세요.")
+    elif f["rank_ic"] > 0 and t is not None and t >= 2:
+        L.append("- 연구 결정 이후의 새 데이터에서도 순위 예측력이 통계적으로 유지되고 있습니다.")
+    elif f["rank_ic"] > 0:
+        L.append("- 방향은 양(+)이지만 아직 통계적으로 확실하지 않습니다.")
+    else:
+        L.append("- 연구 결정 이후 새 데이터에서는 순위 예측력이 관찰되지 않습니다. 전략 적용을 보류하세요.")
+    L += [f"  - {m['month']}: {m['rank_ic']:.3f} ({m['n']}일)" for m in f["monthly"][-12:]]
+    return L
+
+
+def _checklist(st: dict) -> list[str]:
+    """다시 돌린 뒤 확인할 항목을 수치로 판정 (NW 보정 후 유의성, DSR, 2단계 수정 전략의 동작)."""
+    steps, L = st["steps"], []
+    lost, kept = [], []
+    for k, v in steps.items():
+        if not k.startswith("fixed_") or not v.get("done"):
+            continue
+        for r in v.get("result") or []:
+            m = r.get("metrics_valid") or {}
+            t, tnw = m.get("rank_ic_t"), m.get("rank_ic_t_nw")
+            if t is not None and tnw is not None and t >= 2:
+                (kept if tnw >= 2 else lost).append(f"{k[6:]}/{r['algorithm']}(t {t:.1f}→{tnw:.1f})")
+    if kept or lost:
+        L.append(f"- NW 보정: 보통 t≥2 였던 모델 {len(kept) + len(lost)}개 중 보정 후에도 t≥2 유지 {len(kept)}개"
+                 + (f", 유의성 사라짐 {len(lost)}개: {', '.join(lost)}" if lost else "."))
+    else:
+        L.append("- NW 보정: 비교할 모델 기록이 없습니다(이전 버전 기록에는 NW t값이 없음).")
+    sr = (steps.get("strategy_search") or {}).get("result") or {}
+    best = sr.get("best") or []
+    dsr_ok = [b["strategy"] for b in best if (b.get("dsr") or 0) >= 0.95]
+    if best:
+        ds = sr.get("deflated_sharpe") or {}
+        L.append(f"- DSR: 누적 시도 {ds.get('n_trials', '?')}개 기준, 0.95 이상인 선택 전략 {len(dsr_ok)}/{len(best)}개"
+                 + (f" ({', '.join(dsr_ok)})" if dsr_ok else " — 다중 시도를 감안하면 우연과 구분되는 전략이 없습니다."))
+    ft = (steps.get("final_test") or {}).get("result") or {}
+    by = {x["strategy"]: x for x in ft.get("strategies") or []}
+    cc = by.get("ml_confidence_cash")
+    if cc and cc.get("cash_signal"):
+        c = cc["cash_signal"]
+        L.append(f"- ml_confidence_cash: 리밸런싱 {c['n_dates']}번 중 현금 전환 {c['n_cash']}번"
+                 + (" — 현금 전환 조건이 실제로 작동했습니다." if c["n_cash"] else " — 최종 검증 구간에서는 순위상관이 음수인 때가 없었습니다."))
+    ra, top = by.get("ml_risk_adj"), by.get("ml_top_ret")
+    if ra and top and ra["test"].get("sharpe") is not None and top["test"].get("sharpe") is not None:
+        d = ra["test"]["sharpe"] - top["test"]["sharpe"]
+        L.append(f"- ml_risk_adj(순위 점수 표준화 후) 샤프 {ra['test']['sharpe']:.2f} vs ml_top_ret {top['test']['sharpe']:.2f}: "
+                 + ("변동성 조정이 도움이 됐습니다." if d > 0.05 else ("변동성 조정이 오히려 낮췄습니다." if d < -0.05 else "차이가 거의 없습니다.")))
+    if ft.get("compromised"):
+        L.append("- 최종 검증은 재검증(독립성 훼손) 상태입니다 → 판단은 전향 검증(8장)으로.")
+    return L or ["- 점검할 결과가 없습니다."]
 
 
 def _cagr_from_total(total: float | None, years: float | None) -> float | None:
