@@ -29,11 +29,29 @@ AI_INPUT_DATASET = "birkman_ai_inputs"
 AI_REPORT_DATASET = "birkman_ai_reports_raw"
 ALLOWED_DOMAIN = "dwchem.co.kr"
 APP_TITLE = "버크만 팀 리포트"
-APP_VERSION = "2026-10-13.1"
+APP_VERSION = "2026-10-14.1"
+# 자료 확인 주기(초). 이 시간이 지나면 완료 기록(latest_success.json)만 다시 보고,
+# 집계가 바뀌지 않았으면 기존 자료를 그대로 씁니다. 화면을 자동으로 새로 그리지 않습니다.
 DATA_CACHE_SECONDS = 60
-# 테스트 중에는 보고서를 읽다가 페이지가 재배치되지 않도록 자동 갱신을 끕니다.
-# 인증 모드의 주기적 세션 확인은 유지합니다. 테스트 자료 갱신은 '새로 읽기'를 누르세요.
 SHOW_LEADER_ONLY_GROUPS = False  # 팀원이 없는 그룹 직속 조직은 선택 목록에서 숨김
+
+# --- 보고서를 볼 수 있는 사람 (조직장 자동 지정) ---
+# 명부의 직책명으로 각 조직의 조직장을 찾아, 관리자 화면에서 따로 등록하지 않아도 그 조직의 보고서를 보게 합니다.
+#   팀(team)        : 직책명이 TEAM_HEAD_TITLES 인 사람 → 그 팀 + 하위 파트
+#   파트(part)      : 직책명이 PART_HEAD_TITLES 인 사람 → 그 파트
+#   그 밖의 조직(그룹 직속 등) : 직책명이 OTHER_HEAD_TITLES 인 사람 → 그 조직
+# 직책명을 추가하려면 아래 목록에 넣습니다. 예) TEAM_HEAD_TITLES = {"팀장", "팀장대행"}
+# 관리자 화면에서 지정한 권한(인사팀·추가 조직)은 이 자동 지정과 합쳐서 적용됩니다.
+# 팀원(조직장이 아닌 사람)은 팀 보고서를 볼 수 없고 '내 결과'만 봅니다.
+AUTO_LEADER_SCOPES = True
+TEAM_HEAD_TITLES = {"팀장"}
+PART_HEAD_TITLES = {"파트장"}
+OTHER_HEAD_TITLES = {"그룹장", "실장", "센터장", "본부장", "공장장"}
+
+# --- 보고서 해석 기준 (좌표는 가운데 0, 가로·세로 -1~1) ---
+BORDER_BAND = 0.10    # 가로 또는 세로가 이 값보다 가운데에 가까우면 '경계'로 보고 이웃 색을 함께 표시
+NEEDS_GAP = 0.6       # 평소행동과 욕구 기호 사이 거리가 이 이상이면 색이 같아도 '다른 구성원' 목록에 포함
+MIN_GROUP_FOR_PATTERN = 5  # 반영 인원이 이 수 이상일 때만 '주류 색'·'팀에 없는 색' 문구를 표시
 OTP_LIFETIME_SECONDS = 300
 SESSION_LIFETIME_SECONDS = 8 * 60 * 60
 ENROLLMENT_LIFETIME_SECONDS = 30 * 60  # 등록코드는 30분·1회만 사용
@@ -61,9 +79,7 @@ from pathlib import Path
 
 import dataiku
 from dash import dcc, html, Input, Output, State, callback_context, no_update
-from dash.exceptions import PreventUpdate
-import plotly.graph_objects as go
-from flask import session, request, has_request_context
+from flask import session, has_request_context
 from werkzeug.security import generate_password_hash, check_password_hash
 
 LOG = logging.getLogger("birkman_webapp")
@@ -120,9 +136,17 @@ def stamp(t=None):
     return dt.datetime.fromtimestamp(t or time.time(), KST).strftime("%Y.%m.%d %H:%M")
 
 
+class DataCheckError(ValueError):
+    """이 코드가 자료를 검증하다 직접 만든 오류. 문구에 개인정보가 없으므로 로그와 화면에 그대로 보여줍니다."""
+
+
 def fail_log(where, exc):
     # PDF 내용, 메일 본문, 인증번호, 쿠키, 직원 정보는 로그에 쓰지 않습니다.
-    LOG.error("%s: %s", where, type(exc).__name__)
+    # 자료 검증 오류(DataCheckError)만 원인 문구를 함께 남겨 담당자가 무엇을 고칠지 알 수 있게 합니다.
+    if isinstance(exc, DataCheckError):
+        LOG.error("%s: %s", where, str(exc))
+    else:
+        LOG.error("%s: %s", where, type(exc).__name__)
 
 
 # =====================================================================
@@ -189,6 +213,11 @@ class AccessStore:
             r = c.execute("SELECT * FROM access WHERE email=?", (email,)).fetchone()
         return dict(r) if r else {"email": email, "role": "member", "scopes": "[]", "active": 1,
                                   "admin": 0, "revision": 0, "modified": ""}
+
+    @staticmethod
+    def peek(c, key, seconds, maximum, now):
+        """기록을 남기지 않고 제한에 걸렸는지만 확인"""
+        return c.execute("SELECT COUNT(*) FROM limits WHERE k=? AND ts>?", (key, now - seconds)).fetchone()[0] < maximum
 
     @staticmethod
     def hit(c, key, seconds, maximum, now):
@@ -308,16 +337,21 @@ class AccessStore:
         with self.db() as c:
             c.execute("DELETE FROM limits WHERE ts<?",(now-86400,))
             c.execute("DELETE FROM sessions WHERE expires<?",(now,))
+            # 전체 시도 수는 모두 세고(서버 부하 방지), 메일·브라우저별 제한은 '실패'만 셉니다.
             allowed=[self.hit(c,"password:global",900,600,now),
-                     self.hit(c,"password:browser:"+browser,900,30,now),
-                     self.hit(c,"password:email:"+email,900,5,now)]
+                     self.peek(c,"password-fail:browser:"+browser,900,30,now),
+                     self.peek(c,"password-fail:email:"+email,900,5,now)]
             row=c.execute("SELECT * FROM credentials WHERE email=?",(email,)).fetchone()
             # 없는 계정도 같은 해시 검사를 수행하여 계정 유무의 응답시간 차이를 줄입니다.
             saved=dict(row) if row else None
         if not all(allowed):return None
         hash_=saved["password_hash"] if saved else self.dummy_password_hash
         valid=check_password_hash(hash_,password)
-        if not valid or not saved or saved["employee"]!=employee:return None
+        if not valid or not saved or saved["employee"]!=employee:
+            with self.db() as c:
+                c.execute("INSERT INTO limits VALUES (?,?)",("password-fail:browser:"+browser,now))
+                c.execute("INSERT INTO limits VALUES (?,?)",("password-fail:email:"+email,now))
+            return None
         token=secrets.token_urlsafe(48)
         with self.db() as c:
             current=c.execute("SELECT * FROM credentials WHERE email=?",(email,)).fetchone()
@@ -373,7 +407,7 @@ def marker(folder, filename):
     with dataiku.Folder(folder).get_download_stream(filename) as s:
         value = json.loads(s.read().decode("utf-8"))
     if not isinstance(value, dict):
-        raise ValueError("완료 기록 형식을 확인하세요.")
+        raise DataCheckError("완료 기록 형식을 확인하세요.")
     return value
 
 
@@ -381,47 +415,61 @@ class Repository:
     def __init__(self):
         self.lock = threading.RLock()
         self.cached = None
+        self.cached_markers = None
         self.loaded = 0
 
     def get(self, force=False):
         with self.lock:
-            if self.cached and not force and time.time() - self.loaded < DATA_CACHE_SECONDS:
+            now = time.time()
+            if self.cached and not force and now - self.loaded < DATA_CACHE_SECONDS:
                 return self.cached
-            # 새 자료를 읽지 못하면 기존 직원 명부로 계속 서비스하지 않습니다.
-            self.cached = None
-            before = marker(TEAM_CACHE_FOLDER, "latest_success.json")
-            attempt = marker(TEAM_CACHE_FOLDER, "latest_attempt.json")
-            rid = txt(before.get("aggregation_run_id"))
-            if not rid or before.get("status") != "completed" or attempt != before:
-                raise ValueError("팀 집계가 진행 중이거나 완료되지 않았습니다.")
-            extract = marker(EXTRACT_CACHE_FOLDER, "latest_success.json")
-            source_id = txt(before.get("source_run_id"))
-            if extract.get("run_id") != source_id:
-                raise ValueError("PDF 추출 후 팀 집계를 다시 실행하세요.")
-            tables = {n: dataset_rows(n) for n in (SUMMARY_DATASET, MEMBERS_DATASET, AI_INPUT_DATASET)}
-            for n, rows in tables.items():
-                if len(rows) != before.get("row_counts", {}).get(n):
-                    raise ValueError("집계 표의 행 수와 완료 기록이 다릅니다.")
-                if any(txt(r.get("aggregation_run_id")) != rid or txt(r.get("source_run_id")) != source_id for r in rows):
-                    raise ValueError("서로 다른 실행의 집계가 섞였습니다.")
-            people = dataset_rows(PEOPLE_DATASET)
-            if len(people) != extract.get("명부행수") or any(txt(r.get("run_id")) != source_id for r in people):
-                raise ValueError("개인 결과와 팀 집계의 기준이 다릅니다.")
-            # AI가 아직 없어도 수치/맵/명단 조회는 가능합니다.
-            ai_problem = ""
             try:
-                ai_rows = dataset_rows(AI_REPORT_DATASET)
-            except Exception as e:
-                ai_rows = []
-                ai_problem = "AI 보고서가 아직 준비되지 않았습니다."
-                fail_log("ai_read", e)
-            if marker(TEAM_CACHE_FOLDER, "latest_success.json") != before or marker(TEAM_CACHE_FOLDER, "latest_attempt.json") != before:
-                raise ValueError("자료가 갱신 중입니다. 잠시 후 다시 접속하세요.")
-            if marker(EXTRACT_CACHE_FOLDER, "latest_success.json") != extract:
-                raise ValueError("개인 결과가 갱신 중입니다.")
-            snap = self.index(people, tables, ai_rows, before, ai_problem)
-            self.cached, self.loaded = snap, time.time()
+                # 완료 기록 세 개만 먼저 읽습니다. 마지막으로 읽은 집계와 같으면 데이터셋을 다시 읽지 않습니다.
+                before = marker(TEAM_CACHE_FOLDER, "latest_success.json")
+                attempt = marker(TEAM_CACHE_FOLDER, "latest_attempt.json")
+                extract = marker(EXTRACT_CACHE_FOLDER, "latest_success.json")
+                if (self.cached and not force and attempt == before and
+                        (before, extract) == self.cached_markers):
+                    self.loaded = now
+                    return self.cached
+                snap = self.load(before, attempt, extract)
+            except Exception:
+                # 새 자료를 확인하지 못하면 기존 직원 명부로 계속 서비스하지 않습니다.
+                self.cached = None
+                raise
+            self.cached, self.cached_markers, self.loaded = snap, (before, extract), time.time()
             return snap
+
+    def load(self, before, attempt, extract):
+        """완료 기록이 가리키는 한 번의 실행 결과만 읽어 화면용 묶음(snap)을 만듭니다."""
+        rid = txt(before.get("aggregation_run_id"))
+        if not rid or before.get("status") != "completed" or attempt != before:
+            raise DataCheckError("팀 집계가 진행 중이거나 완료되지 않았습니다.")
+        source_id = txt(before.get("source_run_id"))
+        if extract.get("run_id") != source_id:
+            raise DataCheckError("PDF 추출 후 팀 집계를 다시 실행하세요.")
+        tables = {n: dataset_rows(n) for n in (SUMMARY_DATASET, MEMBERS_DATASET, AI_INPUT_DATASET)}
+        for n, rows in tables.items():
+            if len(rows) != before.get("row_counts", {}).get(n):
+                raise DataCheckError("집계 표의 행 수와 완료 기록이 다릅니다: " + n)
+            if any(txt(r.get("aggregation_run_id")) != rid or txt(r.get("source_run_id")) != source_id for r in rows):
+                raise DataCheckError("서로 다른 실행의 집계가 섞였습니다: " + n)
+        people = dataset_rows(PEOPLE_DATASET)
+        if len(people) != extract.get("명부행수") or any(txt(r.get("run_id")) != source_id for r in people):
+            raise DataCheckError("개인 결과와 팀 집계의 기준이 다릅니다.")
+        # AI가 아직 없어도 수치/맵/명단 조회는 가능합니다.
+        ai_problem = ""
+        try:
+            ai_rows = dataset_rows(AI_REPORT_DATASET)
+        except Exception as e:
+            ai_rows = []
+            ai_problem = "AI 보고서가 아직 준비되지 않았습니다."
+            fail_log("ai_read", e)
+        if marker(TEAM_CACHE_FOLDER, "latest_success.json") != before or marker(TEAM_CACHE_FOLDER, "latest_attempt.json") != before:
+            raise DataCheckError("자료가 갱신 중입니다. 잠시 후 다시 접속하세요.")
+        if marker(EXTRACT_CACHE_FOLDER, "latest_success.json") != extract:
+            raise DataCheckError("개인 결과가 갱신 중입니다.")
+        return self.index(people, tables, ai_rows, before, ai_problem)
 
     @staticmethod
     def index(people, tables, ai_rows, meta, ai_problem=""):
@@ -429,7 +477,7 @@ class Repository:
         for p in people:
             eid = txt(p.get("employee_id"))
             if not eid or eid in by_id:
-                raise ValueError("명부의 사번이 비어 있거나 중복됩니다.")
+                raise DataCheckError("명부의 사번이 비어 있거나 중복됩니다.")
             by_id[eid] = p
             email = email_address(p.get("email_normalized") or p.get("이메일주소"))
             if email:
@@ -442,24 +490,24 @@ class Repository:
         members = collections.defaultdict(list)
         for o in tables[SUMMARY_DATASET]:
             if o["org_key"] in orgs:
-                raise ValueError("조직 키가 중복됩니다.")
+                raise DataCheckError("조직 키가 중복됩니다.")
             orgs[o["org_key"]] = o
         seen = set()
         for m in tables[MEMBERS_DATASET]:
             key = (m["org_key"], txt(m.get("employee_id")))
             if key in seen or key[0] not in orgs or key[1] not in by_id:
-                raise ValueError("구성원 연결을 확인하세요.")
+                raise DataCheckError("구성원 연결을 확인하세요.")
             seen.add(key)
             members[key[0]].append(m)
         for k, o in orgs.items():
             if len(members[k]) != int(o["member_count"]):
-                raise ValueError("조직 인원수와 구성원 표가 다릅니다.")
+                raise DataCheckError("조직 인원수와 구성원 표가 다릅니다.")
             members[k].sort(key=lambda m: (txt(m.get("성명")), txt(m.get("employee_id"))))
         inputs = {}
         for r in tables[AI_INPUT_DATASET]:
             key = (r["org_key"], r["audience"])
             if key in inputs:
-                raise ValueError("AI 입력 조직/독자가 중복됩니다.")
+                raise DataCheckError("AI 입력 조직/독자가 중복됩니다.")
             inputs[key] = r
         responses = collections.defaultdict(list)
         for r in ai_rows:
@@ -494,16 +542,33 @@ def principal(snap):
     return {"email": s["email"], "eid": s["employee"], "person": person, "rule": rule}
 
 
-def own_orgs(p, snap):
-    return {k for k, rows in snap["members"].items() if any(txt(r["employee_id"]) == p["eid"] for r in rows)}
+def org_head_rows(snap, key):
+    """조직장(팀장·파트장·그 밖의 조직장)으로 볼 구성원 행. 직책명은 맨 위 설정의 *_HEAD_TITLES 기준입니다."""
+    level = snap["orgs"].get(key, {}).get("org_level")
+    titles = TEAM_HEAD_TITLES if level == "team" else PART_HEAD_TITLES if level == "part" else OTHER_HEAD_TITLES
+    return [r for r in snap["members"].get(key, []) if txt(r.get("직책명")) in titles]
+
+
+def auto_leader_orgs(p, snap):
+    """명부의 직책명으로 이 사람이 조직장인 조직을 찾습니다. 팀장이면 그 팀의 하위 파트도 포함합니다."""
+    if not AUTO_LEADER_SCOPES:
+        return set()
+    keys = set()
+    for k in snap["members"]:
+        if any(txt(r.get("employee_id")) == p["eid"] for r in org_head_rows(snap, k)):
+            keys.add(k)
+            if snap["orgs"][k].get("org_level") == "team":
+                keys.update(x for x, o in snap["orgs"].items() if o.get("parent_team_key") == k)
+    return keys
 
 
 def leader_scopes(p, snap):
+    """보고서를 볼 수 있는 조직: 인사팀 역할은 전체, 그 외에는 자동 조직장 범위 + 관리자가 지정한 범위."""
     role = p["rule"]["role"]
     if role == "hr":
         return set(snap["orgs"])
     scopes = js(p["rule"]["scopes"], [])
-    keys = set()
+    keys = auto_leader_orgs(p, snap)
     for k in scopes:
         org = snap["orgs"].get(k)
         if not org:
@@ -517,7 +582,8 @@ def leader_scopes(p, snap):
 
 
 def visible_orgs(p, snap):
-    return own_orgs(p, snap) | leader_scopes(p, snap)
+    # 팀원에게는 팀 보고서를 공개하지 않습니다. 조직장·인사 권한이 있는 조직만 보입니다.
+    return leader_scopes(p, snap)
 
 
 def selectable_report_orgs(p,snap):
@@ -840,9 +906,10 @@ def finish_report(sheets,title,snap):
     # 원본 구성은 숨기고, 화면과 인쇄에서 동일한 페이지 DOM을 사용합니다.
     tools=[html.Button("원본 크기로 보기",className="report-zoom",type="button")]
     if notes:tools.insert(0,html.Details([html.Summary("설명 전문 · 작성 근거"),html.Div(notes,className="report-explanations")],className="report-notes no-print"))
+    # data-report-key: 화면을 새로 그릴 때마다 바뀌는 값. 페이지 배치 JS가 보고서 전체 내용을 비교하지 않고 이 값만 봅니다.
     return html.Div([html.Div(tools,className="report-tools no-print"),
                      html.Div(sheets,className="report-source",**{"aria-hidden":"true"}),
-                     html.Div(className="report-preview")],className="report")
+                     html.Div(className="report-preview")],className="report",**{"data-report-key":secrets.token_hex(8)})
 
 
 def guide_block():
@@ -952,33 +1019,195 @@ def orientation_content(stats,personal=False):
         html.Div([html.Div([html.B([swatch(c),ORIENTATIONS[c]]),html.P(descriptions[c],className="small")],className="orientation-description") for c in ORIENTATIONS],className="orientation-descriptions")]
 
 
-def profile_card(r,snap):
-    person=snap["people"].get(txt(r.get("employee_id")),r)
-    eligible=flag(r.get("analysis_eligible"))
-    head=html.Div([html.Strong(txt(r.get("성명"))),html.Span(" · ".join(filter(None,[txt(r.get("파트명")),txt(r.get("직책명"))])))],className="profile-head")
-    if not eligible:return html.Div([head,html.P("표시할 진단 결과가 없습니다.",className="profile-status")],className="profile")
-    values=interest_stats_for([person]);top=interest_rank(values)[:3]
-    texts=[html.P([html.B("좋아하는 일")," · ".join(INTERESTS[k] for k in top) or "미확인"])]
-    for field,label in [("needs_personal_json","바라는 대우"),("strengths_json","강점")]:
-        lines=original_text(person,field,1)
-        # 카드의 높이가 원문 길이에 좌우되지 않도록 발췌합니다. 전문은 구성원 상세에 있습니다.
-        excerpt=txt(lines[0]) if lines else "이 항목 미확인"
-        if len(excerpt)>160:excerpt=excerpt[:159].rstrip()+"…"
-        texts.append(html.P([html.B(label),excerpt],className="source-text" if field=="strengths_json" else ""))
-    return html.Div([head,html.Div([svg_map([r],list(MAPS),labels=False,mini=True),html.Div([html.Div([html.Span(SYMBOLS[k]+" "+("스트레스" if k=="stress" else MAPS[k])),html.Span([swatch(color_of(r,k)),color_of(r,k) or "미확인"])]) for k in MAPS],className="profile-colors")],className="profile-map")]+texts,className="profile")
+# ---------------------------------------------------------------------
+# 리더용 해석 규칙 (AI 해설이 없어도 채워지는 기본 문구)
+# 문구를 바꾸려면 아래 사전만 고치면 됩니다. 색에 좋고 나쁨이 없도록 '대하는 방법'으로만 씁니다.
+# ---------------------------------------------------------------------
+FOUR_COLORS = ["빨강", "초록", "노랑", "파랑"]
+# 가로(x)·세로(y) 경계를 넘으면 닿는 이웃 색
+NEIGHBOR = {("빨강", "x"): "초록", ("초록", "x"): "빨강", ("노랑", "x"): "파랑", ("파랑", "x"): "노랑",
+            ("빨강", "y"): "노랑", ("노랑", "y"): "빨강", ("초록", "y"): "파랑", ("파랑", "y"): "초록"}
+DIAGONAL = {"빨강": "파랑", "파랑": "빨강", "초록": "노랑", "노랑": "초록"}
+# 욕구(○) 색별: 리더가 해줄 것 / 욕구가 채워지지 않을 때 보일 수 있는 신호 / 1:1 대화 질문
+LEADER_GUIDE = {
+    "빨강": {"treat": "목표·기한·권한을 짧고 분명하게 전하고, 결과로 인정해 주세요.",
+             "signal": "성급해지거나 지시적으로 변할 수 있습니다.",
+             "question": "이번 일에서 어디까지 직접 결정할 수 있으면 좋겠어요?"},
+    "초록": {"treat": "의견을 말할 기회와 공개적인 인정, 사람과 교류하는 일을 주세요.",
+             "signal": "말이 많아지거나 감정적으로 밀어붙일 수 있습니다.",
+             "question": "요즘 팀 안에서 의견을 충분히 낼 수 있었나요?"},
+    "노랑": {"treat": "변경 사항은 미리 알리고, 기준과 절차를 글로 정리해 주세요.",
+             "signal": "경직되거나 세부사항에 집착하고 비판적으로 변할 수 있습니다.",
+             "question": "일정이나 기준이 바뀔 때 언제쯤 알려주면 일하기 편해요?"},
+    "파랑": {"treat": "생각할 시간과 1:1 대화를 주고, 일의 배경과 의미를 설명해 주세요.",
+             "signal": "결정을 미루거나 위축되고 비관적으로 생각할 수 있습니다.",
+             "question": "결정하기 전에 생각할 시간이 충분했나요?"},
+}
+# 팀 욕구 최다 색별 운영 팁
+TEAM_GUIDE_SITUATIONS = ["회의", "피드백", "업무 지시", "변화·공지"]
+TEAM_GUIDE = {
+    "빨강": ["결론부터, 짧게 진행합니다.", "직접적이고 구체적으로 전합니다.", "목표와 기한을 주고 방법은 맡깁니다.", "빠르게, 실행 계획과 함께 알립니다."],
+    "초록": ["의견을 나누는 시간을 두고, 끝에 담당자를 정리합니다.", "공개적으로 인정하고 조언은 따로 전합니다.", "사람과 연결되는 역할을 줍니다.", "설명하고 의견을 듣는 자리를 만듭니다."],
+    "노랑": ["안건과 자료를 미리 공유합니다.", "기준에 맞춘 구체적인 피드백을 줍니다.", "절차와 기준을 글로 정리해 줍니다.", "미리, 이유와 일정을 함께 알립니다."],
+    "파랑": ["자료를 먼저 주고 생각할 시간을 둡니다. 의견은 1:1로도 받습니다.", "1:1로, 배려하며 전합니다.", "일의 배경과 의미를 설명합니다.", "큰 그림과 이유를 먼저 공유합니다."],
+}
+# 평소행동에서 아무도 없는 색이 있을 때(반영 인원이 MIN_GROUP_FOR_PATTERN 이상일 때만)
+EMPTY_COLOR_TEXT = {
+    "빨강": "빠른 결정과 실행을 자연스럽게 챙기는 사람이 적습니다. 마감과 담당자를 분명히 정해 두세요.",
+    "초록": "대외 소통·설득을 자연스럽게 맡는 사람이 적습니다. 결과를 알리고 설득하는 역할을 정해 두세요.",
+    "노랑": "기준·절차·세부 확인을 자연스럽게 챙기는 사람이 적습니다. 체크리스트와 검토 단계를 두세요.",
+    "파랑": "장기적인 구상과 새로운 아이디어를 자연스럽게 내는 사람이 적습니다. '왜·앞으로'를 논의하는 시간을 두세요.",
+}
+RELATION_TEXT = {"same": "가까움", "near": "부분 조정", "diagonal": "의식적 조정"}
 
 
-def profile_sections(rows,org,snap):
-    """팀에서는 팀장, 파트에서는 파트장을 먼저. 나머지는 직책과 관계없이 가나다순."""
-    ordered=sorted(rows,key=lambda r:(txt(r.get("성명")),txt(r.get("employee_id"))))
-    title={"team":"팀장","part":"파트장"}.get(org.get("org_level"),"")
-    leaders=[r for r in ordered if title and txt(r.get("직책명"))==title]
-    others=[r for r in ordered if not title or txt(r.get("직책명"))!=title]
-    content=[]
+def xy(row, kind):
+    return num(row.get(kind + "_x")), num(row.get(kind + "_y"))
+
+
+def border_colors(row, kind):
+    """기호가 가운데 가로·세로선 가까이(BORDER_BAND 이내) 있으면 닿아 있는 이웃 색 목록"""
+    c = color_of(row, kind)
+    if c not in FOUR_COLORS:
+        return []
+    x, y = xy(row, kind)
+    near = []
+    if abs(x) < BORDER_BAND:
+        near.append(NEIGHBOR[(c, "x")])
+    if abs(y) < BORDER_BAND:
+        near.append(NEIGHBOR[(c, "y")])
+    return near
+
+
+def color_label(row, kind):
+    """'파랑' 또는 경계면 '파랑(노랑 쪽)'. 좌표가 없으면 '미확인'."""
+    c = color_of(row, kind)
+    if not c:
+        return "미확인"
+    if c == "중앙선":
+        return "가운데"
+    near = border_colors(row, kind)
+    return c + ("(%s 쪽)" % "·".join(near) if near else "")
+
+
+def relation(a, b):
+    """두 색의 관계: 같음 / 이웃(한 축만 다름) / 대각선(두 축 모두 다름)"""
+    if a == b:
+        return "same"
+    return "diagonal" if DIAGONAL.get(a) == b else "near"
+
+
+def name_label(r, nums, total):
+    return ("%s " % nums[txt(r.get("employee_id"))] if total > 12 else "") + txt(r.get("성명"))
+
+
+def lines_of(person, field, limit, width=90):
+    return [brief(t, width) for t in original_text(person, field, limit)]
+
+
+def majority(stats):
+    """가장 많은 색(동률이면 앞의 색)과 그 인원. 중앙선은 제외"""
+    qs = [q for q in stats.get("quadrants", []) if q["color"] in FOUR_COLORS and q["count"]]
+    if not qs:
+        return None, 0
+    best = max(qs, key=lambda q: q["count"])
+    return best["color"], best["count"]
+
+
+def orientation_top(r):
+    """구성원 행의 조직지향점에서 가장 긴 막대(동률이면 모두)"""
+    if not flag(r.get("orientation_valid")):
+        return []
+    vals = js(r.get("orientation_profile_json"), {}).get("relative_lengths", {})
+    vals = {c: num(v) for c, v in vals.items() if c in ORIENTATIONS and num(v) is not None}
+    if not vals:
+        return []
+    mx = max(vals.values())
+    return [c for c in ORIENTATIONS if vals.get(c) == mx]
+
+
+def usual_pattern_text(rows):
+    """평소행동 주류 색(50% 이상)과 팀에 없는 색 문구. 반영 인원이 적으면 표시하지 않습니다."""
+    stats = map_stats(rows, "usual")
+    n = sum(q["count"] for q in stats["quadrants"] if q["color"] in FOUR_COLORS)
+    if n < MIN_GROUP_FOR_PATTERN:
+        return []
+    out = []
+    top, cnt = majority(stats)
+    if top and cnt * 2 >= n:
+        out.append(html.P([html.B("절반 이상이 같은 색 · "), "%s %s명 / %s명. 손발이 잘 맞는 대신 다른 관점을 놓치기 쉬우니, 결정 전에 반대 관점을 한 번 검토해 보세요." % (top, cnt, n)]))
+    missing = [q["color"] for q in stats["quadrants"] if q["color"] in FOUR_COLORS and not q["count"]]
+    for c in missing:
+        out.append(html.P([html.B("팀에 없는 색 · %s · " % c), EMPTY_COLOR_TEXT[c]]))
+    return out
+
+
+def differing_members(rows):
+    """평소행동(◆)과 욕구(○)의 색이 다르거나, 같은 색이어도 거리가 NEEDS_GAP 이상인 구성원.
+    대각선(두 축 모두 다른 색) → 거리 순으로 정렬합니다."""
+    out = []
+    for r in rows:
+        u, n = color_of(r, "usual"), color_of(r, "needs")
+        if u not in FOUR_COLORS or n not in FOUR_COLORS:
+            continue
+        (ux, uy), (nx, ny) = xy(r, "usual"), xy(r, "needs")
+        dist = math.hypot(ux - nx, uy - ny)
+        rel = relation(u, n)
+        if rel != "same" or dist >= NEEDS_GAP:
+            out.append((r, rel, dist))
+    order = {"diagonal": 0, "near": 1, "same": 2}
+    return sorted(out, key=lambda v: (order[v[1]], -v[2], txt(v[0].get("성명"))))
+
+
+def org_leader(snap, key):
+    """이 조직의 조직장 중 평소행동 좌표가 확인된 사람 한 명 (없으면 None)"""
+    heads = sorted(org_head_rows(snap, key), key=lambda r: txt(r.get("성명")))
+    valid = [r for r in heads if color_of(r, "usual") in FOUR_COLORS]
+    return valid[0] if valid else None
+
+
+def member_card(r, snap, leader=False):
+    """구성원 카드: 작은 맵 + 네 기호의 색 + 결과지 원문(평소·욕구·스트레스) + 1:1 질문"""
+    person = snap["people"].get(txt(r.get("employee_id")), r)
+    sub = " · ".join(filter(None, [txt(r.get("파트명")), txt(r.get("직책명"))]))
+    head = html.Div([html.Strong(txt(r.get("성명"))), html.Span(sub)], className="profile-head")
+    if not flag(r.get("analysis_eligible")):
+        return html.Div([head, html.P("진단 결과가 없습니다. 명단에는 포함되어 있습니다.", className="profile-status")], className="profile member-card")
+    u, n = color_of(r, "usual"), color_of(r, "needs")
+    top = interest_rank(interest_stats_for([person]))[:2]
+    colors = html.Div([html.Div([html.Span(SYMBOLS[k] + " " + ("스트레스" if k == "stress" else MAPS[k])),
+                                 html.Span([swatch(color_of(r, k)), color_label(r, k)])]) for k in MAPS], className="profile-colors")
+    left = html.Div([svg_map([r], list(MAPS), labels=False, mini=True), colors], className="card-left")
+    guide = LEADER_GUIDE.get(n, {})
+    usual_lines = lines_of(person, "usual_personal_json", 3)
+    needs_lines = lines_of(person, "needs_personal_json", 3) or ([guide["treat"]] if guide else [])
+    stress_lines = lines_of(person, "stress_personal_json", 2) or ([guide["signal"]] if guide else [])
+    questions = [guide["question"]] if guide else []
+    if u in FOUR_COLORS and n in FOUR_COLORS and u != n:
+        questions.append("평소 모습과 다르게, 어떤 방식으로 대해 줄 때 일하기 편한가요?")
+    orient = orientation_top(r)
+    rows_ = [("이렇게 일해요", usual_lines), ("이렇게 대해 주세요", needs_lines),
+             ("이런 모습이 보이면 욕구를 점검", stress_lines), ("다음 1:1 질문", questions)]
+    right = [html.P([html.B("한눈에 "), "평소 %s · 바라는 대우 %s · 좋아하는 일 %s" % (
+        color_label(r, "usual"), color_label(r, "needs"), " · ".join(INTERESTS[k] for k in top) or "미확인")], className="card-summary")]
+    right += [html.P([html.B(label + " "), " · ".join(vals)]) for label, vals in rows_ if vals]
+    if orient:
+        right.append(html.P([html.B("편한 근무환경 "), " · ".join(ORIENTATIONS[c] for c in orient)], className="small"))
+    cls = "profile member-card" + (" leader-card" if leader else "")
+    return html.Div([head, html.Div([left, html.Div(right, className="card-right")], className="card-body")], className=cls)
+
+
+def member_cards(rows, org, snap):
+    """조직장 카드를 먼저, 나머지는 가나다순"""
+    ordered = sorted(rows, key=lambda r: (txt(r.get("성명")), txt(r.get("employee_id"))))
+    heads = {txt(r.get("employee_id")) for r in org_head_rows(snap, org["org_key"])}
+    leaders = [r for r in ordered if txt(r.get("employee_id")) in heads]
+    others = [r for r in ordered if txt(r.get("employee_id")) not in heads]
+    content = []
     if leaders:
-        content += [html.H3(title+" 요약"),html.Div([profile_card(r,snap) for r in leaders],className="profile-grid")]
+        content += [html.H3("조직장"), html.Div([member_card(r, snap, True) for r in leaders], className="profile-grid member-cards")]
     if others:
-        content += [html.H3("구성원 요약 · 가나다순"),html.Div([profile_card(r,snap) for r in others],className="profile-grid")]
+        content += [html.H3("구성원 · 가나다순"), html.Div([member_card(r, snap) for r in others], className="profile-grid member-cards")]
     return content
 
 
@@ -1003,6 +1232,7 @@ def team_interest_explanation(stats,rank):
         html.P("10개 흥미 분야를 비교했을 때 평균 점수가 높은 항목은 "+" · ".join(INTERESTS[k] for k in top)+"입니다. 아래의 활동을 즐기거나 관심을 갖는 경향을 업무 대화에 참고해 보세요."),
         html.Div([html.P([html.B(INTERESTS[k]+" — "),INTEREST_ACTIVITY_TEXT[k],
                          html.Span(" (평균 %.0f / 100 · %s명 반영)"%(stats[k]["mean"],stats[k]["n"]),className="small")]) for k in top]),
+        html.P([html.B("덜 끌리는 활동 · "),", ".join(INTERESTS[k] for k in rank[-2:])+" — 이 일을 오래 맡기면 에너지가 빨리 줄 수 있습니다."]) if len(rank)>=5 else None,
         html.P("이 수치는 관심의 크기이며 능력·성과 점수가 아닙니다. 팀 평균이 높더라도 구성원 모두의 흥미가 같다는 뜻은 아니므로, 실제 업무를 맡길 때는 개인의 관심도 함께 확인하세요.",className="small")]
 
 
@@ -1039,137 +1269,182 @@ def source_panel(snap,rows,kind,title):
     return html.Div([html.H3(title),html.Ul([html.Li([t,html.Span(" (%s명 원문)"%n,className="small")]) for t,n in examples]) if examples else html.P("확인된 원문 설명이 없습니다.",className="small")],className="source-pair")
 
 
-def org_page(snap,p,key,kind=None,leader=False):
-    if key not in visible_orgs(p,snap):return empty("조회할 조직을 선택하세요.")
-    if leader and not can_detail(p,snap,key):return empty("이 조직의 리더 가이드 조회 권한이 없습니다.")
-    org=snap["orgs"][key];rows=snap["members"][key];detail=can_detail(p,snap,key)
-    title=txt(org["org_name"]);audience="leader" if detail else "shared"
-    report,evidence,message=report_for(snap,key,audience)
-    # 팀/파트 중복 없이 개인 테이블에서 전체 진단자 비교값을 만듭니다. 이름은 보내지 않습니다.
+def org_page(snap,p,key):
+    """팀·파트 보고서 (조직장·인사 권한만). 순서:
+    표지 → 01 읽는 법 → 02 평소행동 → 03 욕구·스트레스 → 04 평소행동과 욕구가 다른 구성원 → 05 리더와 구성원
+    → 06 조직지향점 → 07 흥미 → 08 팀 운영 가이드 → 09 구성원 한눈에 보기 → 참고자료
+    """
+    if key not in visible_orgs(p,snap) or not can_detail(p,snap,key):return empty("조회할 조직을 선택하세요.")
+    org=snap["orgs"][key];rows=snap["members"][key];title=txt(org["org_name"])
+    report,evidence,message=report_for(snap,key,"leader")
+    nums=roster_number(rows)
     population=list(snap["people"].values());ref_interest=interest_stats_for(population)
     interests=interest_stats_for(rows);rank=interest_rank(interests)
     usual=map_stats(rows,"usual");needs=map_stats(rows,"needs")
-    paired=[r for r in rows if color_of(r,"usual") and color_of(r,"needs") and "중앙선" not in [color_of(r,"usual"),color_of(r,"needs")]]
-    changed=[r for r in paired if color_of(r,"usual")!=color_of(r,"needs")]
-    summary="평소행동은 %s, 바라는 대우는 %s이 가장 많습니다. 두 항목을 함께 보며 구성원에게 맞는 업무 방식과 소통 방법을 살펴보세요."%(top_color(usual),top_color(needs)) if usual["n"] and needs["n"] else "확인된 결과부터 정리했습니다. 항목마다 반영된 인원을 함께 확인해 주세요."
-    anchors=[("read-guide","30초 읽는 법"),("interest","좋아하는 일"),("usual","남에게 보이는 모습"),("needs","바라는 대우와 스트레스"),("coaching","팀 운영에 적용하기"),("comparison","참고 · 구성 비교·조직지향점")]
-    if detail:anchors += [("interest-table","구성원 흥미 점수표"),("profiles","구성원 한눈에 보기")]
-    cover=sheet("",None,[html.Div([html.Span("BIRKMAN · TEAM REPORT"),html.Span("조직장 열람용" if detail else "팀 공유용")],className="sheet-kicker"),html.Div(txt(org.get("org_path")),className="cover-path"),html.H1(title),
+    needs_top,_=majority(needs);usual_top,_=majority(usual)
+    orientation=js(org.get("orientation_json"),{})
+    orient_cats=[c for c in orientation.get("categories",[]) if c.get("top_count")]
+    orient_top=max(orient_cats,key=lambda c:c["top_count"]) if orient_cats else None
+    differing=differing_members(rows)
+    # 보고서 문구의 리더 호칭: 팀 보고서는 팀장, 파트 보고서는 파트장, 그 밖의 조직은 조직장
+    head_word={"team":"팀장","part":"파트장"}.get(org.get("org_level"),"조직장")
+
+    # ---------- 표지 ----------
+    summary=("평소에는 %s처럼 일하고, %s의 대우를 바라는 구성원이 가장 많습니다. 좋아하는 일은 %s입니다."%(
+        usual_top or "—",needs_top or "—"," · ".join(INTERESTS[k] for k in rank[:2]) or "미확인") if usual_top and needs_top
+        else "확인된 결과부터 정리했습니다. 항목마다 반영된 인원을 함께 확인해 주세요.")
+    first_steps=[]
+    if report:
+        first_steps=[v["action"] for v in report["leader_actions"]]+[v["action"] for v in report["work_patterns"]]+[v["suggestion"] for v in report["collaboration"]]
+    if needs_top:
+        first_steps.append("욕구가 %s인 구성원이 가장 많습니다. %s"%(needs_top,LEADER_GUIDE[needs_top]["treat"]))
+    if differing:
+        first_steps.append("평소행동과 욕구가 다른 구성원 %s명과 1:1로 '어떻게 대해 줄 때 편한지' 물어보세요."%len(differing))
+    first_steps=list(dict.fromkeys(first_steps))[:3]
+    anchors=[("read-guide","읽는 법"),("usual","팀이 일하는 방식"),("needs","팀이 바라는 환경"),("differ","평소행동과 욕구가 다른 구성원"),
+             ("leader","리더와 구성원"),("orientation","조직지향점"),("interest","좋아하는 일"),("coaching","팀 운영 가이드"),("profiles","구성원 한눈에 보기")]
+    first_box=html.Div([html.H3("%s이 먼저 해볼 일"%head_word),html.Ol([html.Li(brief(t,140)) for t in first_steps],className="cover-actions") if first_steps else html.P("결과가 확인되면 표시합니다.",className="small")])
+    toc=html.Div([html.H3("보고서 차례")]+[html.A([html.Span(name),html.Span("—",className="toc-page")],href="#"+a,**{"data-report-link":a}) for a,name in anchors],className="toc")
+    cover=sheet("",None,[html.Div([html.Span("BIRKMAN · TEAM REPORT"),html.Span("조직장 열람용")],className="sheet-kicker"),html.Div(txt(org.get("org_path")),className="cover-path"),html.H1(title),
         html.Div([html.B("진단 반영 %s명"%org["analysis_count"])," / 구성원 %s명 · 기준 %s"%(org["member_count"],txt(snap["meta"].get("processed_at"))[:10])],className="cover-meta"),
         html.P(brief(report["overview"],340) if report else summary,className="cover-lead"),
         html.Div([html.Div([html.Span(label),html.Strong(value),html.Small(note)],className="metric") for label,value,note in [
-        ("구성원 / 진단 반영", "%s명 / %s명"%(org["member_count"],org["analysis_count"]),"진단 없는 구성원도 명단에 포함"),
-        ("좋아하는 일 · 흥미 평균 상위", " · ".join(INTERESTS[k] for k in rank[:2]) or "미확인","항목별 유효 점수 평균"),
-        ("남에게 보이는 모습 · 평소행동",top_color(usual),"좌표 확인 %s명"%usual["n"]),
-        ("바라는 대우 · 욕구",top_color(needs),"좌표 확인 %s명"%needs["n"])]],className="metrics"),
-        html.Div([html.Div([html.H3("먼저 볼 것"),html.P("평소 모습과 바라는 대우가 같은지 살펴보세요. 업무를 맡길 때는 흥미를, 대화할 때는 욕구를 함께 참고하면 좋습니다.",className="small"),html.P("버크만은 일하는 방식과 필요한 환경을 이해하는 도구입니다. 흥미 점수는 능력이나 성과 점수가 아닙니다.",className="small")]),html.Div([html.H3("보고서 차례")]+[html.A([html.Span(name),html.Span("—",className="toc-page")],href="#"+a,**{"data-report-link":a}) for i,(a,name) in enumerate(anchors)],className="toc")],className="cover-bottom")],anchor="overview")
-    if report:
-        actions_=[v["action"] for v in report["leader_actions"]] if detail else []
-        actions_ += [v["action"] for v in report["work_patterns"]]
-        actions_ += [v["suggestion"] for v in report["collaboration"]]
-        chosen=list(dict.fromkeys(actions_))[:3]
-        if chosen:
-            first=cover.children[0].children[1].children[-1].children[0]
-            first.children=[html.H3("팀장이 먼저 해볼 일" if detail else "함께 해볼 일"),html.Ol([html.Li(brief(t,140)) for t in chosen],className="cover-actions")]
+        ("구성원 / 진단 반영","%s명 / %s명"%(org["member_count"],org["analysis_count"]),"진단 없는 구성원도 명단에 포함"),
+        ("일하는 방식 · 평소행동",top_color(usual),"좌표 확인 %s명"%usual["n"]),
+        ("바라는 대우 · 욕구",top_color(needs),"좌표 확인 %s명"%needs["n"]),
+        ("편한 근무환경 · 조직지향점","%s %s명"%(orient_top["label"],orient_top["top_count"]) if orient_top else "미확인","가장 긴 막대 기준 · %s명 반영"%orientation.get("n",0))]],className="metrics"),
+        html.Div([first_box,toc],className="cover-bottom"),
+        html.P("이 보고서는 구성원을 이해하고 대화하기 위한 자료입니다. 평가·배치·승진의 근거로 쓰지 않으며, 다른 사람에게 전달하지 않습니다.",className="small cover-note")],anchor="overview")
     cover.className+=" cover";sheets=[cover];appendix=[]
-    sheets.append(sheet("버크만, 이것만 알고 보세요","흥미·평소행동·욕구·스트레스행동을 기호로 구분합니다. 욕구와 스트레스행동은 한 맵에서 읽습니다.",guide_block(),"read-guide","01 · 읽는 법"))
+
+    # ---------- 01 읽는 법 ----------
+    sheets.append(sheet("버크만, 이것만 알고 보세요","흥미·평소행동·욕구·스트레스행동을 기호로 구분합니다. 색에는 좋고 나쁨이 없습니다.",guide_block(),"read-guide","01 · 읽는 법"))
+
     def map_section(k):
-        if detail:
-            visual=svg_map(rows,k) if map_points(rows,k) else empty("이 맵에서 확인된 좌표가 없습니다.")
-            return html.Div([html.Div([visual,html.P("%s %s · 좌표를 옮기지 않고 같은 자리는 함께 표시"%(SYMBOLS[k],MAPS[k]),className="map-caption")],className="map-visual"),color_summary(rows,k,True)],className="map-grid")
-        return html.Div([stack_bar(map_stats(rows,k),"우리 조직"),color_summary(rows,k,False)])
-    sheets.append(sheet("좋아하는 일","흥미 ✱ · 어떤 활동에 마음이 끌리는지를 보여줍니다.",[tip("새 업무를 맡기기 전 관심 분야를 확인하세요. 점수가 높다는 것은 그 일을 좋아한다는 뜻입니다."),map_section("interest")]+team_interest_explanation(interests,rank),"interest","02 · 흥미"))
-    if detail:
-        appendix.append(sheet("구성원별 흥미 점수","0~100 점수 · 짙을수록 관심이 높습니다. 테두리는 각자의 상위 3개이며 동점은 함께 표시합니다.",[
-            score_table(rows,interests,ref_interest),html.P("—는 확인된 점수 없음. 전체 진단자 평균은 현재 명부에 연결된 유효 점수 기준입니다.",className="small")],"interest-table","참고 · 흥미 점수표"))
+        visual=svg_map(rows,k) if map_points(rows,k) else empty("이 맵에서 확인된 좌표가 없습니다.")
+        return html.Div([html.Div([visual,html.P("%s %s · 좌표를 옮기지 않고 같은 자리는 함께 표시"%(SYMBOLS[k],MAPS[k]),className="map-caption")],className="map-visual"),color_summary(rows,k,True)],className="map-grid")
+
+    # ---------- 02 평소행동 ----------
+    sheets.append(sheet("팀이 일하는 방식","평소행동 ◆ · 일이 잘 풀릴 때 주변에서 보이는 업무 방식입니다.",
+        [tip("색별로 몇 명이 모였는지 보세요. 가운데 선에 가까운 사람은 이웃 색의 특징도 함께 가집니다."),map_section("usual")]+usual_pattern_text(rows)+team_usual_explanation(rows),"usual","02 · 평소행동"))
+
+    # ---------- 03 욕구·스트레스 ----------
+    display,info=paired_map_rows(rows)
+    valid=bool(map_points(display,"needs") or map_points(display,"stress"))
+    needsbody=[tip("○는 바라는 대우, □는 그 욕구가 오래 채워지지 않을 때 나타날 수 있는 반응입니다. 같은 자리면 겹쳐 보이고, 다르면 각자 위치에 표시합니다."),
+               html.Div([html.Div([svg_map(rows,["needs","stress"]) if valid else empty("확인된 좌표 없음"),html.P("○ 욕구 · □ 스트레스행동",className="map-caption")]),color_summary(rows,"needs",True)],className="map-grid")]
+    info_text="같은 위치 %s명"%info["paired"]
+    if info["needs_only"]:info_text+=" · 욕구만 확인 %s명"%info["needs_only"]
+    if info["stress_only"]:info_text+=" · 스트레스만 확인 %s명"%info["stress_only"]
+    if info["review"]:info_text+=" · 서로 다른 위치 %s명(원·네모 원위치 표시)"%info["review"]
+    needsbody.append(html.P(info_text,className="small"))
+    if needs_top:
+        needsbody.append(html.Div([html.H3("%s이 해줄 것 · 욕구 %s이 가장 많을 때"%(head_word,needs_top)),html.P(LEADER_GUIDE[needs_top]["treat"]),
+            html.P([html.B("이런 모습이 보이면 "),LEADER_GUIDE[needs_top]["signal"]+" 먼저 위의 욕구가 채워지고 있는지 점검해 주세요."],className="small")],className="action",style={"marginBottom":"4mm"}))
+    needsbody.append(html.Div([source_panel(snap,rows,"needs","팀에서 많이 나온 바라는 대우"),source_panel(snap,rows,"stress","욕구가 채워지지 않을 때")],className="twocol"))
+    needsbody.append(html.P("네모는 지금의 스트레스 정도를 측정한 값이 아니라, 욕구가 채워지지 않을 때 나올 수 있는 반응입니다.",className="small"))
+    sheets.append(sheet("팀이 바라는 환경","두 기호를 한 맵에 표시하고, 바라는 대우와 채워지지 않을 때의 반응을 나누어 읽습니다.",needsbody,"needs","03 · 욕구와 스트레스"))
+
+    # ---------- 04 평소행동과 욕구가 다른 구성원 ----------
+    if differing:
+        entries=[{"name":name_label(r,nums,len(rows)),"usual":color_label(r,"usual"),"needs":color_label(r,"needs"),
+                  "degree":{"diagonal":"많이 다름","near":"조금 다름","same":"같은 색, 거리 멂"}[rel],
+                  "note":LEADER_GUIDE[color_of(r,"needs")]["treat"]} for r,rel,dist in differing]
+        diffbody=[tip("보이는 모습에 맞춰 대하면 오히려 불편해할 수 있는 구성원입니다. 1:1 대화에서 어떤 방식이 편한지 직접 물어보세요."),
+                  table([("name","구성원"),("usual","평소행동 ◆"),("needs","욕구 ○"),("degree","차이"),("note","%s이 기억할 것"%head_word)],entries),
+                  html.P("'많이 다름'은 맵의 대각선(두 축 모두 다른 색)입니다. 맵 가운데 근처는 작은 위치 차이로 색이 달라질 수 있으니 구성원 카드의 원문도 함께 보세요.",className="small")]
     else:
-        appendix.append(sheet("우리 조직의 흥미 점수","항목별 유효 점수를 평균한 값입니다.",[interest_bars(interests)]))
-    usual_body=[tip("색별로 몇 명이 모였는지 보세요. 팀의 일하는 방식을 이해하는 출발점입니다."),map_section("usual")]+team_usual_explanation(rows)
-    # AI 해설은 ‘팀 운영에 적용하기’에 모읍니다. 욕구 근거의 문장을 평소행동 설명으로 옮기지 않습니다.
-    sheets.append(sheet("남에게 보이는 모습","평소행동 ◆ · 일이 잘 풀릴 때 드러나는 업무 방식입니다.",usual_body,"usual","03 · 평소행동"))
-    needsbody=[tip("○는 바라는 대우, □는 그 욕구가 충족되지 않을 때 나타날 수 있는 반응입니다. 같은 자리일 때 겹쳐 보이며, 다른 자리라면 원래 위치를 각각 표시합니다.")]
-    if detail:
-        display,info=paired_map_rows(rows)
-        valid=bool(map_points(display,"needs") or map_points(display,"stress"))
-        needsbody.append(html.Div([html.Div([svg_map(rows,["needs","stress"]) if valid else empty("확인된 좌표 없음"),html.P("○ 욕구 · □ 스트레스행동",className="map-caption")]),color_summary(rows,"needs",True)],className="map-grid"))
-        info_text="같은 위치 %s명"%info["paired"]
-        if info["needs_only"]:info_text+=" · 욕구만 확인 %s명"%info["needs_only"]
-        if info["stress_only"]:info_text+=" · 스트레스만 확인 %s명"%info["stress_only"]
-        if info["review"]:info_text+=" · 서로 다른 위치 %s명(원·네모 원위치 표시)"%info["review"]
-        needsbody.append(html.P(info_text,className="small"))
-        if info["stress_only"]:
-            nums=roster_number(rows)
-            only=[r for r in rows if map_points([r],"stress") and not map_points([r],"needs")]
-            needsbody.append(html.P("네모만 표시: "+", ".join((str(nums[txt(r.get("employee_id"))])+" " if len(rows)>12 else "")+txt(r.get("성명")) for r in only),className="small"))
-        needsbody.append(html.Div([source_panel(snap,rows,"needs","바라는 대우"),source_panel(snap,rows,"stress","욕구가 채워지지 않을 때")],className="twocol"))
-        if len(rows)>36:
-            nums=roster_number(rows)
-            appendix.append(sheet("맵 번호와 구성원","모든 맵에서 같은 번호를 사용합니다.",[html.Div([html.Span([html.B(str(nums[txt(r.get("employee_id"))])+" "),txt(r.get("성명"))]) for r in rows],className="number-key")]))
+        diffbody=[html.P("평소행동과 욕구가 확인된 구성원 중 두 기호의 색이 다른 사람이 없습니다.",className="small")]
+    sheets.append(sheet("평소행동과 욕구가 다른 구성원","평소 보이는 방식(◆)과 바라는 대우(○)가 다른 사람을 모았습니다.",diffbody,"differ","04 · 평소행동과 욕구"))
+
+    # ---------- 05 리더와 구성원 ----------
+    lead=org_leader(snap,key)
+    if lead:
+        lc=color_of(lead,"usual");lead_id=txt(lead.get("employee_id"))
+        pairs=[]
+        for r in sorted(rows,key=lambda r:txt(r.get("성명"))):
+            n=color_of(r,"needs")
+            if txt(r.get("employee_id"))==lead_id or n not in FOUR_COLORS:continue
+            pairs.append({"name":name_label(r,nums,len(rows)),"needs":color_label(r,"needs"),"rel":RELATION_TEXT[relation(lc,n)],
+                          "todo":LEADER_GUIDE[n]["treat"],"_o":{"diagonal":0,"near":1,"same":2}[relation(lc,n)]})
+        pairs.sort(key=lambda d:d["_o"])
+        counts=collections.Counter(d["rel"] for d in pairs)
+        leadbody=[tip("%s의 평소 방식(◆)과 구성원이 바라는 대우(○)를 맞대 봅니다. '의식적 조정'인 구성원에게는 평소 방식과 다르게 대하는 노력이 필요합니다."%head_word),
+                  html.P([html.B("%s %s의 평소행동 · "%(txt(lead.get("성명")),txt(lead.get("직책명")))),color_label(lead,"usual")+" — "+MAP_COLOR_HINTS["usual"][lc]]),
+                  html.P(" · ".join("%s %s명"%(k,counts.get(k,0)) for k in ["가까움","부분 조정","의식적 조정"]),className="small"),
+                  table([("name","구성원"),("needs","바라는 대우 ○"),("rel","맞춤"),("todo","%s이 해볼 것"%head_word)],[{k:v for k,v in d.items() if k!="_o"} for d in pairs])]
     else:
-        needsbody += [stack_bar(map_stats(rows,"needs"),"욕구"),html.P("욕구는 바라는 환경, 스트레스행동은 그 환경이 충족되지 않을 때 나타날 수 있는 반응입니다.")]
-    needsbody.append(html.P("평소행동과 욕구의 색이 다른 구성원은 %s명 / 비교 가능한 %s명입니다. 맵 중앙 부근은 작은 위치 차이로 색이 달라질 수 있으므로 위치와 원문을 함께 보세요."%(len(changed),len(paired)),className="small"))
-    needsbody.append(html.P("네모는 현재 스트레스의 정도를 측정한 값이 아닙니다. 중앙에 가깝거나 색이 다른 경우에도 기호의 실제 위치와 원문 설명을 함께 확인하세요.",className="small"))
-    sheets.append(sheet("바라는 대우와 스트레스","두 기호를 한 맵에 표시하고, 바라는 환경과 충족되지 않을 때의 반응을 나누어 읽습니다.",needsbody,"needs","04 · 욕구와 스트레스"))
-    if detail and changed:
-        groups=collections.defaultdict(list)
-        nums=roster_number(rows)
-        for r in changed:
-            groups[(color_of(r,"usual"),color_of(r,"needs"))].append((str(nums[txt(r.get("employee_id"))])+" " if len(rows)>12 else "")+txt(r.get("성명")))
-        entries=[{"from":a+" → "+b,"names":", ".join(names)} for (a,b),names in sorted(groups.items())]
-        appendix.append(sheet("평소 모습과 바라는 대우가 다른 구성원","왼쪽은 평소행동, 오른쪽은 욕구입니다. 같은 변화끼리 모았습니다.",[table([("from","평소행동 → 욕구"),("names","구성원")],entries),tip("1:1 대화에서 ‘어떤 방식으로 이야기할 때 가장 편한가요?’라고 물어보세요.")]))
-    comparison=[tip("우리 조직과 전체 진단자의 색 분포를 비교합니다. 색의 많고 적음 자체가 좋고 나쁨을 뜻하지는 않습니다.")]
-    for k in ["interest","usual","needs"]:
-        comparison.append(html.Div([html.H3(MAP_TITLES[k]+" · "+MAPS[k]),stack_bar(map_stats(rows,k),"우리 조직"),stack_bar(map_stats(population,k),"전체 진단자",True)],className="compare-row"))
-    comparison += [html.Div([html.Span([swatch(c),c]) for c in PALETTE],className="stack-legend"),html.P("전체 진단자는 현재 명부와 연결된 유효 진단 결과 기준입니다. 팀·파트에 중복 소속된 사람은 한 번만 셉니다. 각 막대 오른쪽은 해당 항목의 반영 인원입니다.",className="small")]
-    orientation=js(org.get("orientation_json"),{})
-    comparison += [html.H3("조직지향점 · 네 가지 근무환경")]+orientation_content(orientation)
-    sheets.append(sheet("우리 조직의 구성 비교","맵의 색 분포와 조직지향점을 함께 정리했습니다.",comparison,"comparison","05 · 구성 비교"))
-    comp=js(org.get("leader_comparison_json"),{})
-    if detail and comp.get("leaders",{}).get("coverage",{}).get("analysis_count",0):
-        compbody=[tip("리더가 일하는 방식과 구성원들이 바라는 대우를 함께 봅니다. 서로 다른 색은 대화할 주제입니다.")]
-        for k in ["usual","needs"]:
-            compbody.append(html.Div([html.H3(MAP_TITLES[k]),stack_bar(comp["leaders"]["maps"].get(k,{"n":0,"quadrants":[]}),"리더"),stack_bar(comp["others"]["maps"].get(k,{"n":0,"quadrants":[]}),"구성원")],className="compare-row"))
-        compbody.append(html.H3("흥미를 나란히 보기"))
-        compbody.append(table([("field","흥미"),("leader","리더 평균"),("others","구성원 평균")],[{"field":INTERESTS[k],"leader":"—" if num(comp["leaders"]["interests"].get(k,{}).get("mean")) is None else "%.0f"%comp["leaders"]["interests"][k]["mean"],"others":"—" if num(comp["others"]["interests"].get(k,{}).get("mean")) is None else "%.0f"%comp["others"]["interests"][k]["mean"]} for k in INTERESTS]))
-        appendix.append(sheet("리더와 구성원 함께 보기","팀에서는 팀장, 파트에서는 파트장의 유효 결과를 반영합니다.",compbody))
+        leadbody=[html.P("조직장의 평소행동 결과가 확인되지 않아 이 비교는 생략했습니다.",className="small")]
+    sheets.append(sheet("리더와 구성원","%s의 평소 방식이 구성원이 바라는 대우와 얼마나 가까운지 봅니다."%head_word,leadbody,"leader","05 · 리더와 구성원"))
+
+    # ---------- 06 조직지향점 ----------
+    groups=collections.defaultdict(list)
+    for r in rows:
+        for c in orientation_top(r):groups[c].append(name_label(r,nums,len(rows)))
+    orientbody=orientation_content(orientation)
+    if groups:
+        orientbody.append(html.Div([html.H3("분야별 구성원 · 가장 긴 막대 기준")]+[html.P([swatch(c),html.B(ORIENTATIONS[c]+" "),", ".join(groups[c])]) for c in ORIENTATIONS if groups.get(c)]))
+    orientbody.append(tip("우리 팀의 실제 업무는 네 환경 중 어디에 가까운가요? 가장 많은 환경과 다르다면 어떤 일에서 피로가 쌓이는지 살펴보세요."))
+    sheets.append(sheet("조직지향점 · 편한 근무환경","네 가지 근무환경에서 일하는 사람들과 얼마나 비슷한지를 보여줍니다.",orientbody,"orientation","06 · 조직지향점"))
+
+    # ---------- 07 흥미 ----------
+    top3=[{"name":name_label(r,nums,len(rows)),"top":" · ".join(INTERESTS[k] for k in interest_rank(interest_stats_for([snap["people"].get(txt(r.get("employee_id")),r)]))[:3]) or "미확인"}
+          for r in sorted(rows,key=lambda r:txt(r.get("성명"))) if flag(r.get("analysis_eligible"))]
+    sheets.append(sheet("좋아하는 일","흥미 ✱ · 어떤 활동에 마음이 끌리는지를 보여줍니다. 능력이나 성과 점수가 아닙니다.",
+        [tip("새 업무를 맡기기 전 관심 분야를 확인하세요."),map_section("interest")]+team_interest_explanation(interests,rank)+
+        [html.H3("구성원별 흥미 상위 3"),table([("name","구성원"),("top","흥미 상위 3")],top3)],"interest","07 · 흥미"))
+
+    # ---------- 08 팀 운영 가이드 ----------
     coaching=[]
+    if needs_top:
+        guide_rows=[{"situation":s_,"tip":TEAM_GUIDE[needs_top][i]} for i,s_ in enumerate(TEAM_GUIDE_SITUATIONS)]
+        coaching+=[html.H3("욕구 %s이 가장 많은 조직의 운영 팁"%needs_top),table([("situation","상황"),("tip","이렇게 해 보세요")],guide_rows)]
+        if usual_top and usual_top!=needs_top:
+            coaching.append(html.P("평소행동은 %s이 가장 많지만 욕구는 %s이 가장 많습니다. 보이는 모습보다 바라는 대우 쪽 팁을 우선하세요."%(usual_top,needs_top),className="small"))
     if report:
+        if report.get("coverage_note"):coaching.append(html.P(report["coverage_note"],className="small"))
+        coaching.append(html.H3("AI 해설 · 근거가 연결된 문장만 표시"))
         for v in report["work_patterns"]:
             coaching.append(html.Div([html.H3(v["title"]),readable_text(v["observation"]),readable_text(v["action"],"action"),evidence_view(v["basis"],evidence)],className="coach"))
         for v in report["collaboration"]:
             coaching.append(html.Div([html.H3(v["situation"]),readable_text(v["suggestion"]),evidence_view(v["basis"],evidence)],className="coach"))
-        if detail:
-            for v in report["leader_actions"]:
-                coaching.append(html.Div([html.H3(v["situation"]),readable_text(v["action"]),evidence_view(v["basis"],evidence)],className="coach"))
-    if not coaching:coaching=[empty("맞춤 해설을 아직 불러오지 못했습니다. 앞쪽의 맵·점수·명단은 확인할 수 있습니다."),tip("업무를 맡길 때 관심 분야를 확인하고, 1:1 대화에서는 바라는 지원을 직접 물어보세요.")]
-    if report and report.get("coverage_note"):
-        coaching.insert(0,html.P(report["coverage_note"],className="small"))
-    if detail and not comp.get("leaders",{}).get("coverage",{}).get("analysis_count",0):
-        coaching.insert(0,html.P("리더의 유효한 진단이 없어 리더 성향 비교는 생략했습니다.",className="small"))
-    if report and report["discussion_questions"]:
-        coaching += [html.H3("다음 팀 대화에서"),html.Ul([html.Li(t) for t in report["discussion_questions"]],className="tight-list")]
-    # 행동 제안까지 먼저 읽고, 비교·점수표·개인 카드는 뒤에서 참고합니다.
-    comparison_sheet=sheets.pop()
-    sheets.append(sheet("팀 운영에 적용하기","보고서를 읽고 바로 시도할 대화와 업무 방식입니다.",coaching,"coaching","05 · 리더 가이드"))
-    comparison_sheet.children[0].children[0].children[0].children="06 · 구성 비교"
-    appendix.insert(0,comparison_sheet)
-    if detail:
-        appendix.append(sheet("구성원별 한눈에 보기","팀 보고서는 팀장, 파트 보고서는 파트장을 먼저 표시하고 나머지는 가나다순으로 정리했습니다. ✱ 흥미 · ◆ 평소행동 · ○ 욕구 · □ 스트레스행동. 전문은 구성원 상세에서 확인할 수 있습니다.",
-            profile_sections(rows,org,snap),"profiles","참고 · 구성원"))
+        for v in report["leader_actions"]:
+            coaching.append(html.Div([html.H3(v["situation"]),readable_text(v["action"]),evidence_view(v["basis"],evidence)],className="coach"))
+        if report["discussion_questions"]:
+            coaching+=[html.H3("다음 팀 대화에서"),html.Ul([html.Li(t) for t in report["discussion_questions"]],className="tight-list")]
+    elif message:
+        coaching.append(html.P(message,className="small"))
+    if not coaching:coaching=[empty("결과가 확인되면 운영 팁을 표시합니다.")]
+    sheets.append(sheet("팀 운영 가이드","회의·피드백·업무 지시·공지에서 바로 시도할 방법입니다.",coaching,"coaching","08 · 팀 운영"))
+
+    # ---------- 09 구성원 한눈에 보기 ----------
+    sheets.append(sheet("구성원 한눈에 보기","조직장을 먼저, 나머지는 가나다순입니다. 결과지 원문을 짧게 발췌했고, 전문은 '구성원 상세'에서 봅니다.",
+        member_cards(rows,org,snap),"profiles","09 · 구성원"))
+
+    # ---------- 참고자료 ----------
+    appendix.append(sheet("구성원별 흥미 점수","0~100 점수 · 짙을수록 관심이 높습니다. 테두리는 각자의 상위 3개이며 동점은 함께 표시합니다.",[
+        score_table(rows,interests,ref_interest),html.P("—는 확인된 점수 없음. 전체 진단자 평균은 현재 명부에 연결된 유효 점수 기준입니다.",className="small")],"interest-table","참고 · 흥미 점수표"))
+    comparison=[tip("우리 조직과 전체 진단자의 색 분포를 비교합니다. 색의 많고 적음 자체가 좋고 나쁨을 뜻하지는 않습니다.")]
+    for k in ["usual","needs","interest"]:
+        comparison.append(html.Div([html.H3(MAP_TITLES[k]+" · "+MAPS[k]),stack_bar(map_stats(rows,k),"우리 조직"),stack_bar(map_stats(population,k),"전체 진단자",True)],className="compare-row"))
+    comparison+=[html.Div([html.Span([swatch(c),c]) for c in PALETTE],className="stack-legend"),html.P("전체 진단자는 현재 명부와 연결된 유효 진단 결과 기준입니다. 각 막대 오른쪽은 해당 항목의 반영 인원입니다.",className="small")]
+    appendix.append(sheet("전체 진단자와 비교","맵의 색 분포를 회사 전체와 나란히 봅니다.",comparison,"comparison","참고 · 비교"))
+    if len(rows)>12:
+        appendix.append(sheet("맵 번호와 구성원","모든 맵에서 같은 번호를 사용합니다.",[html.Div([html.Span([html.B(str(nums[txt(r.get("employee_id"))])+" "),txt(r.get("성명"))]) for r in rows],className="number-key")]))
     if report:
         extra_texts=[]
         if brief(report["overview"],340)!=txt(report["overview"]):
-            extra_texts += [html.H3("전체 개요"),html.P(report["overview"])]
+            extra_texts+=[html.H3("전체 개요"),html.P(report["overview"])]
         for category,fields in [("work_patterns",["observation","action"]),("collaboration",["suggestion"]),("leader_actions",["action"])]:
             for entry in report[category]:
                 if any(brief(entry[f])!=txt(entry[f]) for f in fields):
-                    extra_texts += [html.H3(entry.get("title") or entry.get("situation"))]+[html.P(entry[f]) for f in fields]
+                    extra_texts+=[html.H3(entry.get("title") or entry.get("situation"))]+[html.P(entry[f]) for f in fields]
         if extra_texts:appendix.append(sheet("해설 전문","본문에서 짧게 제시한 해설의 전체 문장입니다.",extra_texts))
     sheets.extend(appendix)
     return finish_report(sheets,title+" 버크만 팀 리포트",snap)
 
 
-def personal_page(snap,p,eid,kind=None):
+def personal_page(snap,p,eid):
     if not eid or not allowed_person(p,snap,eid):return empty("조회할 구성원을 선택하세요.")
     person=snap["people"].get(eid)
     if not person:return empty("구성원 정보가 없습니다.")
@@ -1191,10 +1466,6 @@ def personal_page(snap,p,eid,kind=None):
     profile=next((js(r.get("orientation_profile_json"),{}) for members in snap["members"].values() for r in members if txt(r.get("employee_id"))==eid and flag(r.get("orientation_valid"))),{})
     pages.append(sheet("선호하는 업무 환경","조직지향점",orientation_content(profile,True)))
     return finish_report(pages,name+" 버크만 결과",snap)
-
-
-def footer(snap,p):
-    return html.Div("집계 기준: "+txt(snap["meta"].get("processed_at"))[:16],className="footer")
 
 
 # =====================================================================
@@ -1267,6 +1538,14 @@ CSS += r"""
 .password-enrollment{border-top:1px solid var(--line);margin-top:20px;padding-top:18px}
 .enrollment-token{font-family:monospace;overflow-wrap:anywhere;font-size:14px;background:#f2f5f7;padding:12px;user-select:all}
 @media print{.report-notes,.test-mode-note,.report-explanations{display:none!important}}
+.report-sheet .cover-note{margin-top:6mm;border-top:1px solid var(--line);padding-top:3mm}
+.report-sheet .profile-grid.member-cards{grid-template-columns:1fr;gap:3.5mm}
+.report-sheet .member-card .card-body{display:grid;grid-template-columns:34mm 1fr;gap:4mm;margin-top:2.5mm}
+.report-sheet .member-card .card-left .birkman-map{width:30mm;height:30mm!important;margin:0 0 2mm}
+.report-sheet .member-card .profile-colors{font-size:8pt}
+.report-sheet .member-card .card-right p{font-size:9pt;line-height:1.6;margin:0 0 1.6mm}
+.report-sheet .member-card .card-summary{background:#f2f5f7;padding:1.5mm 2.5mm}
+.report-sheet .member-card.leader-card{border-color:#9fb5b3}
 """
 # 기본 Dataiku URL/자산 설정을 유지하면서 인쇄용 CSS만 삽입합니다.
 if AUTH_MODE == "preview":
@@ -1447,7 +1726,11 @@ function paginate(report){
   for(let i=0;i<blocks.length;i++){
    const block=blocks[i];
    if(/^H[23]$/.test(block.tagName)&&blocks[i+1]){
-    const probe=clean(block),nextProbe=clean(blocks[i+1]);current.body.append(probe,nextProbe);
+    // 소제목 뒤의 카드 묶음·표는 첫 카드·첫 행만 함께 들어가면 같은 쪽에 둡니다(빈 쪽 방지).
+    const nb=blocks[i+1];let nextProbe=clean(nb);
+    if(nb.matches('.profile-grid,.number-key')&&nb.firstElementChild){nextProbe=nb.cloneNode(false);nextProbe.append(clean(nb.firstElementChild));}
+    else if(nb.matches('.table-wrap')&&nb.querySelector('tbody > tr')){nextProbe.querySelectorAll('tbody > tr').forEach((tr,k)=>{if(k>0)tr.remove();});}
+    const probe=clean(block);current.body.append(probe,nextProbe);
     const can=fits();probe.remove();nextProbe.remove();if(!can&&hasBody())next(src,true);
    }
    append(block,src);
@@ -1482,7 +1765,7 @@ function resize(report){
 }
 async function prepare(report){
  const source=report.querySelector('.report-source');if(!source)return;
- const signature=source.innerHTML;
+ const signature=report.dataset.reportKey||source.innerHTML;
  const previous=roots.get(report);if(previous&&previous.signature===signature)return;
  const state={signature};roots.set(report,state);report.dataset.paged='loading';
  const btn=document.querySelector('#print');if(btn)btn.disabled=true;
@@ -1551,8 +1834,9 @@ def layout():
         dcc.Store(id="csrf", data=csrf, storage_type="memory"),
         dcc.Store(id="event", data="", storage_type="memory"),
         dcc.Store(id="admin-revision", data=0),
-        # 미리보기의 60초마다 화면 재구성을 중단. 인증 모드에서는 세션 만료 확인을 유지합니다.
+        # 60초마다 로그인 만료 여부만 확인합니다(session_watch). 보고서는 다시 그리지 않습니다.
         dcc.Interval(id="heartbeat", interval=60000, n_intervals=0,disabled=AUTH_MODE=="preview"),
+        dcc.Store(id="session-expired", data="", storage_type="memory"),
         html.Div([
             html.Div("동우화인켐", className="wordmark"), html.H1(APP_TITLE),
             html.P("보고서를 불러오는 중입니다. 계속 이 화면이면 FIRST_ADMIN_EMAIL이 명부에 유일하게 등록되어 있는지와 집계 완료 여부를 확인하세요." if AUTH_MODE == "preview" else "사내 이메일로 로그인해 우리 팀의 결과를 확인하세요.", className="muted"),
@@ -1583,12 +1867,9 @@ def layout():
             html.Main([
                 html.Div("로그인 없는 테스트 모드 · 접속자는 모두 같은 인사 화면을 봅니다.",className="test-mode-note no-print",style={} if AUTH_MODE=="preview" else {"display":"none"}),
                 html.Div([
-                    html.Div([html.Label("조직",className="label"),dcc.Dropdown(id="org",options=[],value=None,clearable=False,placeholder="조직 선택")],className="org"),
+                    html.Div([html.Label("조직",className="label"),dcc.Dropdown(id="org",options=[],value=None,clearable=False,placeholder="조직 선택")],id="org-control",className="org"),
                     html.Div([html.Button("새로 읽기",id="reload",n_clicks=0),html.Button("인쇄 · PDF 저장",id="print",n_clicks=0)],className="actions"),
                 ],className="toolbar"),
-                html.Div([
-                    dcc.Input(id="map-kind",value="usual",type="hidden"),
-                ],id="map-controls",className="no-print",style={"marginBottom":"18px"}),
                 html.Div([html.Label("구성원",className="label"),dcc.Dropdown(id="person",options=[],value=None,clearable=False)],
                          id="person-control",className="no-print",style={"display":"none"}),
                 dcc.Loading(html.Div(id="page"),type="circle",color="#527a60"),
@@ -1684,7 +1965,9 @@ def actions(_send,_verify,_logout,_save,_reload,email,code,csrf,target,role,scop
             # 일반 사용자도 완료된 자료를 다시 요청할 수 있으나 읽기 캐시의 주기를 유지.
             if p["rule"]["role"]=="hr" or p["rule"]["admin"]:
                 REPO.get(force=True)
-            return nonce,"","자료를 다시 읽었습니다."
+                return nonce,"","자료를 다시 읽었습니다."
+            REPO.get()
+            return nonce,"","최신 집계를 확인했습니다."
         if event=="save-access":
             if not p["rule"]["admin"]:
                 raise PermissionError()
@@ -1754,6 +2037,9 @@ def issue_activation(_click,email,nav,confirmed,csrf):
         if not p or not p["rule"]["admin"] or nav!="admin":return "관리자 권한이 필요합니다.",[]
         person=snap["login"].get(email)
         if not person or "confirmed" not in (confirmed or []):return "대상자를 선택하고 본인 확인 항목을 체크하세요.",[]
+        # 테스트 모드는 주소에 들어온 누구나 관리자이므로, 최초 관리자 본인의 등록코드만 발급합니다.
+        if AUTH_MODE=="preview" and email!=ACCESS.owner:
+            return "테스트 모드에서는 최초 관리자 본인의 등록코드만 발급할 수 있습니다. 다른 직원은 운영 모드로 전환한 뒤 발급하세요.",[]
         token=ACCESS.issue_enrollment(p["email"],email,txt(person["employee_id"]))
         return html.Div([html.P(txt(person["성명"])+" · "+email),html.Div(token,className="enrollment-token"),
             html.P("등록코드만 대상자에게 직접 전달하세요. 발급 화면을 벗어나면 다시 표시하지 않습니다. 재발급하면 이전 코드는 폐기됩니다.",className="small")]),[]
@@ -1762,11 +2048,24 @@ def issue_activation(_click,email,nav,confirmed,csrf):
         fail_log("enrollment_issue",exc);return "등록코드를 발급하지 못했습니다.",[]
 
 
-@app.callback([Output("org","options"),Output("org","value"),Output("nav","options"),
+@app.callback(Output("session-expired","data"),Input("heartbeat","n_intervals"),prevent_initial_call=True)
+def session_watch(_tick):
+    """로그인이 끝났는지만 확인합니다. 아직 유효하면 아무것도 바꾸지 않아 보고서가 다시 그려지지 않습니다."""
+    if AUTH_MODE=="preview" or not ACCESS:
+        return no_update
+    try:
+        if ACCESS.lookup_session(session.get("birkman_sid")):
+            return no_update
+    except Exception as exc:
+        fail_log("session_watch",exc)
+    return secrets.token_hex(8)
+
+
+@app.callback([Output("org","options"),Output("org","value"),Output("nav","options"),Output("nav","value"),
                Output("admin-email","options"),Output("admin-scopes","options"),Output("user-label","children")],
-              [Input("event","data"),Input("heartbeat","n_intervals")], [State("org","value")])
-def choices(_event,_tick,selected):
-    blank=([],None,[{"label":"팀·파트 보고서","value":"team"}],[],[],"")
+              [Input("event","data"),Input("session-expired","data")], [State("org","value"),State("nav","value")])
+def choices(_event,_expired,selected,nav_value):
+    blank=([],None,[{"label":"팀·파트 보고서","value":"team"}],"team",[],[],"")
     if not ACCESS:
         return blank
     try:
@@ -1779,24 +2078,26 @@ def choices(_event,_tick,selected):
         if selected not in keys:
             preferred=txt(p["person"].get("team_key")) or txt(p["person"].get("part_key"))
             selected=preferred if preferred in keys else (options[0]["value"] if options else None)
-        nav=[{"label":"팀·파트 보고서","value":"team"},{"label":"내 결과","value":"self"}]
-        if leader_scopes(p,snap):
-            nav.insert(1,{"label":"구성원 상세","value":"members"})
+        # 팀 보고서·구성원 상세는 조직장·인사 권한이 있을 때만. 팀원은 '내 결과'만 봅니다.
+        nav=[{"label":"내 결과","value":"self"}]
+        if keys:
+            nav=[{"label":"팀·파트 보고서","value":"team"},{"label":"구성원 상세","value":"members"}]+nav
         admin_people,org_options=[],[]
         if p["rule"]["admin"]:
             nav.append({"label":"관리자","value":"admin"})
             admin_people=[{"label":"%s · %s · %s"%(r.get("성명",""),r.get("조직명",""),email),"value":email} for email,r in sorted(snap["login"].items(),key=lambda kv:txt(kv[1].get("성명")))]
             org_options=[{"label":o["org_path_full"]+" · "+("팀" if o["org_level"]=="team" else "파트"),"value":k} for k,o in sorted(snap["orgs"].items(),key=lambda kv:kv[1]["org_path_full"]) if o["org_level"] in {"team","part"}]
         label=html.Div([html.Strong(txt(p["person"].get("성명"))),html.Div("로그인 없이 확인 중 · 인사 권한" if AUTH_MODE == "preview" else ROLE_LABELS[p["rule"]["role"]],className="muted small")])
-        return options,selected,nav,admin_people,org_options,label
+        values=[o["value"] for o in nav]
+        return options,selected,nav,(nav_value if nav_value in values else values[0]),admin_people,org_options,label
     except Exception as exc:
         fail_log("choices",exc)
         return blank
 
 
 @app.callback([Output("person","options"),Output("person","value")],
-              [Input("org","value"),Input("event","data"),Input("heartbeat","n_intervals")], [State("person","value")])
-def people_choices(key,_event,_tick,selected):
+              [Input("org","value"),Input("event","data")], [State("person","value")])
+def people_choices(key,_event,selected):
     if not ACCESS:
         return [],None
     try:
@@ -1833,11 +2134,12 @@ def load_rule(email,_event):
 
 
 @app.callback([Output("login-panel","style"),Output("app-panel","style"),Output("page","children"),
-               Output("admin-panel","style"),Output("person-control","style"),Output("map-controls","style"),Output("access-table","children")],
-              [Input("event","data"),Input("heartbeat","n_intervals"),Input("nav","value"),Input("org","value"),Input("person","value"),Input("map-kind","value")])
-def render(_event,_tick,nav,key,eid,kind):
+               Output("admin-panel","style"),Output("person-control","style"),Output("access-table","children"),Output("org-control","style")],
+              [Input("event","data"),Input("session-expired","data"),Input("nav","value"),Input("org","value"),Input("person","value")])
+def render(_event,_expired,nav,key,eid):
+    """메뉴·조직·구성원 선택이나 로그인 상태가 바뀔 때만 화면을 그립니다(주기적으로 다시 그리지 않음)."""
     hidden={"display":"none"}
-    logged_out=({},hidden,[],hidden,hidden,hidden,[])
+    logged_out=({},hidden,[],hidden,hidden,[],{})
     if not ACCESS:
         return logged_out
     try:
@@ -1845,7 +2147,6 @@ def render(_event,_tick,nav,key,eid,kind):
         p=principal(snap)
         if not p:
             return logged_out
-        kind=kind if kind in MAPS else "usual"
         admin_table=[]
         if nav=="admin":
             if not p["rule"]["admin"]:
@@ -1861,22 +2162,25 @@ def render(_event,_tick,nav,key,eid,kind):
                                      active="허용" if r["active"] else "중지",admin="관리자" if r["admin"] else "",modified=r["modified"]))
                 admin_table=[card("등록한 권한",table([("email","이메일"),("role","역할"),("scopes","조회 조직"),("active","로그인"),("admin","관리"),("modified","변경")],rows)),
                              card("최근 로그인·권한 변경",table([("ts","시간"),("actor","실행자"),("action","작업"),("target","대상")],[dict(r,action={"login":"로그인","access_update":"권한 변경"}.get(r["action"],r["action"])) for r in ACCESS.recent_audit()]))]
-            return hidden,{},page,admin_style,hidden,hidden,admin_table
+            return hidden,{},page,admin_style,hidden,admin_table,hidden
         if nav=="self":
-            page=personal_page(snap,p,p["eid"],kind)
+            page=personal_page(snap,p,p["eid"])
         elif nav=="members":
             if not can_detail(p,snap,key) or not any(txt(m["employee_id"])==txt(eid) for m in snap["members"].get(key,[])):
                 page=empty("구성원을 조회할 수 있는 조직을 선택하세요.")
             else:
-                page=personal_page(snap,p,txt(eid),kind)
+                page=personal_page(snap,p,txt(eid))
         else:
-            page=org_page(snap,p,key,kind,leader=(nav=="leader"))
-        return hidden,{},page,hidden,({"marginBottom":"20px"} if nav=="members" else hidden),hidden,[]
+            page=org_page(snap,p,key)
+        # '내 결과'에서는 조직 선택이 필요 없으므로 숨깁니다(팀원은 이 화면만 봅니다).
+        return hidden,{},page,hidden,({"marginBottom":"20px"} if nav=="members" else hidden),[],(hidden if nav=="self" else {})
     except Exception as exc:
         fail_log("render",exc)
         # 자료 확인에 실패하면 이전 개인 보고서를 응답에 재사용하지 않습니다.
         if AUTH_MODE == "preview" or ACCESS.lookup_session(session.get("birkman_sid")):
-            return hidden,{},empty("집계 자료를 준비 중입니다. 잠시 후 새로 읽기를 누르거나 담당자에게 문의해 주세요."),hidden,hidden,hidden,[]
+            # 자료 검증 오류는 원인 문구(개인정보 없음)를 함께 보여 담당자가 무엇을 다시 돌릴지 알 수 있게 합니다.
+            reason=(" 확인할 내용: "+str(exc)) if isinstance(exc,DataCheckError) else ""
+            return hidden,{},empty("집계 자료를 준비 중입니다. 잠시 후 새로 읽기를 누르거나 담당자에게 문의해 주세요."+reason),hidden,hidden,[],{}
         return logged_out
 
 
