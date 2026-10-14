@@ -1255,7 +1255,7 @@ def team_interest_map_explanation(rows, nums):
     if diff:
         out.append(html.P([html.B("흥미와 평소행동의 색이 다른 구성원 %s명 · "%len(diff)),", ".join(name_label(r,nums,len(rows)) for r in diff),
                            " — 끌리는 일과 평소 일하는 방식이 다릅니다. 업무를 맡길 때 흥미 쪽 일을 일부 섞어 주면 몰입에 도움이 됩니다."]))
-    out.append(html.P("흥미는 하고 싶은 일이며, 잘하는 일과 같은 뜻은 아닙니다. 흥미 10개 영역의 점수는 뒤쪽 참고자료에 있습니다.",className="small"))
+    out.append(html.P("흥미는 하고 싶은 일이며, 잘하는 일과 같은 뜻은 아닙니다. 흥미 10개 영역의 점수는 08 흥미 점수에 있습니다.",className="small"))
     return out
 
 
@@ -1304,8 +1304,9 @@ def source_panel(snap,rows,kind,title):
 
 def org_page(snap,p,key):
     """팀·파트 보고서 (조직장·인사 권한만). 순서:
-    표지 → 01 읽는 법 → 02 평소행동 → 03 욕구·스트레스 → 04 평소행동과 욕구가 다른 구성원 → 05 리더와 구성원
-    → 06 조직지향점 → 07 흥미 → 08 팀 운영 가이드 → 09 구성원 한눈에 보기 → 참고자료
+    표지 → 01 읽는 법 → 02 맵의 흥미 → 03 평소행동 → 04 욕구·스트레스 → 05 평소행동과 욕구가 다른 구성원
+    → 06 리더와 구성원 → 07 조직지향점 → 08 흥미 점수(10개 영역) → 09 팀 운영 가이드 → 10 구성원 한눈에 보기
+    → 참고자료(전체 진단자 비교, 번호표, 해설 전문)
     """
     if key not in visible_orgs(p,snap) or not can_detail(p,snap,key):return empty("조회할 조직을 선택하세요.")
     org=snap["orgs"][key];rows=snap["members"][key];title=txt(org["org_name"])
@@ -1336,7 +1337,7 @@ def org_page(snap,p,key):
         first_steps.append("평소행동과 욕구가 다른 구성원 %s명과 1:1로 '어떻게 대해 줄 때 편한지' 물어보세요."%len(differing))
     first_steps=list(dict.fromkeys(first_steps))[:3]
     anchors=[("read-guide","읽는 법"),("interest","팀이 끌리는 활동 · 흥미"),("usual","팀이 일하는 방식 · 평소행동"),("needs","팀이 바라는 환경 · 욕구"),
-             ("differ","평소행동과 욕구가 다른 구성원"),("leader","리더와 구성원"),("orientation","편한 근무환경 · 조직지향점"),
+             ("differ","평소행동과 욕구가 다른 구성원"),("leader","리더와 구성원"),("orientation","편한 근무환경 · 조직지향점"),("interest-score","흥미 점수 · 10개 영역"),
              ("coaching","팀 운영 가이드"),("profiles","구성원 한눈에 보기")]
     # 표지 하단: 먼저 해볼 일을 세 칸 카드로 가로 배치(왼쪽 아래 빈 공간이 생기지 않도록)
     first_box=html.Div([html.H3("%s이 먼저 해볼 일"%head_word),
@@ -1429,7 +1430,15 @@ def org_page(snap,p,key):
     orientbody.append(tip("우리 팀의 실제 업무는 네 환경 중 어디에 가까운가요? 가장 많은 환경과 다르다면 어떤 일에서 피로가 쌓이는지 살펴보세요."))
     sheets.append(sheet("편한 근무환경 · 조직지향점","네 가지 근무환경에서 일하는 사람들과 얼마나 비슷한지를 보여줍니다.",orientbody,"orientation","07 · 조직지향점"))
 
-    # ---------- 08 팀 운영 가이드 ----------
+    # ---------- 08 흥미 점수 · 10개 영역 (맵의 흥미를 보완하는 본문 자료) ----------
+    top3=[{"name":name_label(r,nums,len(rows)),"top":" · ".join(INTERESTS[k] for k in interest_rank(interest_stats_for([snap["people"].get(txt(r.get("employee_id")),r)]))[:3]) or "미확인"}
+          for r in sorted(rows,key=lambda r:txt(r.get("성명"))) if flag(r.get("analysis_eligible"))]
+    sheets.append(sheet("흥미 점수 · 10개 영역","숫자·관리·과학 등 10개 영역의 0~100 점수입니다. 맵의 흥미(✱)와 함께 업무 배분·성장 대화에 참고하세요.",
+        team_interest_explanation(interests,rank)+[html.H3("구성원별 흥미 점수 상위 3"),table([("name","구성원"),("top","흥미 점수 상위 3")],top3),
+        html.H3("구성원별 흥미 점수"),score_table(rows,interests,ref_interest),
+        html.P("짙을수록 관심이 높습니다. 테두리는 각자의 상위 3개이며 동점은 함께 표시합니다. —는 확인된 점수 없음. 전체 진단자 평균은 현재 명부에 연결된 유효 점수 기준입니다.",className="small")],"interest-score","08 · 흥미 점수"))
+
+    # ---------- 09 팀 운영 가이드 ----------
     coaching=[]
     if needs_top:
         guide_rows=[{"situation":s_,"tip":TEAM_GUIDE[needs_top][i]} for i,s_ in enumerate(TEAM_GUIDE_SITUATIONS)]
@@ -1450,19 +1459,12 @@ def org_page(snap,p,key):
     elif message:
         coaching.append(html.P(message,className="small"))
     if not coaching:coaching=[empty("결과가 확인되면 운영 팁을 표시합니다.")]
-    sheets.append(sheet("팀 운영 가이드","회의·피드백·업무 지시·공지에서 바로 시도할 방법입니다.",coaching,"coaching","08 · 팀 운영"))
+    sheets.append(sheet("팀 운영 가이드","회의·피드백·업무 지시·공지에서 바로 시도할 방법입니다.",coaching,"coaching","09 · 팀 운영"))
 
-    # ---------- 09 구성원 한눈에 보기 ----------
+    # ---------- 10 구성원 한눈에 보기 ----------
     sheets.append(sheet("구성원 한눈에 보기","조직장을 먼저, 나머지는 가나다순입니다. 결과지 원문을 짧게 발췌했고, 전문은 '구성원 상세'에서 봅니다.",
-        member_cards(rows,org,snap),"profiles","09 · 구성원"))
+        member_cards(rows,org,snap),"profiles","10 · 구성원"))
 
-    # ---------- 참고자료: 흥미 10개 영역 점수(부수 정보) ----------
-    top3=[{"name":name_label(r,nums,len(rows)),"top":" · ".join(INTERESTS[k] for k in interest_rank(interest_stats_for([snap["people"].get(txt(r.get("employee_id")),r)]))[:3]) or "미확인"}
-          for r in sorted(rows,key=lambda r:txt(r.get("성명"))) if flag(r.get("analysis_eligible"))]
-    appendix.append(sheet("흥미 점수 · 10개 영역","숫자·관리·과학 등 10개 영역의 0~100 점수입니다. 맵의 흥미(✱)를 보완하는 참고 정보입니다.",
-        team_interest_explanation(interests,rank)+[html.H3("구성원별 흥미 점수 상위 3"),table([("name","구성원"),("top","흥미 점수 상위 3")],top3),
-        html.H3("구성원별 흥미 점수"),score_table(rows,interests,ref_interest),
-        html.P("짙을수록 관심이 높습니다. 테두리는 각자의 상위 3개이며 동점은 함께 표시합니다. —는 확인된 점수 없음. 전체 진단자 평균은 현재 명부에 연결된 유효 점수 기준입니다.",className="small")],"interest-table","참고 · 흥미 점수"))
     comparison=[tip("우리 조직과 전체 진단자의 색 분포를 비교합니다. 색의 많고 적음 자체가 좋고 나쁨을 뜻하지는 않습니다.")]
     for k in ["interest","usual","needs"]:
         comparison.append(html.Div([html.H3(MAP_TITLES[k]+" · "+MAPS[k]),stack_bar(map_stats(rows,k),"우리 조직"),stack_bar(map_stats(population,k),"전체 진단자",True)],className="compare-row"))
@@ -1506,7 +1508,7 @@ def personal_page(snap,p,eid):
     if strengths:pages.append(sheet("강점","개인 결과지 원문",[html.Ul([html.Li(t) for t in strengths],className="tight-list")]))
     profile=next((js(r.get("orientation_profile_json"),{}) for members in snap["members"].values() for r in members if txt(r.get("employee_id"))==eid and flag(r.get("orientation_valid"))),{})
     pages.append(sheet("선호하는 업무 환경","조직지향점",orientation_content(profile,True)))
-    pages.append(sheet("흥미 점수 · 10개 영역","참고 정보 · 맵의 흥미(✱)를 보완합니다. 능력·성과 점수가 아닙니다.",[interest_bars(values)]))
+    pages.append(sheet("흥미 점수 · 10개 영역","맵의 흥미(✱)와 함께 보는 10개 영역 점수입니다. 능력·성과 점수가 아닙니다.",[interest_bars(values)]))
     return finish_report(pages,name+" 버크만 결과",snap)
 
 
@@ -1588,6 +1590,7 @@ CSS += r"""
 .report-sheet .quad-tile b{display:block;font-size:10.5pt;margin-bottom:1.5mm}
 .report-sheet .quad-caption{margin-top:2mm!important;text-align:center}
 .report-sheet .cover-first{margin-top:5mm}
+.report-sheet.cover .toc a{padding:1.7mm 0}
 .report-sheet.cover .cover-lead{font-size:12pt;line-height:1.7;margin:4mm 0}
 .report-sheet.cover .metrics{margin:4mm 0}
 .report-sheet.cover .sheet-kicker{margin-bottom:5mm}
