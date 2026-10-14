@@ -22,6 +22,7 @@ from ..config import get_settings
 from ..logging_setup import get_logger, log_event
 from ..storage.catalog import memory_connection
 from . import backtest as bt
+from .evaluation import deflated_sharpe, expected_max_sharpe, return_moments
 from .features import feature_glob
 from .store import jdump, research_db
 
@@ -40,7 +41,7 @@ DESCRIPTIONS = {
     "rel_strength": "60일 수익률의 시장 내 순위 상위 N종목",
     "ml_top_ret": "머신러닝 예상 수익률 상위 N종목",
     "ml_top_up": "머신러닝 상승 확률 상위 N종목",
-    "ml_risk_adj": "예상 수익률 ÷ 예상 변동성 상위 N종목",
+    "ml_risk_adj": "예상 수익률(순위 점수면 날짜별 표준화) ÷ 예상 변동성 상위 N종목",
     "ml_regime_switch": "ML 상위 N종목, 단 하락 추세·변동성 확대 국면에서는 비중 50%",
     "ml_confidence_cash": "최근(이미 결과가 확인된) 예측 순위상관이 음수면 현금 보유",
     "ml_plus_trend": "20일선>60일선 종목 중 ML 예상 수익률 상위 N종목",
@@ -77,12 +78,17 @@ def load_predictions(market: str, run_ids: dict[str, str], dates: list[date]) ->
             if not rid:
                 continue
             col = {"ret": "coalesce(pred_ret, pred_rank)", "up": "pred_up", "vol": "pred_vol", "rank": "pred_rank"}[key]
-            p = db.execute(f"""SELECT security_id, trade_date, algorithm, {col} AS {key}, model_trained_until FROM predictions
+            sel, cols = f"{col} AS {key}", [key]
+            if key == "ret":
+                # rank 과제 run 이면 ret 은 수익률이 아니라 0~1 순위 점수 → 표시해 두고 크기를 쓰는 전략에서 표준화한다
+                sel += ", (pred_ret IS NULL AND pred_rank IS NOT NULL) AS ret_is_rank"
+                cols.append("ret_is_rank")
+            p = db.execute(f"""SELECT security_id, trade_date, algorithm, {sel}, model_trained_until FROM predictions
                                WHERE run_id = ? AND trade_date IN (SELECT unnest(?::DATE[]))""", [rid, dates]).df()
             if not p.empty:
                 assert (pd.to_datetime(p["model_trained_until"]) < pd.to_datetime(p["trade_date"])).all(), "미래 학습 모델 예측 혼입"
                 algo = "lgbm" if (p["algorithm"] == "lgbm").any() else p["algorithm"].iloc[0]
-                parts.append(p[p["algorithm"] == algo][["security_id", "trade_date", key]].set_index(["security_id", "trade_date"]))
+                parts.append(p[p["algorithm"] == algo][["security_id", "trade_date", *cols]].set_index(["security_id", "trade_date"]))
     if not parts:
         return pd.DataFrame(columns=["security_id", "trade_date"])
     out = pd.concat(parts, axis=1).reset_index()
@@ -93,6 +99,19 @@ def load_predictions(market: str, run_ids: dict[str, str], dates: list[date]) ->
 def _topn(g: pd.DataFrame, col: str, n: int, ascending=False) -> list[str]:
     g = g.dropna(subset=[col])
     return g.sort_values(col, ascending=ascending).head(n)["security_id"].tolist()
+
+
+def risk_adjusted(g: pd.DataFrame) -> pd.DataFrame:
+    """같은 날 종목들의 '예측 ÷ 예상 변동성' (ra).
+    rank 과제 예측(0~1 순위 점수)은 크기에 의미가 없어 그대로 나누면 변동성 낮은 종목만 고르게 된다
+    → 그날 단면에서 표준화(z)한 뒤 나눈다. 기대값이 0 이하인 종목은 변동성으로 나누면 순서가 뒤집히므로 제외한다."""
+    score = g["ret"].astype(float)
+    if "ret_is_rank" in g and g["ret_is_rank"].fillna(False).astype(bool).any():
+        sd = score.std()
+        score = (score - score.mean()) / sd if sd and sd > 0 else score * np.nan
+    vol = g["vol"] if "vol" in g else g["rv_20"]
+    ra = score / vol.astype(float).clip(lower=0.05)
+    return g.assign(ra=ra.where(score > 0))
 
 
 def generate_targets(market: str, strategy: str, start: date, end: date, params: dict,
@@ -139,8 +158,7 @@ def generate_targets(market: str, strategy: str, start: date, end: date, params:
         elif strategy == "ml_top_up":
             pick = _topn(g, "up", n)
         elif strategy == "ml_risk_adj":
-            g = g.assign(ra=g["ret"] / g["vol"].clip(lower=0.05)) if "vol" in g else g.assign(ra=g["ret"] / g["rv_20"].clip(lower=0.05))
-            pick = _topn(g, "ra", n)
+            pick = _topn(risk_adjusted(g), "ra", n)
         elif strategy in ("ml_regime_switch",):
             pick = _topn(g, "ret", n)
         elif strategy == "ml_confidence_cash":
@@ -220,7 +238,9 @@ def search(market: str, strategies: list[str], grid: dict | None = None, budget:
             continue
         res = bt.run(market, tg, sel_start, sel_end, costs=costs, name=s)
         m = res["metrics"]
-        rows.append({"strategy": s, "params": {k: v for k, v in c.items()}, **{k: m.get(k) for k in ("cagr", "sharpe", "mdd", "n_trades", "turnover_per_year", "total_cost")}})
+        mom = return_moments(res["equity"]["equity"].pct_change()) if not res["equity"].empty else {}
+        rows.append({"strategy": s, "params": {k: v for k, v in c.items()}, **{k: m.get(k) for k in ("cagr", "sharpe", "mdd", "n_trades", "turnover_per_year", "total_cost")},
+                     "sr_daily": mom.get("sr"), "skew": mom.get("skew"), "kurt": mom.get("kurt"), "n_obs": mom.get("n_obs")})
         with research_db() as db:
             db.execute("INSERT INTO strategy_search_log VALUES (?,?,?,?,?,?,?,?,?,?,FALSE, now())",
                        [search_id, s, market, jdump(c), f"{sel_start}~{sel_end}", metric, m.get(metric),
@@ -228,13 +248,35 @@ def search(market: str, strategies: list[str], grid: dict | None = None, budget:
     df = pd.DataFrame(rows)
     if df.empty:
         return {"search_id": search_id, "trials": df}
+    dsr_info = _deflate(df, market, f"{sel_start}~{sel_end}")
+    with research_db() as db:
+        for r in df.itertuples():
+            db.execute("UPDATE strategy_search_log SET risk = json_merge_patch(risk, ?) WHERE search_id=? AND strategy_id=? AND params=?",
+                       [jdump({"dsr": r.dsr}), search_id, r.strategy, jdump(r.params)])
     best = df.sort_values(metric, ascending=False).groupby("strategy").head(1)
     with research_db() as db:
         for r in best.itertuples():
             db.execute("UPDATE strategy_search_log SET selected = TRUE WHERE search_id=? AND strategy_id=? AND params=?",
                        [search_id, r.strategy, jdump(r.params)])
     return {"search_id": search_id, "trials": df, "best_per_strategy": best, "n_trials": len(df),
-            "selection_period": f"{sel_start}~{sel_end}"}
+            "selection_period": f"{sel_start}~{sel_end}", "deflated_sharpe": dsr_info}
+
+
+def _deflate(df: pd.DataFrame, market: str, period: str) -> dict:
+    """각 시도에 deflated Sharpe(df['dsr'])를 붙인다 (제자리 수정).
+    시도 횟수 N 은 같은 시장·같은 선택 구간에서 지금까지 기록된 모든 시도(이번 탐색 포함) — 탐색을 여러 번 돌린 것도 시도다.
+    SR0(우연히 나올 최대 샤프)의 분산은 이번 탐색 시도들의 일간 샤프 분산으로 추정한다."""
+    with research_db(read_only=True) as db:
+        n_logged = db.execute("SELECT count(*) FROM strategy_search_log WHERE market=? AND period=?", [market, period]).fetchone()[0]
+    n_trials = max(int(n_logged), len(df))
+    srs = df["sr_daily"].tolist()
+    df["dsr"] = [deflated_sharpe(r.sr_daily, r.n_obs, r.skew, r.kurt, srs, n_trials) for r in df.itertuples()]
+    sr0 = expected_max_sharpe(srs, n_trials)
+    top = df.loc[df["sharpe"].astype(float).idxmax()] if df["sharpe"].notna().any() else None
+    return {"n_trials": n_trials, "n_trials_this_search": len(df), "sr0_daily": sr0, "sr0_annual": sr0 * np.sqrt(252),
+            "best_strategy": None if top is None else top["strategy"], "best_sharpe": None if top is None else top["sharpe"],
+            "best_dsr": None if top is None else top["dsr"],
+            "note": "DSR = 다중 시도를 감안해 '우연히 나올 최대 샤프'(SR0)를 넘었을 확률. 0.95 이상이면 유의하다고 본다."}
 
 
 def _first_pred_date(pred_runs: dict | None) -> date:

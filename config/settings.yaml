@@ -159,7 +159,13 @@ research:
   costs:                           # 거래비용 기본 시나리오 (출처·가정은 docs/research_guide.md)
     KR:
       commission_bps: 1.5          # 매수·매도 각각
-      slippage_bps: 10
+      slippage_bps: 10               # slippage_tiers 를 지우면 모든 종목에 이 값
+      # 거래대금 구간별 슬리피지 (체결일 직전 20일 평균 거래대금, 원). 가정값 — 호가 단위·스프레드가
+      # 소형주일수록 넓다는 점만 반영한 보수적 단순화이며, 실측 체결 데이터로 보정한 값이 아니다.
+      slippage_tiers:
+        - {min_amount: 0, bps: 40}                 # 20억 미만 소형·저유동성
+        - {min_amount: 2000000000, bps: 20}        # 20억~100억
+        - {min_amount: 10000000000, bps: 10}       # 100억 이상 (기존 고정값과 같음)
       sell_tax_schedule:           # 증권거래세(+농특세) 매도 시, 시점별 가정
         - {from: "1995-01-01", bps: 30}
         - {from: "2019-06-03", bps: 25}
@@ -171,6 +177,10 @@ research:
     US:
       commission_bps: 0.0
       slippage_bps: 5
+      slippage_tiers:                            # (달러) 가정값, 위와 같은 취지
+        - {min_amount: 0, bps: 25}                 # 500만 달러 미만
+        - {min_amount: 5000000, bps: 10}           # 500만~5000만
+        - {min_amount: 50000000, bps: 5}           # 5000만 이상 (기존 고정값과 같음)
       sell_tax_schedule: []
       fx_cost_bps: 25              # 원화 투자자 환전 비용 (원화 기준 성과 계산 시)
   portfolio:

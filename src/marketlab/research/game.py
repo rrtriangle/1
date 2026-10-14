@@ -33,7 +33,7 @@ class Side:
     shares: dict = field(default_factory=dict)
     cost_basis: dict = field(default_factory=dict)
     last_px: dict = field(default_factory=dict)
-    pending_sells: list = field(default_factory=list)
+    pending_sells: dict = field(default_factory=dict)   # security_id → 미체결 매도 수량
     trades: list = field(default_factory=list)
     equity: list = field(default_factory=list)
 
@@ -150,13 +150,15 @@ def place_order(g: GameState, side: str, security_id: str, qty: int) -> None:
 def _portfolio(side: Side, market: str) -> Portfolio:
     p = Portfolio(cash=side.cash, costs=Costs.for_market(market), cons=Constraints.default())
     p.shares, p.cost_basis, p.last_px = dict(side.shares), dict(side.cost_basis), dict(side.last_px)
-    p.pending_sells = set(side.pending_sells)
+    ps = side.pending_sells
+    # 예전 저장본은 종목 목록(전량 매도 의미)이었다
+    p.pending_sells = {s: float(side.shares.get(s, 0)) for s in ps} if isinstance(ps, list) else {s: float(q) for s, q in ps.items()}
     return p
 
 
 def _store(side: Side, p: Portfolio) -> None:
     side.cash, side.shares, side.cost_basis, side.last_px = p.cash, p.shares, p.cost_basis, p.last_px
-    side.pending_sells = sorted(p.pending_sells)
+    side.pending_sells = dict(sorted(p.pending_sells.items()))
     for t in p.trades:
         t = dict(t)
         t["date"] = str(t["date"])
@@ -201,9 +203,7 @@ def advance(g: GameState, n_days: int = 1) -> GameState:
         up = _portfolio(g.user, g.market)
         up.corporate_actions(pb, i, d)
         up.delistings(pb, i, d, MERGER_KEYWORDS)
-        for s in list(up.pending_sells):
-            up.pending_sells.discard(s)
-            up.sell(pb, i, d, s, up.shares.get(s, 0), "미체결 매도 재시도")
+        up.retry_pending(pb, i, d)
         for o in g.orders:
             if o["side"] == "SELL":
                 up.sell(pb, i, d, o["security_id"], o["qty"], "사용자 주문")

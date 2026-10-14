@@ -92,7 +92,9 @@ def main(argv: list[str] | None = None) -> int:
     rs.add_argument("--model-id")
     rs.add_argument("--exp-ids", nargs="*")
     rs.add_argument("--force-test", action="store_true", help="최종 검증 재실행 (독립성 훼손으로 기록됨)")
-    rs.add_argument("--run-id", help="(audit) walk-forward run_id")
+    rs.add_argument("--run-id", help="(audit, walkforward) walk-forward run_id — walkforward 에서는 같은 run 을 이어서 계산")
+    rs.add_argument("--through", choices=["valid", "test"], default="valid",
+                    help="(walkforward) valid: valid_end 연도까지만(기본), test: 최종 검증 구간까지 (test_access_log 기록)")
     rs.add_argument("--all", action="store_true", help="(features) 모든 연도 특징을 다시 생성")
     rs.add_argument("--winsorize", action="store_true", help="수익률 라벨 극단값을 학습구간 1%/99% 분위수로 제한해 학습")
     args = p.parse_args(argv)
@@ -207,7 +209,7 @@ def _research(a) -> int:
         for r in experiments.train_eval(a.market, a.horizon, a.task, a.algos, winsorize=(0.01, 0.99) if a.winsorize else None):
             print(r["algorithm"], json.dumps(r["metrics_valid"], ensure_ascii=False, default=str)[:400])
     elif a.action == "walkforward":
-        r = experiments.walk_forward(a.market, a.horizon, a.task, a.algos, window=a.window)
+        r = experiments.walk_forward(a.market, a.horizon, a.task, a.algos, window=a.window, run_id=a.run_id, through=a.through)
         print(experiments.wf_summary(r["run_id"]).to_string())
     elif a.action == "regime":
         from ..research.regime import analyze
@@ -245,7 +247,9 @@ def _research(a) -> int:
                     print("refit 실패", t, h, e)
     elif a.action == "audit":
         from ..research import audit
-        rid = a.run_id or f"wf-{a.market}-rank-{a.horizon}-expanding"
+        from ..research import runner
+        rid = a.run_id or runner.load_state(a.market).get("wf_runs", {}).get(f"wf_rank_{a.horizon}_expanding") \
+            or runner.wf_run_id(a.market, "rank", a.horizon, "expanding")
         res = audit.audit(a.market, rid, a.horizon)
         print("보고서:", audit.write_report(res))
         _print({k: res[k] for k in ("overall", "diagnostics")})

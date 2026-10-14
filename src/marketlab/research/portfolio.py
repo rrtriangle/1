@@ -20,7 +20,8 @@ class Portfolio:
     shares: dict = field(default_factory=dict)
     cost_basis: dict = field(default_factory=dict)
     last_px: dict = field(default_factory=dict)
-    pending_sells: set = field(default_factory=set)
+    # 미체결 매도: security_id → 아직 팔지 못한 수량 (부분 체결이면 남은 수량만, 전량 매도면 보유 전량)
+    pending_sells: dict = field(default_factory=dict)
     trades: list = field(default_factory=list)
 
     # ---------------------------------------------------------------- daily steps
@@ -32,11 +33,15 @@ class Portfolio:
             f = float(pb.adj[i, j])
             if f > 0 and not math.isnan(f) and abs(f - 1) > 1e-6:
                 self.shares[s] = _snap(self.shares[s] / f)
+                if s in self.pending_sells:
+                    self.pending_sells[s] = _snap(self.pending_sells[s] / f)
                 if s in self.last_px:
                     self.last_px[s] *= f
             r = float(pb.split[i, j])
             if r > 0 and not math.isnan(r) and abs(r - 1) > 1e-6:
                 self.shares[s] = _snap(self.shares[s] * r)
+                if s in self.pending_sells:
+                    self.pending_sells[s] = _snap(self.pending_sells[s] * r)
                 if s in self.last_px:
                     self.last_px[s] /= r
             dv = float(pb.div[i, j])
@@ -61,7 +66,7 @@ class Portfolio:
                                     "value": value, "cost": 0.0, "pnl": value - self.cost_basis.get(s, 0), "note": note})
                 self.shares.pop(s)
                 self.cost_basis.pop(s, None)
-                self.pending_sells.discard(s)
+                self.pending_sells.pop(s, None)
 
     def equity_at_open(self, pb, i: int) -> float:
         v = self.cash
@@ -70,18 +75,29 @@ class Portfolio:
             v += q * (o if o > 0 and not math.isnan(o) else self.last_px.get(s, 0.0))
         return v
 
+    def _slip(self, pb, i: int, s: str) -> float:
+        """종목·날짜별 슬리피지 (거래대금 구간 설정이 없으면 고정값)."""
+        if not getattr(self.costs, "slippage_tiers", None):
+            return self.costs.slip
+        avg = getattr(pb, "amount_avg20", None)
+        return self.costs.slip_for(float(avg[i, pb.sidx[s]]) if avg is not None and s in pb.sidx else None)
+
     def _price(self, pb, i, s):
         if s not in pb.sidx:
             return 0.0
         px = float(pb.open[i, pb.sidx[s]])
         return px if px > 0 and not math.isnan(px) else 0.0
 
+    def _defer(self, s: str, qty: float) -> None:
+        """못 판 수량을 미체결로 쌓는다 (같은 날 여러 매도의 잔량을 합산, 보유 수량 이하)."""
+        self.pending_sells[s] = min(self.pending_sells.get(s, 0) + qty, self.shares.get(s, 0))
+
     def sell(self, pb, i: int, d: date, s: str, qty: float, note: str = "") -> float:
         px = self._price(pb, i, s)
         have = self.shares.get(s, 0)
         if px <= 0 or have <= 0:
-            if have > 0:
-                self.pending_sells.add(s)
+            if have > 0 and qty > 0:
+                self._defer(s, qty)
             return 0
         j = pb.sidx[s]
         cap = float(pb.amount[i, j]) * self.cons.max_participation if pb.amount[i, j] > 0 else 0.0
@@ -89,9 +105,10 @@ class Portfolio:
         if cap > 0:
             q = min(q, math.floor(cap / px))
         if q <= 0:
-            self.pending_sells.add(s)
+            self._defer(s, qty)
             return 0
-        exec_px = px * (1 - self.costs.slip)
+        slip = self._slip(pb, i, s)
+        exec_px = px * (1 - slip)
         value = q * exec_px
         fee = value * (self.costs.comm + self.costs.sell_tax(d))
         avg = self.cost_basis.get(s, 0) / have
@@ -101,11 +118,11 @@ class Portfolio:
         if self.shares[s] <= 1e-9:
             self.shares.pop(s)
             self.cost_basis.pop(s, None)
-            self.pending_sells.discard(s)
+            self.pending_sells.pop(s, None)
         elif qty > q:
-            self.pending_sells.add(s)
+            self._defer(s, qty - q)   # 남은 수량만 다음 날 재시도
         self.trades.append({"date": d, "security_id": s, "side": "SELL", "shares": q, "price": exec_px, "value": value,
-                            "cost": fee + q * px * self.costs.slip, "pnl": value - fee - avg * q, "note": note})
+                            "cost": fee + q * px * slip, "pnl": value - fee - avg * q, "note": note})
         return q
 
     def buy(self, pb, i: int, d: date, s: str, qty: float, note: str = "") -> float:
@@ -114,7 +131,8 @@ class Portfolio:
             return 0
         j = pb.sidx[s]
         cap = float(pb.amount[i, j]) * self.cons.max_participation if pb.amount[i, j] > 0 else 0.0
-        exec_px = px * (1 + self.costs.slip)
+        slip = self._slip(pb, i, s)
+        exec_px = px * (1 + slip)
         q = min(math.floor(qty), math.floor(cap / px) if cap > 0 else 0,
                 math.floor(self.cash / (exec_px * (1 + self.costs.comm))))
         if q <= 0:
@@ -125,26 +143,33 @@ class Portfolio:
         self.shares[s] = self.shares.get(s, 0) + q
         self.cost_basis[s] = self.cost_basis.get(s, 0) + value + fee
         self.trades.append({"date": d, "security_id": s, "side": "BUY", "shares": q, "price": exec_px, "value": value,
-                            "cost": fee + q * px * self.costs.slip, "pnl": 0.0, "note": note})
+                            "cost": fee + q * px * slip, "pnl": 0.0, "note": note})
         return q
 
+    def retry_pending(self, pb, i: int, d: date, note: str = "미체결 매도 재시도") -> None:
+        """전날 못 판 수량만 다시 매도 (비중 축소의 잔량을 전량 매도로 키우지 않는다)."""
+        pending, self.pending_sells = dict(self.pending_sells), {}
+        for s in sorted(pending):
+            q = min(pending[s], self.shares.get(s, 0))
+            if q > 0:
+                self.sell(pb, i, d, s, q, note)
+
     def rebalance(self, pb, i: int, d: date, target: dict | None) -> None:
-        """목표 비중으로 조정 (target=None 이면 미체결 매도만 재시도). 매도 먼저, 그다음 매수."""
-        sells = set(self.pending_sells)
-        self.pending_sells = set()
-        if target is not None:
-            sells |= {s for s in self.shares if s not in target}
-        for s in sorted(sells):
-            self.sell(pb, i, d, s, self.shares.get(s, 0))
+        """목표 비중으로 조정 (target=None 이면 미체결 매도만 재시도). 매도 먼저, 그다음 매수.
+        새 목표가 있으면 전날 미체결분은 버리고 새 목표 기준으로 다시 계산한다."""
         if target is None:
+            self.retry_pending(pb, i, d)
             return
+        self.pending_sells = {}
+        for s in sorted(s for s in self.shares if s not in target):
+            self.sell(pb, i, d, s, self.shares.get(s, 0))
         eq = self.equity_at_open(pb, i) * (1 - self.cons.cash_buffer)
         plan = []
         for s, w in target.items():
             px = self._price(pb, i, s)
             if px <= 0:
                 continue
-            want = math.floor(eq * min(w, self.cons.max_weight) / (px * (1 + self.costs.slip)))
+            want = math.floor(eq * min(w, self.cons.max_weight) / (px * (1 + self._slip(pb, i, s))))
             plan.append((s, want - self.shares.get(s, 0)))
         for s, dq in sorted(plan, key=lambda x: x[1]):
             if dq < 0:

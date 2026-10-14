@@ -72,7 +72,8 @@ def confidence(task: str, met: dict) -> tuple[str, str]:
         if auc >= 0.53:
             return "낮음", f"검증 AUC {auc:.3f} (무작위 0.5 대비 약간 나음)"
         return "판단 보류", f"검증 AUC {auc:.3f} — 무작위와 큰 차이 없음"
-    t = met.get("rank_ic_t") or 0
+    # 라벨 기간 중첩을 보정한 Newey-West t값 우선 (예전 실험 기록에는 없으므로 보통 t값으로 대체)
+    t = met.get("rank_ic_t_nw") if met.get("rank_ic_t_nw") is not None else (met.get("rank_ic_t") or 0)
     ic = met.get("rank_ic") or 0
     if ic >= 0.05 and t >= 3:
         return "보통", f"검증 Rank IC {ic:.3f} (t={t:.1f})"

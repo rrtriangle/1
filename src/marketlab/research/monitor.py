@@ -71,6 +71,38 @@ def realized_vs_predicted(market: str, horizon: int = 20, kind_like: str = "live
         lambda x: x["pred"].corr(x["y"], method="spearman")).mean(), "n": len(g)})).reset_index()
 
 
+def forward_ic(market: str, since: date, horizon: int = 20, min_dates: int = 60) -> dict:
+    """전향(forward) 검증: since 이후 실운영 예측(kind='live', 모든 refit 모델 합침)의 날짜별 Rank IC.
+    라벨(t+1~t+horizon)이 확정된 날짜만 쓴다. 매일 예측이므로 Newey-West 라그 = horizon."""
+    from .evaluation import newey_west_tstat
+    with research_db(read_only=True) as db:
+        p = db.execute("""SELECT security_id, trade_date, coalesce(pred_rank, pred_ret) AS pred FROM predictions
+                          WHERE market=? AND horizon=? AND kind='live' AND trade_date >= ?""", [market, horizon, since]).df()
+    out = {"since": str(since), "horizon": horizon, "n_pred_dates": int(p["trade_date"].nunique()) if not p.empty else 0,
+           "n_dates": 0, "rank_ic": None, "rank_ic_t_nw": None, "monthly": [], "enough": False}
+    p = p.dropna(subset=["pred"])
+    if p.empty:
+        return out
+    con = memory_connection()
+    try:
+        con.register("p", p)
+        df = con.execute(f"""SELECT p.*, f.y_ret_{horizon} AS y FROM p JOIN read_parquet('{feature_glob(market)}') f
+                             USING (security_id, trade_date) WHERE f.y_ret_{horizon} IS NOT NULL""").df()
+    finally:
+        con.close()
+    if df.empty:
+        return out
+    daily = df.groupby("trade_date")[["pred", "y"]].apply(
+        lambda g: g["pred"].corr(g["y"], method="spearman") if len(g) >= 10 else np.nan).dropna().sort_index()
+    if daily.empty:
+        return out
+    m = pd.Series(daily.to_numpy(), index=pd.to_datetime(daily.index).to_period("M").astype(str))
+    out.update({"n_dates": int(len(daily)), "rank_ic": float(daily.mean()), "rank_ic_t_nw": newey_west_tstat(daily, horizon),
+                "monthly": [{"month": k, "rank_ic": float(v.mean()), "n": int(len(v))} for k, v in m.groupby(level=0)],
+                "enough": len(daily) >= min_dates})
+    return out
+
+
 def psi(a: np.ndarray, b: np.ndarray, bins: int = 10) -> float:
     a, b = a[~np.isnan(a)], b[~np.isnan(b)]
     if len(a) < 100 or len(b) < 100:

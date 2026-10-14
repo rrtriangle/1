@@ -93,7 +93,8 @@ def _predict(m: Model, X: pd.DataFrame) -> np.ndarray:
     return m.predict(X)
 
 
-def _metrics(task: str, df: pd.DataFrame, horizon: int) -> dict:
+def _metrics(task: str, df: pd.DataFrame, horizon: int, sample_every: int = 1) -> dict:
+    """sample_every: 평가 행의 날짜 간격(거래일). 순위상관 t값의 Newey-West 라그 = ceil(horizon/sample_every)."""
     if task == "up":
         out = classification_metrics(df, "pred", "y")
         # 투자 관점: 상승 확률 상위 20% 의 실현 수익률
@@ -104,11 +105,11 @@ def _metrics(task: str, df: pd.DataFrame, horizon: int) -> dict:
         return out
     if task == "rank":
         # 순위 모델은 실현 수익률과의 순위 상관으로 평가
-        out = regression_metrics(df.assign(y=df[f"y_ret_{horizon}"]), "pred", "y")
+        out = regression_metrics(df.assign(y=df[f"y_ret_{horizon}"]), "pred", "y", horizon, sample_every)
         for k in ("mae", "rmse", "direction_acc"):
             out.pop(k, None)
         return out
-    return regression_metrics(df, "pred", "y")
+    return regression_metrics(df, "pred", "y", horizon, sample_every)
 
 
 def train_eval(market: str, horizon: int, task: str, algorithms: list[str] | None = None,
@@ -132,6 +133,15 @@ def train_eval(market: str, horizon: int, task: str, algorithms: list[str] | Non
     valid = dataset.load(market, P["valid_start"], va_end, labels=labels, sample_every=sample_every, require_label=target)
     results = []
     seed = int(s.get("research.seed", 42))
+    if kind == "classification":
+        # 확률 보정: 검증 구간 앞 절반(+purge)으로 보정, 뒤 절반으로 평가. 보정 여부와 관계없이 모든 모델(기준 모델 포함)을
+        # 같은 뒤쪽 절반으로 평가해야 AUC·Brier 를 서로 비교할 수 있다.
+        vd = np.sort(valid["trade_date"].unique())
+        half = vd[len(vd) // 2]
+        cal_mask = valid["trade_date"] < dataset.purge_cutoff(market, half, horizon)
+        eval_df = valid[valid["trade_date"] >= half]
+    else:
+        cal_mask, eval_df = None, valid
     for i, algo in enumerate(algos):
         if progress:
             progress(i / len(algos), f"{algo} 학습 중")
@@ -156,21 +166,13 @@ def train_eval(market: str, horizon: int, task: str, algorithms: list[str] | Non
                 m.fit(train, y_tr, seed=seed)
             mon.check()
             if kind == "classification" and algo in ("logistic", "lgbm"):
-                # 확률 보정: 검증 구간 앞 절반으로 보정, 뒤 절반으로 평가 (보정 데이터와 평가 데이터 분리)
-                vd = np.sort(valid["trade_date"].unique())
-                half = vd[len(vd) // 2]
-                cal_mask = valid["trade_date"] < dataset.purge_cutoff(market, half, horizon)
-                raw = m.predict(valid[cal_mask])
-                m.calibrate(raw, valid.loc[cal_mask, target].to_numpy())
-                eval_df = valid[valid["trade_date"] >= half]
-            else:
-                eval_df = valid
+                m.calibrate(m.predict(valid[cal_mask]), valid.loc[cal_mask, target].to_numpy())
             ev = eval_df[["security_id", "trade_date", f"y_ret_{horizon}"]].copy() if f"y_ret_{horizon}" != target else eval_df[["security_id", "trade_date"]].copy()
             ev["pred"] = _predict(m, eval_df)
             ev["y"] = eval_df[target].to_numpy()
             if f"y_ret_{horizon}" not in ev:
                 ev[f"y_ret_{horizon}"] = eval_df[f"y_ret_{horizon}"].to_numpy()
-            met = _metrics(task, ev, horizon)
+            met = _metrics(task, ev, horizon, sample_every or sample_every_for(market))
             if kind == "regression" and task != "rank":
                 res = (ev["y"] - ev["pred"]).dropna()
                 met["resid_q"] = [float(res.quantile(q)) for q in (0.1, 0.5, 0.9)]
@@ -217,7 +219,7 @@ def final_test(exp_ids: list[str], purpose: str = "final evaluation") -> list[di
         ev = test[["security_id", "trade_date", f"y_ret_{horizon}"]].copy()
         ev["pred"] = _predict(m, test)
         ev["y"] = test[target].to_numpy()
-        met = _metrics(task, ev, horizon)
+        met = _metrics(task, ev, horizon, sample_every_for(market))
         n_prev = prev.get(exp_id, 0)
         rec = {"exp_id": exp_id, "metrics_test": met, "n_test": len(test), "test_period": f"{P['test_start']}~{test['trade_date'].max()}",
                "previous_accesses": n_prev,
@@ -231,24 +233,45 @@ def final_test(exp_ids: list[str], purpose: str = "final evaluation") -> list[di
 
 
 # ---------------------------------------------------------------------------- walk-forward
+def wf_test_years(market: str, through: str = "valid") -> list[int]:
+    """walk-forward 예측 연도. through='valid'(기본): 연말이 valid_end 이하인 해까지 — 최종 검증 구간을 건드리지 않는다.
+    through='test': 데이터가 있는 마지막 해까지 (최종 검증 단계 전용)."""
+    if through not in ("valid", "test"):
+        raise ValueError(f"through 는 'valid' 또는 'test': {through}")
+    wf = get_settings().get("research.walkforward", {}) or {}
+    P = periods(market)
+    first = max(P["train_start"].year + int(wf.get("first_train_years", 6)), int((wf.get("min_test_year") or {}).get(market, 0)))
+    ys = [y for y in available_years(market) if y >= first]
+    if through == "valid":
+        ys = [y for y in ys if date(y, 12, 31) <= P["valid_end"]]
+    return ys
+
+
 def walk_forward(market: str, horizon: int, task: str, algorithms: list[str] | None = None,
                  window: str = "expanding", run_id: str | None = None, sample_every: int | None = None,
-                 save_predictions: bool = True, progress=None) -> dict:
-    """연 단위 walk-forward. 각 fold 모델은 test 시작 전(라벨 purge 반영) 데이터만으로 학습한다."""
+                 save_predictions: bool = True, progress=None, through: str = "valid") -> dict:
+    """연 단위 walk-forward. 각 fold 모델은 test 시작 전(라벨 purge 반영) 데이터만으로 학습한다.
+
+    through='valid'(기본)는 valid_end 연도까지만 예측한다. 최종 검증 구간의 예측은 최종 검증 단계에서
+    through='test' 로 같은 run_id 를 이어서 계산하며(앞 연도 fold 는 재사용), 그 사용이 test_access_log 에 기록된다."""
     s = get_settings()
     wf = s.get("research.walkforward", {}) or {}
     target, kind = _target(task, horizon)
     algos = algorithms or (["ridge", "lgbm"] if kind == "regression" else ["logistic", "lgbm"])
-    ys = available_years(market)
     t0 = periods(market)["train_start"]
-    first = max(t0.year + int(wf.get("first_train_years", 6)), int((wf.get("min_test_year") or {}).get(market, 0)))
-    test_years = [y for y in ys if y >= first]
+    test_years = wf_test_years(market, through)   # 앞부분(연도 순서)은 through 와 무관하게 같다 → fold 번호 유지
     run_id = run_id or f"wf-{market}-{task}-{horizon}-{window}-{datetime.now():%Y%m%d%H%M%S}"
     with research_db() as db:
         done = {(r[0], r[1]) for r in db.execute("SELECT fold, algorithm FROM fold_results WHERE run_id=? AND wf_window=?",
                                                   [run_id, window]).fetchall()}
     seed = int(s.get("research.seed", 42))
     summary = []
+    valid_years = set(wf_test_years(market, "valid"))
+    beyond = [y for i, y in enumerate(test_years) if y not in valid_years and not all((i, a) in done for a in algos)]
+    if beyond:
+        with research_db() as db:
+            db.execute("INSERT INTO test_access_log VALUES (now(), 'walk_forward', ?, ?)",
+                       [f"walk-forward 예측(최종 검증 구간) {beyond[0]}~{beyond[-1]}", run_id])
     for fi, ty in enumerate(test_years):
         tstart, tend = date(ty, 1, 1), date(ty, 12, 31)
         tr_end = dataset.purge_cutoff(market, tstart, horizon)
@@ -284,7 +307,7 @@ def walk_forward(market: str, horizon: int, task: str, algorithms: list[str] | N
             ev = test[["security_id", "trade_date", f"y_ret_{horizon}"]].copy()
             ev["pred"] = pred
             ev["y"] = test[target].to_numpy()
-            met = _metrics(task, ev.dropna(subset=["y"]), horizon)
+            met = _metrics(task, ev.dropna(subset=["y"]), horizon, 1)
             with research_db() as db:
                 db.execute("INSERT OR REPLACE INTO fold_results VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, now())",
                            [run_id, fi, market, horizon, algo, window, tr_start, tr_end, tstart, tend, len(train), len(test), jdump(met)])
@@ -321,10 +344,15 @@ def wf_summary(run_id: str) -> pd.DataFrame:
     return pd.concat([df.drop(columns="metrics"), m], axis=1)
 
 
+CALIB_DAYS = 252   # refit 보정용으로 학습에서 떼어 두는 최근 거래일 수 (약 1년)
+
+
 def refit_live(market: str, horizon: int, task: str, source_exp_id: str | None = None) -> dict:
     """운영용 재학습: 검증으로 선택된 실험과 같은 알고리즘·설정을, 라벨이 확정된 최신 날짜까지의 데이터로 다시 학습.
 
     독립 검증 성적이 없으므로 원 실험의 검증 지표를 함께 기록하고 note 에 'refit' 을 남긴다.
+    분류 모델은 최근 CALIB_DAYS 거래일을 학습에서 떼어 그 구간으로 새로 확률 보정한다(보정 구간이 부족하면 보정 없음).
+    trained_until 은 보정 구간까지 포함한 '라벨을 본 마지막 날'이다.
     분석 화면은 승인 모델 → 최신 refit → 검증 최고 후보 순으로 사용한다(자동 승인 없음).
     """
     from .analysis import pick_model
@@ -344,10 +372,24 @@ def refit_live(market: str, horizon: int, task: str, source_exp_id: str | None =
     import json as _json
     valid_metrics = _json.loads(metrics_json).get("metrics_valid", {})
     P = periods(market)
-    last = max(d for d in dataset.trading_days(market) if d <= date.today())
-    tr_end = dataset.purge_cutoff(market, last, horizon)
+    days = [d for d in dataset.trading_days(market) if d <= date.today()]
+    tr_end = dataset.purge_cutoff(market, max(days), horizon)
     labels = list(dict.fromkeys([target, f"y_ret_{horizon}"]))
     train = dataset.load(market, P["train_start"], tr_end, labels=labels, require_label=target)
+    calibration = None
+    if kind == "classification" and algo in ("logistic", "lgbm"):
+        # 보정: 옛 모델의 보정기는 다른 모델의 점수 분포에 맞춰져 있어 재사용할 수 없다.
+        # 최근 구간(CALIB_DAYS 거래일)을 학습에서 떼어(purge 포함) 그 구간으로 새로 보정한다.
+        cal_days = sorted(d for d in train["trade_date"].unique())
+        if len(cal_days) > 2 * CALIB_DAYS:
+            cal_start = cal_days[-CALIB_DAYS]
+            fit_end = dataset.purge_cutoff(market, cal_start, horizon)
+            cal = train[train["trade_date"] >= cal_start]
+            if cal[target].nunique() >= 2:
+                calibration = {"cal_start": str(cal_start), "cal_end": str(cal_days[-1]), "fit_end": str(fit_end), "n_cal": len(cal)}
+                train = train[train["trade_date"] <= fit_end]
+        if calibration is None:
+            calibration = {"note": "최근 보정 구간 부족 — 보정 없이 원 점수 사용"}
     mon = MemoryMonitor().start()
     t0 = time.time()
     try:
@@ -361,10 +403,8 @@ def refit_live(market: str, horizon: int, task: str, source_exp_id: str | None =
             m.fit(train[fm], y[fm], train[em], y[em], seed=int(s.get("research.seed", 42)))
         elif algo != "hist_vol":
             m.fit(train, y, seed=int(s.get("research.seed", 42)))
-        if kind == "classification" and algo in ("logistic", "lgbm"):
-            # 보정: 최근 2년(학습에 포함되지만 별도 적합 불가) 대신 원 실험의 보정기를 재사용
-            src_model = Model.load(s.paths.data / s.get("research.models_dir", "research_models") / f"{exp_src}.pkl")
-            m.calibrator = src_model.calibrator
+        if calibration and "cal_start" in calibration:
+            m.calibrate(m.predict(cal), cal[target].to_numpy())
         mon.check()
     finally:
         mon.stop()
@@ -372,7 +412,8 @@ def refit_live(market: str, horizon: int, task: str, source_exp_id: str | None =
     path = s.paths.data / s.get("research.models_dir", "research_models") / f"{exp_id}.pkl"
     m.save(path)
     rec = {"exp_id": exp_id, "source_exp": exp_src, "metrics_valid": valid_metrics, "n_train": len(train),
-           "train_seconds": round(time.time() - t0, 1), "peak_rss_gb": round(mon.peak_rss_gb, 2), "trained_until": str(tr_end)}
+           "train_seconds": round(time.time() - t0, 1), "peak_rss_gb": round(mon.peak_rss_gb, 2),
+           "trained_until": str(tr_end), "calibration": calibration}
     with research_db() as db:
         db.execute("INSERT INTO experiments VALUES (?, now(), 'refit', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, 'done', ?)",
                    [exp_id, market, target, horizon, algo, params_json, jdump(FEATURES), jdump(s.get("research.universe")),
