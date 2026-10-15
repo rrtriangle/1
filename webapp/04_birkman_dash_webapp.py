@@ -29,7 +29,7 @@ AI_INPUT_DATASET = "birkman_ai_inputs"
 AI_REPORT_DATASET = "birkman_ai_reports_raw"
 ALLOWED_DOMAIN = "dwchem.co.kr"
 APP_TITLE = "버크만 팀 리포트"
-APP_VERSION = "2026-10-15.9"
+APP_VERSION = "2026-10-15.10"
 # 자료 확인 주기(초). 이 시간이 지나면 완료 기록(latest_success.json)만 다시 보고,
 # 집계가 바뀌지 않았으면 기존 자료를 그대로 씁니다. 화면을 자동으로 새로 그리지 않습니다.
 DATA_CACHE_SECONDS = 60
@@ -635,7 +635,11 @@ def selectable_report_orgs(p,snap):
     보고서로 볼 내용이 없으므로 목록에 넣지 않습니다(예: 본부장 1명만 있는 본부 직속)."""
     keys=visible_orgs(p,snap)
     if SHOW_LEADER_ONLY_GROUPS:return keys
-    return {key for key in keys if any(txt(r.get("직책명")) not in LEADER_ONLY_TITLES for r in snap["members"].get(key,[]))}
+    def has_members(key):
+        # 조직장(이 조직의 조직장 + 상위 직책자)을 뺀 구성원이 한 명이라도 있어야 목록에 넣습니다.
+        head_ids={txt(r.get("employee_id")) for r in org_head_rows(snap,key)}
+        return any(txt(r.get("employee_id")) not in head_ids and txt(r.get("직책명")) not in LEADER_ONLY_TITLES for r in snap["members"].get(key,[]))
+    return {key for key in keys if has_members(key)}
 
 
 def can_detail(p, snap, org):
@@ -1278,6 +1282,44 @@ def josa(word, with_final, without_final):
     return with_final if 0xAC00 <= c <= 0xD7A3 and (c - 0xAC00) % 28 else without_final
 
 
+# 표지 첫 문장(AI 개요에 색 이름·기호·숫자가 섞였거나 AI 해설이 없을 때): 가장 많은 색을 쉬운 말로 이어 붙입니다.
+COVER_INTRO = {
+    "interest": {"빨강": "직접 다루고 결과를 만드는 일", "초록": "사람을 만나고 의견을 전하는 일",
+                 "노랑": "자료와 절차를 정리하는 일", "파랑": "아이디어를 구상하고 표현하는 일"},
+    "usual": {"빨강": "빠르게 실행하며 결과를 챙기는", "초록": "대화와 설득으로 일을 풀어가는",
+              "노랑": "기준과 세부사항을 꼼꼼히 챙기는", "파랑": "깊이 생각하고 구상한 뒤 움직이는"},
+    "needs": {"빨강": "분명하고 직접적인 소통", "초록": "의견을 나누고 인정받는 분위기",
+              "노랑": "분명한 기준과 예측 가능한 일정", "파랑": "생각할 시간과 1:1 대화"}}
+
+
+def plain_overview(text):
+    """AI 개요를 표지에 그대로 써도 되는지: 색 이름·맵 기호·숫자(1:1 제외)가 없어야 합니다."""
+    t = txt(text).replace("1:1", "")
+    return bool(t) and not re.search(r"빨강|초록|노랑|파랑|[✱◆○□◇]|\d", t)
+
+
+def cover_intro(rows, unit="팀"):
+    def tops(kind):
+        cs, _ = majority_all(map_stats(rows, kind))
+        return cs if 1 <= len(cs) <= 2 else []      # 셋 이상 같으면 한쪽으로 말하지 않습니다
+    i, u, n = tops("interest"), tops("usual"), tops("needs")
+    it = "".join(COVER_INTRO["interest"][c] + (josa(COVER_INTRO["interest"][c], "이나", "나") if k < len(i) - 1 else "") + (" " if k < len(i) - 1 else "") for k, c in enumerate(i))
+    ut = " 사람과 ".join(COVER_INTRO["usual"][c] for c in u)
+    if it and ut:
+        first = "%s에 끌리고, 평소에는 %s 사람이 많은 %s입니다." % (it, ut, unit)
+    elif it:
+        first = "%s에 끌리는 사람이 많은 %s입니다." % (it, unit)
+    elif ut:
+        first = "평소에 %s 사람이 많은 %s입니다." % (ut, unit)
+    else:
+        first = "여러 성향이 고르게 섞인 %s입니다." % unit
+    if not n:
+        return first
+    words = [COVER_INTRO["needs"][c] for c in n]
+    nt = (words[0] + josa(words[0], "이나", "나") + " " + words[1]) if len(words) == 2 else words[0]
+    return first + " %s%s 있을 때 힘을 냅니다." % (nt, josa(words[-1], "이", "가"))
+
+
 def majority_all(stats):
     """가장 많은 색 목록(동률이면 모두)과 그 인원. 중앙선은 제외"""
     qs = [q for q in stats.get("quadrants", []) if q["color"] in FOUR_COLORS and q["count"]]
@@ -1543,7 +1585,6 @@ def org_page(snap,p,key):
     interest_map=map_stats(rows,"interest");interest_tops,_=majority_all(interest_map)
     stress_map=map_stats(rows,"stress")
     stress_tops,_=majority_all(stress_map)
-    summary="구성원 %s명의 버크만 결과를 모아 끌리는 일, 일하는 방식, 바라는 대우를 정리했습니다."%team_eligible
     # 표지 '우리 팀 한눈에': 기호·색 이름 없이 말로만 씁니다(처음 보는 사람도 바로 읽도록).
     def glance(kind,tops,stats):
         # 같은 수로 가장 많은 색이 둘이면 둘 다, 셋 이상이면 '고르게 나뉨'
@@ -1574,7 +1615,7 @@ def org_page(snap,p,key):
     cover=sheet("",None,[html.Div([html.Span(style={"background":PALETTE[c]}) for c in FOUR_COLORS],className="cover-stripe"),
         html.Div([html.Span("BIRKMAN · %s REPORT"%{"team":"TEAM","part":"PART","group":"GROUP"}.get(org.get("org_level"),"TEAM")),html.Span("조직장 열람용")],className="sheet-kicker"),html.Div(txt(org.get("org_path")),className="cover-path"),html.H1(title),
         html.Div([html.B("진단 반영 %s명"%team_eligible)," / 구성원 %s명"%len(rows)+(" · %s %s 별도"%(head_word," ".join(txt(r.get("성명")) for r in head_rows)) if head_rows else "")+" · 기준 %s"%txt(snap["meta"].get("processed_at"))[:10]],className="cover-meta"),
-        html.P(brief(report["overview"],340) if report else summary,className="cover-lead"),
+        html.P(brief(report["overview"],340) if report and plain_overview(report["overview"]) else cover_intro(rows,unit_word),className="cover-lead"),
         html.Div([html.Div([html.H3("우리 %s 한눈에"%unit_word),html.Dl([x for label,value in glance_rows for x in (html.Dt(label),html.Dd(value))],className="glance"),
 ],className="cover-glance"),toc],className="cover-bottom"),first_box,
         html.P("진단 결과를 요약한 자료로, 실제와 다를 수 있고 한 사람의 모든 면을 나타내지는 않습니다.",className="cover-note")],anchor="overview")

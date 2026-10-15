@@ -24,12 +24,15 @@ AI_INPUTS_OUTPUT = "birkman_ai_inputs"
 TEAM_CACHE_OUTPUT = "birkman_team_cache"  # 새 관리 폴더. 기존 캐시와 분리
 
 ALLOWED_JOB_TYPES = {"사무직", "기술직", "연구직"}
-AGGREGATOR_VERSION = "2026-10-15.1"   # 그룹 단위 조직 추가
+AGGREGATOR_VERSION = "2026-10-15.2"   # 조직장만 있는 직속 조직은 만들지 않음
 PROMPT_VERSION = "2026-10-15.1"       # 쉬운 말 요약 · 문제해결 방식 · 주의 문구 없음 · 그룹
 GROUP_REPORTS = True                  # 그룹 단위 조직과 AI 입력을 만듭니다. 끄려면 False
 TEAM_LEADER_TITLES = {"팀장"}         # 팀 보고서의 리더 직책명
 PART_LEADER_TITLES = {"파트장"}       # 파트 보고서의 리더 직책명
 GROUP_LEADER_TITLES = {"그룹장"}      # 그룹 보고서의 리더 직책명
+# 본부·공장·그룹 직속 명단은 이 직책자 말고 다른 구성원이 있을 때만 조직으로 만듭니다(그룹장·본부장만 있으면 만들지 않음).
+MIN_REPORT_MEMBERS = 2   # 조직장을 뺀 진단 결과 보유자가 이보다 적으면 AI 해설을 만들지 않음(04도 같은 기준으로 '보고서 생성 안 됨')
+DIRECT_LEADER_TITLES = {"그룹장", "실장", "센터장", "본부장", "공장장", "사장", "부사장", "TFT장"}
 MAX_EVIDENCE_PER_SECTION = 80  # 분야별 개인 설명의 서로 다른 문장 수 상한
 MAX_EVIDENCE_TEXT_CHARS = 700
 MAX_PROMPT_CHARS = 60000       # 모델별 토큰 한도와는 별개인 입력 길이 상한
@@ -554,6 +557,11 @@ def build_outputs(people):
     for key in [k for k, o in orgs.items() if o["org_level"] == "group"]:
         if not any(r["팀명"] or r["파트명"] for r in groups[key]):
             del orgs[key], groups[key]
+    # 본부·공장·그룹 직속 명단에 조직장(그룹장·본부장 등)만 있으면 보고서로 볼 내용이 없으므로 만들지 않습니다.
+    # (그 사람은 그룹 전체 조직이나 상위 조직 명단에는 그대로 들어갑니다.)
+    for key in [k for k, o in orgs.items() if o["org_level"].endswith("_direct")]:
+        if all(r["직책명"] in DIRECT_LEADER_TITLES for r in groups[key]):
+            del orgs[key], groups[key]
     summaries, members, ai_inputs = [], [], []
     redact = make_redactor(people)
     for key in sorted(orgs, key=lambda k: (orgs[k]["org_path_full"], orgs[k]["org_level"], k)):
@@ -573,7 +581,8 @@ def build_outputs(people):
         # AI 대상 선별도 여기서 끝냅니다. 별도 Prepare/Filter 레시피 없이
         # birkman_ai_inputs를 바로 Prompt Recipe의 입력으로 연결합니다.
         # 진단 없는 조직과 상위 직속 명단은 summary/members에 그대로 남습니다.
-        if summary["report_scope"] and summary["analysis_count"] > 0:
+        report_n = sum(1 for r in rows if r["analysis_eligible"] and not leader_in_org(r, org))
+        if summary["report_scope"] and report_n >= MIN_REPORT_MEMBERS:
             sections = evidence_sections(rows, redact)
             for audience in ("shared", "leader"):
                 ai_inputs.append(make_ai_row(org, rows, summary, sections, audience))
