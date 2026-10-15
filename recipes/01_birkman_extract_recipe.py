@@ -394,7 +394,7 @@ def extract_orientation(page, rows, drawings):
         if m and m.group(1) not in labels:
             labels[m.group(1)] = r
     if len(labels) != 4:
-        return {}
+        return {"_reason": "이름표 %d개만 찾음(%s)" % (len(labels), ",".join(labels) or "없음")}
     bars = {}
     for color, label in labels.items():
         lr = label["rect"]
@@ -404,7 +404,7 @@ def extract_orientation(page, rows, drawings):
               abs((d["rect"].y0+d["rect"].y1)/2-cy) < page.rect.height*0.02 and
               d["rect"].width > 0 and 0 < d["rect"].height < page.rect.height*0.06]
         if not ds:
-            return {}
+            return {"_reason": "%s 막대를 찾지 못함" % color}
         r = fitz.Rect(ds[0])
         for extra in ds[1:]:
             r |= extra
@@ -412,8 +412,10 @@ def extract_orientation(page, rows, drawings):
     rects = [fitz.Rect(v["pdf_rect"]) for v in bars.values()]
     centers = [(r.x0+r.x1)/2 for r in rects]
     heights = [r.height for r in rects]
-    if max(centers)-min(centers) > page.rect.width*0.01 or max(heights)/min(heights) > 1.3:
-        return {}
+    if max(centers)-min(centers) > page.rect.width*0.01:
+        return {"_reason": "막대 가운데 위치가 서로 다름"}
+    if max(heights)/min(heights) > 1.3:
+        return {"_reason": "막대 높이가 서로 다름"}
     return {"method": "vector_geometry_only", "bars": bars,
             "note": "원본 막대 도형. 공식 점수가 아님. 개인 내 길이 비교와 최상위 분야 인원 집계에 사용."}
 
@@ -449,7 +451,7 @@ def extract_pdf(pdf_bytes):
         map_candidates = collections.defaultdict(list)
         overview_candidates = collections.defaultdict(list)
         interest_candidates = []
-        orientation_pages = []
+        orientation_pages, orientation_reasons = [], []
         for index, page in enumerate(doc):
             t, number = compact(texts[index]), index+1
             detail = next((k for k, label in MAP_KINDS.items() if label+"탐색(" in t), None)
@@ -464,6 +466,8 @@ def extract_pdf(pdf_bytes):
             if need_map:
                 box = map_bounds(page, drawings)
                 symbols = symbols_in_map(drawings, box) if box else {}
+                if detail and not box:
+                    out["issues"].append(issue("MAP_BOX_NOT_FOUND", MAP_KINDS[detail]+" 상세 페이지에서 맵 테두리(네 색 사분면)를 찾지 못했습니다.", page=number))
                 if detail:
                     desc = detail_text(page, rows, box, detail)
                     candidates = symbols.get(detail, [])
@@ -475,7 +479,7 @@ def extract_pdf(pdf_bytes):
                                       method="detail_page_vector")
                         map_candidates[detail].append(record)
                     else:
-                        out["issues"].append(issue("MAP_SYMBOL_NOT_UNIQUE", MAP_KINDS[detail]+" 맵/기호를 하나로 확정하지 못했습니다.", page=number))
+                        out["issues"].append(issue("MAP_SYMBOL_NOT_UNIQUE", MAP_KINDS[detail]+" 기호를 하나로 확정하지 못했습니다(찾은 기호 %d개)." % len(candidates), page=number))
                 else:
                     for k, candidates in symbols.items():
                         if len(candidates) == 1:
@@ -491,8 +495,10 @@ def extract_pdf(pdf_bytes):
             if need_orientation:
                 orientation_pages.append(number)
                 orientation = extract_orientation(page, rows, drawings)
-                if orientation:
+                if orientation and "_reason" not in orientation:
                     out["orientation"] = dict(orientation, page=number)
+                elif orientation:
+                    orientation_reasons.append("%d쪽: %s" % (number, orientation["_reason"]))
         for k in MAP_KINDS:
             choices = map_candidates[k]
             summaries = overview_candidates[k]
@@ -539,7 +545,7 @@ def extract_pdf(pdf_bytes):
         if not out["strengths"]:
             out["issues"].append(issue("STRENGTHS_MISSING", "강점 설명을 추출하지 못했습니다."))
         if not out["orientation"]:
-            reason = ("조직지향점 페이지는 찾았지만 네 막대를 확정하지 못했습니다." if orientation_pages
+            reason = ("조직지향점 페이지는 찾았지만 네 막대를 확정하지 못했습니다. " + " / ".join(orientation_reasons) if orientation_pages
                       else "조직지향점 페이지의 제목/표 문구를 찾지 못했습니다.")
             out["issues"].append(issue("ORIENTATION_UNAVAILABLE", reason, level="info",
                                        page=orientation_pages[0] if orientation_pages else None))

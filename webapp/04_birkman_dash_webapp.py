@@ -29,7 +29,7 @@ AI_INPUT_DATASET = "birkman_ai_inputs"
 AI_REPORT_DATASET = "birkman_ai_reports_raw"
 ALLOWED_DOMAIN = "dwchem.co.kr"
 APP_TITLE = "버크만 팀 리포트"
-APP_VERSION = "2026-10-15.4"
+APP_VERSION = "2026-10-15.5"
 # 자료 확인 주기(초). 이 시간이 지나면 완료 기록(latest_success.json)만 다시 보고,
 # 집계가 바뀌지 않았으면 기존 자료를 그대로 씁니다. 화면을 자동으로 새로 그리지 않습니다.
 DATA_CACHE_SECONDS = 60
@@ -47,7 +47,7 @@ AUTO_LEADER_SCOPES = True
 TEAM_HEAD_TITLES = {"팀장"}
 PART_HEAD_TITLES = {"파트장"}
 OTHER_HEAD_TITLES = {"그룹장", "실장", "센터장", "본부장", "공장장"}
-GROUP_REPORTS = True        # 그룹 단위 보고서: 같은 그룹의 팀·파트·그룹 직속 명단을 합쳐 04에서 만듭니다(01~03 변경 없음)
+GROUP_REPORTS = True        # 그룹 단위 보고서. 02가 그룹을 만들면 그것을 쓰고(AI 해설 포함), 예전 02 결과면 04에서 합쳐 만듭니다
 GROUP_HEAD_TITLES = {"그룹장"}  # 그룹 보고서의 조직장(그룹 보고서를 자동으로 볼 수 있는 사람)
 
 # --- 보고서 해석 기준 (좌표는 가운데 0, 가로·세로 -1~1) ---
@@ -548,6 +548,8 @@ def principal(snap):
 def add_group_orgs(orgs, members):
     """같은 그룹(본부·그룹총괄/공장·그룹명이 같음)의 팀·파트·그룹 직속 명단을 합쳐 그룹 조직을 만듭니다.
     한 사람이 팀과 파트에 함께 있어도 한 번만 넣습니다. 팀이나 파트가 하나도 없는 그룹은 만들지 않습니다."""
+    if any(o.get("org_level") == "group" for o in orgs.values()):
+        return  # 02(2026-10-15 이후)가 그룹 조직과 AI 입력을 이미 만든 경우 그대로 씁니다.
     buckets, ident, has_unit = collections.defaultdict(dict), {}, set()
     for k, o in list(orgs.items()):
         g = txt(o.get("그룹명"))
