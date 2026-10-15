@@ -29,7 +29,7 @@ AI_INPUT_DATASET = "birkman_ai_inputs"
 AI_REPORT_DATASET = "birkman_ai_reports_raw"
 ALLOWED_DOMAIN = "dwchem.co.kr"
 APP_TITLE = "버크만 팀 리포트"
-APP_VERSION = "2026-10-15.8"
+APP_VERSION = "2026-10-15.9"
 # 자료 확인 주기(초). 이 시간이 지나면 완료 기록(latest_success.json)만 다시 보고,
 # 집계가 바뀌지 않았으면 기존 자료를 그대로 씁니다. 화면을 자동으로 새로 그리지 않습니다.
 DATA_CACHE_SECONDS = 60
@@ -1160,7 +1160,7 @@ def orientation_mini(r, nums, n_rows):
 def team_orientation_content(rows, nums, unit="팀"):
     """07: 조직지향점이 무엇인지 → 구성원별 막대(가장 긴 막대가 같은 사람끼리) → 한 줄 요약"""
     out=[html.Div([html.H3("조직지향점 · 문제를 해결하는 방식"),
-        html.P("조직에서 문제가 생겼을 때 원인을 어디서 찾고 어떻게 해결하는지를 보여줍니다. 네 직군에서 일하는 사람들과 비슷한 정도를 막대로 나타내며, 가장 긴 막대가 그 사람의 문제해결 방식입니다."),
+        html.P("조직에서 문제가 생겼을 때 원인을 어디서 찾고 어떻게 해결하는지를 보여줍니다. 막대가 길수록 그 방식에 가깝고, 가장 긴 막대가 그 사람의 문제해결 방식입니다."),
         html.Div([html.Div([html.B([swatch(c),ORIENTATIONS[c]]),html.Div([html.Span("원인 ",className="os-k"),ORIENT_SOLVE[c][0]],className="small"),
                             html.Div([html.Span("해결 ",className="os-k"),ORIENT_SOLVE[c][1]],className="small")],className="orientation-description") for c in ORIENTATIONS],className="orientation-descriptions")],className="orient-intro")]
     # 안내는 설명 바로 뒤에 둡니다(맨 끝에 두면 다음 장에 혼자 넘어가는 경우가 있음).
