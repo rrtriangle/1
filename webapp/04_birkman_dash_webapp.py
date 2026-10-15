@@ -29,11 +29,12 @@ AI_INPUT_DATASET = "birkman_ai_inputs"
 AI_REPORT_DATASET = "birkman_ai_reports_raw"
 ALLOWED_DOMAIN = "dwchem.co.kr"
 APP_TITLE = "버크만 팀 리포트"
-APP_VERSION = "2026-10-15.5"
+APP_VERSION = "2026-10-15.6"
 # 자료 확인 주기(초). 이 시간이 지나면 완료 기록(latest_success.json)만 다시 보고,
 # 집계가 바뀌지 않았으면 기존 자료를 그대로 씁니다. 화면을 자동으로 새로 그리지 않습니다.
 DATA_CACHE_SECONDS = 60
-SHOW_LEADER_ONLY_GROUPS = False  # 팀원이 없는 그룹 직속 조직은 선택 목록에서 숨김
+SHOW_LEADER_ONLY_GROUPS = False  # False: 아래 직책자만 있는 조직(본부장 1명뿐인 본부 직속 등)은 보고서 목록에서 숨김
+LEADER_ONLY_TITLES = {"팀장", "파트장", "그룹장", "실장", "센터장", "본부장", "사장", "부사장", "공장장", "TFT장"}
 
 # --- 보고서를 볼 수 있는 사람 (조직장 자동 지정) ---
 # 명부의 직책명으로 각 조직의 조직장을 찾아, 관리자 화면에서 따로 등록하지 않아도 그 조직의 보고서를 보게 합니다.
@@ -622,12 +623,12 @@ def visible_orgs(p, snap):
 
 
 def selectable_report_orgs(p,snap):
-    """명부·집계는 보존하고 조직 선택 목록에서만 그룹장 단독 조직을 숨깁니다."""
+    """명부·집계는 보존하고 조직 선택 목록에서만 숨깁니다.
+    본부·공장·그룹 직속이나 팀·파트·그룹 어디든, 구성원이 모두 상위 직책자(LEADER_ONLY_TITLES)이면
+    보고서로 볼 내용이 없으므로 목록에 넣지 않습니다(예: 본부장 1명만 있는 본부 직속)."""
     keys=visible_orgs(p,snap)
     if SHOW_LEADER_ONLY_GROUPS:return keys
-    leader_titles={"팀장","파트장","그룹장","실장","센터장","본부장","사장","부사장","공장장","TFT장"}
-    return {key for key in keys if snap["orgs"][key].get("org_level")!="group_direct" or
-            any(txt(r.get("직책명")) not in leader_titles for r in snap["members"].get(key,[]))}
+    return {key for key in keys if any(txt(r.get("직책명")) not in LEADER_ONLY_TITLES for r in snap["members"].get(key,[]))}
 
 
 def can_detail(p, snap, org):
