@@ -21,6 +21,7 @@ FIRST_ADMIN_EMAIL = ""         # 최초 관리자 본인의 회사 이메일
 AUTH_FOLDER_ID = "birkman_webapp_state"  # 새 로컬 관리 폴더 이름 또는 ID
 TEAM_CACHE_FOLDER = "birkman_team_cache" # 2단계 출력 폴더 이름 또는 ID
 EXTRACT_CACHE_FOLDER = "birkman_cache"   # 1단계 출력 폴더 이름 또는 ID
+PDF_FOLDER_ID = ""             # 원본 진단지 PDF 폴더 ID(01의 PDF_FOLDER_ID와 같은 값). 비워 두면 '원본 진단지' 버튼을 숨깁니다.
 
 PEOPLE_DATASET = "birkman_people"
 SUMMARY_DATASET = "birkman_org_summary"
@@ -29,7 +30,7 @@ AI_INPUT_DATASET = "birkman_ai_inputs"
 AI_REPORT_DATASET = "birkman_ai_reports_raw"
 ALLOWED_DOMAIN = "dwchem.co.kr"
 APP_TITLE = "버크만 팀 리포트"
-APP_VERSION = "2026-10-15.10"
+APP_VERSION = "2026-10-15.11"
 # 자료 확인 주기(초). 이 시간이 지나면 완료 기록(latest_success.json)만 다시 보고,
 # 집계가 바뀌지 않았으면 기존 자료를 그대로 씁니다. 화면을 자동으로 새로 그리지 않습니다.
 DATA_CACHE_SECONDS = 60
@@ -82,7 +83,7 @@ from pathlib import Path
 
 import dataiku
 from dash import dcc, html, Input, Output, State, callback_context, no_update
-from flask import session, has_request_context
+from flask import session, has_request_context, Response, abort, request
 from werkzeug.security import generate_password_hash, check_password_hash
 
 LOG = logging.getLogger("birkman_webapp")
@@ -1759,10 +1760,30 @@ def org_page(snap,p,key):
     return finish_report(sheets,"%s 버크만 %s 리포트"%(title,unit_word),snap)
 
 
+def pdf_token(eid):
+    """주소에 사번이 그대로 드러나지 않도록 쓰는 값(서버 비밀키로 만든 해시)"""
+    return hmac.new(str(server.secret_key).encode(), ("pdf:" + txt(eid)).encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def pdf_bar(person):
+    """원본 진단지 열기·내려받기 버튼(인쇄에는 나오지 않음). 권한 확인은 PDF를 보낼 때 다시 합니다."""
+    if not PDF_FOLDER_ID:
+        return None
+    if not txt(person.get("source_path")):
+        return html.Div(html.Span("원본 진단지 PDF가 연결되어 있지 않습니다.",className="small muted"),className="pdf-bar no-print")
+    url=(app.config.requests_pathname_prefix or "/")+"birkman-pdf/"+pdf_token(person.get("employee_id"))
+    return html.Div([html.B("원본 진단지"),html.A("새 창에서 열기",href=url,target="_blank",rel="noopener",className="pdf-link"),
+                     html.A("내려받기",href=url+"?dl=1",className="pdf-link")],className="pdf-bar no-print")
+
+
 def personal_page(snap,p,eid):
     if not eid or not allowed_person(p,snap,eid):return empty("조회할 구성원을 선택하세요.")
     person=snap["people"].get(eid)
     if not person:return empty("구성원 정보가 없습니다.")
+    return html.Div([pdf_bar(person),personal_report(snap,eid,person)])
+
+
+def personal_report(snap,eid,person):
     name=txt(person.get("성명"));subtitle=" · ".join(filter(None,[txt(person.get("팀명")),txt(person.get("파트명")),txt(person.get("직책명"))]))
     if not flag(person.get("analysis_eligible")):
         return finish_report([sheet(name,subtitle,[empty("표시할 진단 결과가 없습니다. 명부에는 포함되어 있습니다.")])],name,snap)
@@ -1835,6 +1856,42 @@ server.config.update(SESSION_COOKIE_NAME="birkman_"+cookie_suffix, SESSION_COOKI
                      PERMANENT_SESSION_LIFETIME=dt.timedelta(seconds=SESSION_LIFETIME_SECONDS),
                      SESSION_REFRESH_EACH_REQUEST=False, MAX_CONTENT_LENGTH=256*1024)
 app.title = APP_TITLE
+
+
+@server.route((app.config.routes_pathname_prefix or "/") + "birkman-pdf/<token>")
+def original_pdf(token):
+    """원본 진단지 PDF: 로그인한 사람이 볼 수 있는 구성원(본인·조직장 범위·인사)의 것만 보냅니다.
+    01이 분석한 파일과 같은지(sha256) 확인하고, 사번·이름·내용은 로그에 쓰지 않습니다."""
+    if not PDF_FOLDER_ID or not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        abort(404)
+    try:
+        snap = REPO.get()
+        p = principal(snap)
+        if not p:
+            abort(403)
+        eid = next((e for e in snap["people"] if hmac.compare_digest(pdf_token(e), token)), None)
+        if not eid or not allowed_person(p, snap, eid):
+            abort(403)
+        person = snap["people"][eid]
+        path = txt(person.get("source_path"))
+        if not path:
+            abort(404)
+        with dataiku.Folder(PDF_FOLDER_ID).get_download_stream(path) as stream:
+            data = stream.read()
+        expected = txt(person.get("source_sha256"))
+        if expected and hashlib.sha256(data).hexdigest() != expected:
+            return Response("PDF 파일이 분석 이후 바뀌었습니다. 01 레시피를 다시 실행하세요.", status=409, mimetype="text/plain; charset=utf-8")
+        disposition = "attachment" if request.args.get("dl") else "inline"
+        return Response(data, mimetype="application/pdf", headers={
+            "Content-Disposition": '%s; filename="birkman_report.pdf"' % disposition,
+            "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+    except Exception as exc:
+        if getattr(exc, "code", None) in (403, 404):
+            raise
+        fail_log("original_pdf", exc)
+        abort(500)
+
+
 app.config.suppress_callback_exceptions = False
 app.css.config.serve_locally = True
 app.scripts.config.serve_locally = True
@@ -1915,6 +1972,9 @@ CSS += r"""
 @media(max-width:760px){.threecol{grid-template-columns:1fr}}
 .report-sheet .cover-first{margin-top:5mm}
 .report-sheet.cover .toc a{padding:1.7mm 0}
+.pdf-bar{display:flex;align-items:center;gap:10px;margin:0 0 14px;padding:10px 14px;background:#fff;border:1px solid #d7dee3;border-radius:6px}
+.pdf-bar .pdf-link{padding:5px 12px;border:1px solid #9fb3b0;border-radius:4px;color:#234c49;text-decoration:none;font-size:13px}
+.pdf-bar .pdf-link:hover{background:#eef4f3}
 .report-sheet.cover .cover-lead{font-size:12pt;line-height:1.7;margin:4mm 0}
 .report-sheet.cover .metrics{margin:4mm 0}
 .report-sheet.cover .sheet-kicker{margin-bottom:5mm}
