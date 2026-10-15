@@ -29,11 +29,12 @@ AI_INPUT_DATASET = "birkman_ai_inputs"
 AI_REPORT_DATASET = "birkman_ai_reports_raw"
 ALLOWED_DOMAIN = "dwchem.co.kr"
 APP_TITLE = "버크만 팀 리포트"
-APP_VERSION = "2026-10-15.7"
+APP_VERSION = "2026-10-15.8"
 # 자료 확인 주기(초). 이 시간이 지나면 완료 기록(latest_success.json)만 다시 보고,
 # 집계가 바뀌지 않았으면 기존 자료를 그대로 씁니다. 화면을 자동으로 새로 그리지 않습니다.
 DATA_CACHE_SECONDS = 60
 SHOW_LEADER_ONLY_GROUPS = False  # False: 아래 직책자만 있는 조직(본부장 1명뿐인 본부 직속 등)은 보고서 목록에서 숨김
+MIN_REPORT_MEMBERS = 2       # 조직장을 뺀 진단 결과 보유자가 이 수보다 적으면 '보고서 생성 안 됨'으로 표시(목록에는 남김)
 LEADER_ONLY_TITLES = {"팀장", "파트장", "그룹장", "실장", "센터장", "본부장", "사장", "부사장", "공장장", "TFT장"}
 
 # --- 보고서를 볼 수 있는 사람 (조직장 자동 지정) ---
@@ -622,6 +623,12 @@ def visible_orgs(p, snap):
     return leader_scopes(p, snap)
 
 
+def report_member_count(snap,key):
+    """보고서에 반영되는 인원: 조직장을 뺀, 진단 결과가 있는 구성원 수"""
+    head_ids={txt(r.get("employee_id")) for r in org_head_rows(snap,key)}
+    return sum(1 for r in snap["members"].get(key,[]) if flag(r.get("analysis_eligible")) and txt(r.get("employee_id")) not in head_ids)
+
+
 def selectable_report_orgs(p,snap):
     """명부·집계는 보존하고 조직 선택 목록에서만 숨깁니다.
     본부·공장·그룹 직속이나 팀·파트·그룹 어디든, 구성원이 모두 상위 직책자(LEADER_ONLY_TITLES)이면
@@ -972,22 +979,18 @@ def score_table(rows,interest_stats,reference=None,names=True,leaders=(),head_wo
     head=html.Thead(html.Tr([html.Th("구성원" if names else "기준",className="name-cell")]+[html.Th(INTERESTS[k],style={"borderTop":"3px solid "+PALETTE[INTEREST_COLOR[k]]}) for k in INTEREST_ORDER]))
     body=[]
     if names:
-        for r in rows:
-            if not flag(r.get("analysis_eligible")):continue   # 결과 없는 사람은 '구성원 한눈에 보기'에 이름만 둡니다
+        # 조직장은 첫 줄에 같은 방식(색·상위 3 테두리)으로 표시하되, 아래 '우리 조직 평균'에는 넣지 않습니다.
+        # 결과 없는 사람은 '구성원 한눈에 보기'에 이름만 둡니다.
+        for r,is_head in [(r,True) for r in leaders]+[(r,False) for r in rows]:
+            if not flag(r.get("analysis_eligible")):continue
             vals={k:num(r.get("interest_"+k)) for k in INTERESTS}
             available=sorted((v for v in vals.values() if v is not None),reverse=True)
             threshold=available[min(2,len(available)-1)] if available else None
-            cells=[html.Td(txt(r.get("성명")),className="name-cell")]
+            cells=[html.Td([txt(r.get("성명")),html.Span(head_word,className="lead-tag") if is_head else None],className="name-cell")]
             for k in INTEREST_ORDER:
                 v=vals[k];alpha=.08+.82*(v or 0)/100
                 cells.append(html.Td("—" if v is None else "%g"%v,style={"background":tint(INTEREST_COLOR[k],alpha) if v is not None else "#f5f7f8","color":"white" if v is not None and v>=60 else "#243440"},className="top-score" if v is not None and threshold is not None and v>=threshold else ""))
-            body.append(html.Tr(cells))
-        # 조직장은 맨 아래 따로 표시하고 팀 평균에는 넣지 않습니다.
-        for r in leaders:
-            if not flag(r.get("analysis_eligible")):continue
-            vals={k:num(r.get("interest_"+k)) if flag(r.get("analysis_eligible")) else None for k in INTERESTS}
-            body.append(html.Tr([html.Td([txt(r.get("성명")),html.Span(" "+head_word,className="lead-tag")],className="name-cell")]+
-                [html.Td("—" if vals[k] is None else "%g"%vals[k]) for k in INTEREST_ORDER],className="leader-row"))
+            body.append(html.Tr(cells,className="leader-row" if is_head else None))
     foot=[]
     for label,stats,cls in [("우리 조직 평균",interest_stats,""),("전체 진단자 평균",reference,"reference-row")]:
         if stats is None:continue
@@ -1044,9 +1047,64 @@ def readable_text(text,cls=""):
     return html.Div([html.P(short,className=cls),html.Details([html.Summary("전체 설명 보기"),html.P(text)],className="evidence no-print") if short!=txt(text) else None])
 
 
+# 결과지 원문은 '~다', '~원함', '~할 때', '~한' 등 끝이 제각각이라 화면에서는 명사형(~함/~음/~임)으로 맞춥니다.
+NOUN_END_FIELDS = {"interest_personal_json", "usual_personal_json", "needs_personal_json", "stress_personal_json"}
+L_STEM_N = {"든": "듦", "논": "놂", "연": "엶", "산": "삶", "판": "팖", "운": "욺"}   # ㄹ 받침 동사의 'ㄴ다' 꼴
+NOUN_ENDING_HAN = {"권한", "기한", "제한", "시한", "무한", "한"}   # '~한'으로 끝나지만 원래 명사인 말
+
+
+def _with_final(syllable, final):
+    code = ord(syllable) - 0xAC00
+    return chr(0xAC00 + code - code % 28 + final)
+
+
+def _final(syllable):
+    code = ord(syllable) - 0xAC00
+    return code % 28 if 0 <= code < 11172 else -1
+
+
+def noun_end(text):
+    """'통찰력이 있다'→'통찰력이 있음', '위축된다'→'위축됨', '낙관적이다'→'낙관적임', '세밀한'→'세밀함'"""
+    t = txt(text).rstrip(" .")
+    if len(t) < 2:
+        return t
+    words = t.split(" ")
+    last = words[-1]
+    if last.endswith("다") and len(last) >= 2:
+        stem = last[:-1]
+        if stem.endswith("는") and len(stem) >= 2 and _final(stem[-2]) > 0:     # 먹는다 → 먹음
+            stem = stem[:-1]
+            new = stem + "음"
+        elif stem[-1] in L_STEM_N:                                               # 만든다·논다·연다 → 만듦·놂·엶 (ㄹ 받침 동사)
+            new = stem[:-1] + L_STEM_N[stem[-1]]
+        elif _final(stem[-1]) == 4 and len(stem) >= 2:                          # 한다·된다·진다 → 함·됨·짐
+            new = stem[:-1] + _with_final(stem[-1], 16)
+        elif _final(stem[-1]) == 0:                                              # 빠르다·하다·이다 → 빠름·함·임
+            new = stem[:-1] + _with_final(stem[-1], 16)
+        elif _final(stem[-1]) == 8:                                              # 만들다 → 만듦
+            new = stem[:-1] + _with_final(stem[-1], 10)
+        elif _final(stem[-1]) > 0:                                               # 있다·깊다 → 있음·깊음
+            new = stem + "음"
+        else:
+            return t
+        words[-1] = new
+    elif last.endswith("한") and len(last) >= 2 and last not in NOUN_ENDING_HAN:   # 세밀한 → 세밀함
+        words[-1] = last[:-1] + "함"
+    elif last.endswith("적인"):                                                      # 독립적인 → 독립적임
+        words[-1] = last[:-1] + "임"
+    elif last.endswith("된") and len(last) >= 2:                                     # 정리된 → 정리됨
+        words[-1] = last[:-1] + "됨"
+    return " ".join(words)
+
+
 def original_text(person,field,limit=None):
     vals=js(person.get(field),[])
     vals=[t for t in vals if isinstance(t,str) and txt(t)] if isinstance(vals,list) else []
+    if field in NOUN_END_FIELDS:
+        vals=list(dict.fromkeys(noun_end(t) for t in vals))
+        if field=="needs_personal_json":
+            # '~을 원함' 문장을 먼저, '~할 때' 문장은 뒤로
+            vals=sorted(vals,key=lambda t:t.endswith("때"))
     return vals[:limit] if limit is not None else vals
 
 
@@ -1204,8 +1262,11 @@ def name_label(r, nums, total):
     return ("%s " % nums[txt(r.get("employee_id"))] if total > 12 else "") + txt(r.get("성명"))
 
 
-def lines_of(person, field, limit, width=90):
-    return [brief(t, width) for t in original_text(person, field, limit)]
+def lines_of(person, field, limit, width=60):
+    """카드용: 길이가 width 이하인 원문을 앞에서부터 고르고, 모자라면 긴 원문을 줄여 채웁니다."""
+    vals = original_text(person, field)
+    short = [t for t in vals if len(t) <= width]
+    return (short + [brief(t, width) for t in vals if len(t) > width])[:limit]
 
 
 def josa(word, with_final, without_final):
@@ -1298,10 +1359,10 @@ def member_card(r, snap, head_word=""):
                     className="mc-syms")
     top_block = html.Div([svg_map([r], list(MAPS), labels=False, mini=True), syms], className="mc-top")
     n = color_of(r, "needs");guide = LEADER_GUIDE.get(n, {})
-    lines = [("끌리는 일", lines_of(person, "interest_personal_json", 2)),
-             ("일할 때", lines_of(person, "usual_personal_json", 2)),
-             ("대해 주세요", lines_of(person, "needs_personal_json", 2) or ([guide["treat"]] if guide else [])),
-             ("지치면", lines_of(person, "stress_personal_json", 2) or ([guide["signal"]] if guide else [])),
+    lines = [("흥미", lines_of(person, "interest_personal_json", 2)),
+             ("평소행동", lines_of(person, "usual_personal_json", 2)),
+             ("욕구", lines_of(person, "needs_personal_json", 2) or ([guide["treat"]] if guide else [])),
+             ("스트레스", lines_of(person, "stress_personal_json", 2) or ([guide["signal"]] if guide else [])),
              ("1:1 질문", [guide["question"]] if guide else [])]
     body = html.Div([html.Div([html.B(label), html.Span(" · ".join(vals))], className="mc-line") for label, vals in lines if vals], className="mc-lines")
     foot = []
@@ -1452,6 +1513,13 @@ def org_page(snap,p,key):
     head_rows=org_head_rows(snap,key);head_ids={txt(r.get("employee_id")) for r in head_rows}
     rows=[r for r in all_rows if txt(r.get("employee_id")) not in head_ids]
     team_eligible=sum(1 for r in rows if flag(r.get("analysis_eligible")))
+    if team_eligible<MIN_REPORT_MEMBERS:
+        # 한두 명짜리 보고서는 사실상 개인 결과지가 되므로 만들지 않습니다.
+        waiting=[txt(r.get("성명")) for r in sorted(rows,key=lambda r:txt(r.get("성명"))) if not flag(r.get("analysis_eligible"))]
+        return html.Div([html.H2(title+" · 보고서 생성 안 됨"),
+            html.P("%s을 제외한 진단 결과가 %s명 이상일 때 보고서를 만듭니다. 현재 %s명입니다."%(
+                {"team":"팀장","part":"파트장","group":"그룹장"}.get(org.get("org_level"),"조직장"),MIN_REPORT_MEMBERS,team_eligible)),
+            html.P("아직 진단 결과가 없는 구성원: "+", ".join(waiting),className="small") if waiting else None],className="panel")
     report,evidence,message=report_for(snap,key,"leader")
     nums=roster_number(rows)
     population=list(snap["people"].values());ref_interest=interest_stats_for(population)
@@ -1482,10 +1550,10 @@ def org_page(snap,p,key):
         if not tops or len(tops)>2:return ["여러 쪽으로 고르게 나뉩니다"] if tops else ["확인된 결과 없음"]
         cnt=next((q["count"] for q in stats["quadrants"] if q["color"]==tops[0]),0)
         return [" / ".join(COVER_GLANCE[kind][c] for c in tops),html.Span("%s명 중 %s%s명"%(stats["n"],"각 " if len(tops)>1 else "",cnt),className="glance-n")]
-    glance_rows=[("끌리는 일",glance("interest",interest_tops,interest_map)),
-                 ("평소 일하는 방식",glance("usual",usual_tops,usual)),
-                 ("바라는 대우",glance("needs",needs_tops,needs)),
-                 ("지쳤을 때",glance("stress",stress_tops,stress_map)),
+    glance_rows=[("흥미",glance("interest",interest_tops,interest_map)),
+                 ("평소행동",glance("usual",usual_tops,usual)),
+                 ("욕구",glance("needs",needs_tops,needs)),
+                 ("스트레스",glance("stress",stress_tops,stress_map)),
                  ("문제해결 방식",[ORIENT_SHORT[orient_top],html.Span("%s명 중 %s명"%(orient_n,orient_cnt[orient_top]),className="glance-n")] if orient_top else ["확인된 결과 없음"])]
     first_steps=[]
     if report:
@@ -1597,7 +1665,7 @@ def org_page(snap,p,key):
     sheets.append(sheet("흥미 점수 · 10개 영역","숫자·관리·과학 등 10개 영역의 0~100 점수입니다. 맵의 흥미(✱)와 함께 업무 배분·성장 대화에 참고하세요.",
         team_interest_explanation(interests,rank,unit_word)+[html.H3("영역별로 보기 · 같은 색끼리 묶음"),interest_area_table(rows,snap,interests,unit_word),
         html.Div([html.H3("구성원별 흥미 점수"),score_table(rows,interests,ref_interest,leaders=head_rows,head_word=head_word),
-        html.P("테두리는 각자의 상위 3개입니다. %s 점수는 맨 아래에 따로 두었고 %s 평균에 넣지 않았습니다."%(head_word,unit_word),className="small")],className="page-start")],"interest-score","08 · 흥미 점수"))
+        html.P("테두리는 각자의 상위 3개입니다. %s 점수는 첫 줄에 따로 두었고 %s 평균에는 넣지 않았습니다."%(head_word,unit_word),className="small")],className="page-start")],"interest-score","08 · 흥미 점수"))
 
     # ---------- 09 팀 운영 가이드 ----------
     coaching=[]
@@ -1760,7 +1828,7 @@ CSS += r"""
 .report-sheet p,.report-sheet li,.report-sheet td{text-wrap:pretty}
 .report-sheet .score-table td,.report-sheet .score-table th{word-break:normal;overflow-wrap:normal}
 .lead-tag{display:inline-block;font-size:7.5pt;font-weight:600;color:#234c49;background:#e3eeec;border-radius:2px;padding:0 1.5mm;margin-left:1.5mm;vertical-align:middle}
-.report-sheet .score-table .leader-row td{background:#fafbfc;color:#6a7781;border-top:2px dashed #c9d2d8}
+.report-sheet .score-table .leader-row td{border-bottom:2px solid #8a98a3}
 /* 구성원 카드: 2×2, 높이 고정 */
 .report-sheet .profile-grid.member-cards{grid-template-columns:1fr 1fr;gap:4mm}
 .report-sheet .member-card{height:var(--card-h,96mm);overflow:hidden;padding:3.2mm 3.5mm;display:flex;flex-direction:column;gap:2mm}
@@ -1772,8 +1840,9 @@ CSS += r"""
 .report-sheet .mc-syms{font-size:8pt;line-height:1.75}.report-sheet .mc-symrow{display:flex;align-items:center;gap:1mm;white-space:nowrap}
 .report-sheet .mc-sym{width:3.5mm;text-align:center}.report-sheet .mc-kind{width:12mm;color:#64727e}
 .report-sheet .mc-lines{display:flex;flex-direction:column;gap:1.4mm;flex:1;min-height:0}
-.report-sheet .mc-line{font-size:8.3pt;line-height:1.5;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.report-sheet .mc-line b{display:inline-block;min-width:15mm;color:#2d5a56;font-weight:600}
+.report-sheet .mc-line{font-size:8.3pt;line-height:1.5;display:grid;grid-template-columns:15mm 1fr;column-gap:1mm}
+.report-sheet .mc-line b{color:#2d5a56;font-weight:600}
+.report-sheet .mc-line span{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .report-sheet .mc-foot{font-size:7.3pt;color:#6a7781;border-top:1px solid var(--line);padding-top:1.4mm;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .report-sheet .mc-missing{margin-top:4mm}
 /* 07 조직지향점 */
@@ -2342,10 +2411,16 @@ def choices(_event,_expired,selected,nav_value):
         if not p:
             return blank
         keys=selectable_report_orgs(p,snap)
-        options=[{"label":snap["orgs"][k]["org_path_full"]+" · "+{"part":"파트","team":"팀","group":"그룹 전체"}.get(snap["orgs"][k]["org_level"],"직속"),"value":k} for k in sorted(keys,key=lambda k:snap["orgs"][k]["org_path_full"])]
+        # 인원이 모자라 보고서를 만들지 않는 조직도 목록에 남기되, 이유를 붙여 아래쪽에 둡니다.
+        counts={k:report_member_count(snap,k) for k in keys}
+        def org_option(k):
+            o=snap["orgs"][k];label=o["org_path_full"]+" · "+{"part":"파트","team":"팀","group":"그룹 전체"}.get(o["org_level"],"직속")
+            if counts[k]<MIN_REPORT_MEMBERS:label+=" · 보고서 생성 안 됨 (진단 결과 %s명)"%counts[k]
+            return {"label":label,"value":k}
+        options=[org_option(k) for k in sorted(keys,key=lambda k:(counts[k]<MIN_REPORT_MEMBERS,snap["orgs"][k]["org_path_full"]))]
         if selected not in keys:
             preferred=txt(p["person"].get("team_key")) or txt(p["person"].get("part_key"))
-            selected=preferred if preferred in keys else (options[0]["value"] if options else None)
+            selected=preferred if preferred in keys else (options[0]["value"] if options else None)   # 보고서가 있는 조직이 앞에 있음
         # 팀 보고서·구성원 상세는 조직장·인사 권한이 있을 때만. 팀원은 '내 결과'만 봅니다.
         nav=[{"label":"내 결과","value":"self"}]
         if keys:
