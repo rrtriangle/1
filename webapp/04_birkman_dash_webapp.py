@@ -29,7 +29,7 @@ AI_INPUT_DATASET = "birkman_ai_inputs"
 AI_REPORT_DATASET = "birkman_ai_reports_raw"
 ALLOWED_DOMAIN = "dwchem.co.kr"
 APP_TITLE = "버크만 팀 리포트"
-APP_VERSION = "2026-10-15.1"
+APP_VERSION = "2026-10-15.2"
 # 자료 확인 주기(초). 이 시간이 지나면 완료 기록(latest_success.json)만 다시 보고,
 # 집계가 바뀌지 않았으면 기존 자료를 그대로 씁니다. 화면을 자동으로 새로 그리지 않습니다.
 DATA_CACHE_SECONDS = 60
@@ -718,6 +718,7 @@ COLOR_TEXT = {"빨강":("행동", "빠르게 결정하고 실행해 눈에 보�
               "노랑":("분석", "절차·세부사항·규칙을 세워 신중하고 체계적으로 일하기"),
               "파랑":("생각", "새 아이디어와 장기적인 구상으로 문제 풀기"),
               "중앙선":("중앙선", "색의 경계에 위치")}
+MAP_TITLES_SHORT = {"interest":"흥미", "usual":"평소", "needs":"욕구", "stress":"스트레스"}
 MAP_TITLES = {"interest":"좋아하는 일", "usual":"남에게 보이는 모습", "needs":"바라는 대우", "stress":"지쳤을 때의 반응"}
 SYMBOLS = {"interest":"✱", "usual":"◆", "needs":"○", "stress":"□"}
 PALETTE.update({"빨강":"#971e2d", "초록":"#24754f", "노랑":"#d37820", "파랑":"#305faa"})
@@ -931,7 +932,7 @@ def guide_block():
         html.Div([html.Strong("○와 □는 한 쌍입니다.")," ○ 바라는 대우를 오래 받지 못하면 □ 같은 색의 스트레스 반응이 나올 수 있습니다. 평소행동(◆)만 보고 대하면 놓치기 쉬운 부분입니다."],className="read-tip")]
 
 
-def score_table(rows,interest_stats,reference=None,names=True):
+def score_table(rows,interest_stats,reference=None,names=True,leaders=(),head_word="조직장"):
     head=html.Thead(html.Tr([html.Th("구성원" if names else "기준",className="name-cell")]+[html.Th(INTERESTS[k],style={"borderTop":"3px solid "+PALETTE[INTEREST_COLOR[k]]}) for k in INTEREST_ORDER]))
     body=[]
     if names:
@@ -944,6 +945,11 @@ def score_table(rows,interest_stats,reference=None,names=True):
                 v=vals[k];alpha=.08+.82*(v or 0)/100
                 cells.append(html.Td("—" if v is None else "%g"%v,style={"background":tint(INTEREST_COLOR[k],alpha) if v is not None else "#f5f7f8","color":"white" if v is not None and v>=60 else "#243440"},className="top-score" if v is not None and threshold is not None and v>=threshold else ""))
             body.append(html.Tr(cells))
+        # 조직장은 맨 아래 따로 표시하고 팀 평균에는 넣지 않습니다.
+        for r in leaders:
+            vals={k:num(r.get("interest_"+k)) if flag(r.get("analysis_eligible")) else None for k in INTERESTS}
+            body.append(html.Tr([html.Td([txt(r.get("성명")),html.Span(" "+head_word,className="lead-tag")],className="name-cell")]+
+                [html.Td("—" if vals[k] is None else "%g"%vals[k]) for k in INTEREST_ORDER],className="leader-row"))
     foot=[]
     for label,stats,cls in [("우리 조직 평균",interest_stats,""),("전체 진단자 평균",reference,"reference-row")]:
         if stats is None:continue
@@ -1020,7 +1026,7 @@ def orientation_content(stats,personal=False):
         if set(vals)!=set(ORIENTATIONS) or any(num(v) is None or not 0<=num(v)<=1 for v in vals.values()):
             return [empty("이 항목의 결과는 아직 확인되지 않았습니다.")]
         entries=[(ORIENTATIONS[c],c,vals[c],"") for c in ORIENTATIONS]
-        note="결과지처럼 네 막대를 가운데 정렬했습니다. 가장 긴 막대를 기준으로 개인 안의 길이 관계를 재현한 것으로, 공식 점수나 서로 반대되는 양방향 척도가 아닙니다. 다른 사람과 길이의 절대값을 비교하지 않습니다."
+        note="결과지처럼 네 막대를 가운데 정렬했습니다. 막대가 길수록 그 환경에서 일하는 사람들과 비슷합니다."
     else:
         cats=stats.get("categories",[]);n=stats.get("n",0)
         if not n:return [empty("이 항목의 결과는 아직 확인되지 않았습니다.")]
@@ -1032,6 +1038,43 @@ def orientation_content(stats,personal=False):
         html.Div([html.Div([html.Span(label),html.Div(html.Div(className="orientation-fill",style={"width":"%.3f%%"%(max(0,min(1,num(v)))*100),"background":PALETTE[c]}),className="orientation-track orientation-centered"),html.Span(count,className="orientation-number")],className="orientation-row") for label,c,v,count in entries]),
         html.P(note,className="small"),html.P("맵과 같은 네 색을 사용하지만 측정하는 항목은 다릅니다. 조직지향점의 색을 맵의 욕구나 평소행동 색으로 바꾸어 읽지 않습니다.",className="small"),
         html.Div([html.Div([html.B([swatch(c),ORIENTATIONS[c]]),html.P(descriptions[c],className="small")],className="orientation-description") for c in ORIENTATIONS],className="orientation-descriptions")]
+
+
+ORIENT_DESC={"파랑":"기획·혁신·아이디어를 중시하는 환경","초록":"설득·교류·영향력 있는 소통을 중시하는 환경",
+             "빨강":"실행·현실적 접근·결과물을 중시하는 환경","노랑":"표준·일관성·절차를 중시하는 환경"}
+
+
+def orientation_mini(r, nums, n_rows):
+    """구성원 한 명의 조직지향점: 결과지처럼 네 막대를 가운데 정렬(개인 안에서 가장 긴 막대 = 100%)"""
+    vals=js(r.get("orientation_profile_json"),{}).get("relative_lengths",{})
+    top=orientation_top(r)
+    bars=[html.Div([html.Span(ORIENTATIONS[c].split("/")[0],className="om-label"+(" om-top" if c in top else "")),
+                    html.Div(html.Div(className="orientation-fill",style={"width":"%.1f%%"%(max(0,min(1,num(vals.get(c)) or 0))*100),"background":PALETTE[c]}),className="orientation-track orientation-centered om-track")],
+                   className="om-row") for c in ORIENTATIONS]
+    return html.Div([html.Div(name_label(r,nums,n_rows),className="om-name")]+bars,className="om-card")
+
+
+def team_orientation_content(rows, nums):
+    """07: 조직지향점이 무엇인지 → 구성원별 막대(가장 긴 막대가 같은 사람끼리) → 한 줄 요약"""
+    out=[html.Div([html.H3("조직지향점이란?"),
+        html.P("개인 결과지 마지막 장에 있는 항목입니다. 네 가지 근무환경에서 일하는 사람들과 얼마나 비슷한지를 막대 길이로 보여줍니다. "
+               "막대가 길수록 그 환경에서 편하게 일할 가능성이 높습니다. 실제 부서나 직무가 맞는지를 판단하는 점수는 아닙니다."),
+        html.Div([html.Div([html.B([swatch(c),ORIENTATIONS[c]]),html.Div(ORIENT_DESC[c],className="small")],className="orientation-description") for c in ORIENTATIONS],className="orientation-descriptions")],className="orient-intro")]
+    valid=[r for r in rows if orientation_top(r)]
+    if not valid:
+        return out+[empty("조직지향점 결과가 확인된 구성원이 없습니다.")]
+    groups=collections.defaultdict(list)
+    for r in sorted(valid,key=lambda r:txt(r.get("성명"))):
+        groups[orientation_top(r)[0]].append(r)   # 동률이면 첫 분야에 두고, 막대 이름을 함께 굵게 표시
+    out.append(html.P([html.B("가장 긴 막대 기준 · "),"  ".join("%s %s명"%(ORIENTATIONS[c],len(groups[c])) for c in ORIENTATIONS if groups.get(c))],className="om-summary"))
+    for c in sorted(ORIENTATIONS,key=lambda c:-len(groups.get(c,[]))):
+        if not groups.get(c):continue
+        out+=[html.H3([swatch(c),"%s 막대가 가장 긴 구성원 %s명"%(ORIENTATIONS[c],len(groups[c]))],className="om-group"),
+              html.Div([orientation_mini(r,nums,len(rows)) for r in groups[c]],className="profile-grid om-grid")]
+    missing=[name_label(r,nums,len(rows)) for r in rows if flag(r.get("analysis_eligible")) and not orientation_top(r)]
+    if missing:out.append(html.P("조직지향점 결과가 확인되지 않은 구성원: "+", ".join(missing),className="small"))
+    out.append(tip("우리 팀의 실제 업무는 네 환경 중 어디에 가까운가요? 가장 많은 환경과 다르다면 어떤 일에서 피로가 쌓이는지 살펴보세요."))
+    return out
 
 
 # ---------------------------------------------------------------------
@@ -1199,54 +1242,43 @@ def org_leader(snap, key):
     return valid[0] if valid else None
 
 
-def member_card(r, snap, leader=False):
-    """구성원 카드: 작은 맵 + 네 기호의 색 + 결과지 원문(평소·욕구·스트레스) + 1:1 질문"""
+def member_card(r, snap, head_word=""):
+    """구성원 카드(한 장에 4명): 이름 · 작은 맵 · 네 기호의 색 · 짧은 원문 · 1:1 질문"""
     person = snap["people"].get(txt(r.get("employee_id")), r)
     sub = " · ".join(filter(None, [txt(r.get("파트명")), txt(r.get("직책명"))]))
-    head = html.Div([html.Strong(txt(r.get("성명"))), html.Span(sub)], className="profile-head")
-    if not flag(r.get("analysis_eligible")):
-        return html.Div([head, html.P("진단 결과가 없습니다. 명단에는 포함되어 있습니다.", className="profile-status")], className="profile member-card")
-    u, n = color_of(r, "usual"), color_of(r, "needs")
-    top = interest_rank(interest_stats_for([person]))[:3]
-    colors = html.Div([html.Div([html.Span(SYMBOLS[k] + " " + ("스트레스" if k == "stress" else MAPS[k])),
-                                 html.Span([swatch(color_of(r, k)), color_label(r, k)])]) for k in MAPS], className="profile-colors")
-    left = html.Div([svg_map([r], list(MAPS), labels=False, mini=True), colors], className="card-left")
-    guide = LEADER_GUIDE.get(n, {})
-    interest_lines = lines_of(person, "interest_personal_json", 2)
-    usual_lines = lines_of(person, "usual_personal_json", 3)
-    needs_lines = lines_of(person, "needs_personal_json", 3) or ([guide["treat"]] if guide else [])
-    stress_lines = lines_of(person, "stress_personal_json", 2) or ([guide["signal"]] if guide else [])
-    questions = [guide["question"]] if guide else []
-    if u in FOUR_COLORS and n in FOUR_COLORS and u != n:
-        questions.append("평소 모습과 다르게, 어떤 방식으로 대해 줄 때 일하기 편한가요?")
+    head = html.Div([html.Strong(txt(r.get("성명"))), html.Span(head_word, className="lead-tag") if head_word else None,
+                     html.Span(sub, className="mc-sub")], className="mc-head")
+    syms = html.Div([html.Div([html.Span(SYMBOLS[k], className="mc-sym"), html.Span(MAP_TITLES_SHORT[k], className="mc-kind"),
+                               swatch(color_of(r, k)), html.Span(color_label(r, k), className="mc-color")], className="mc-symrow") for k in MAPS],
+                    className="mc-syms")
+    top_block = html.Div([svg_map([r], list(MAPS), labels=False, mini=True), syms], className="mc-top")
+    n = color_of(r, "needs");guide = LEADER_GUIDE.get(n, {})
+    lines = [("끌리는 일", lines_of(person, "interest_personal_json", 2)),
+             ("일할 때", lines_of(person, "usual_personal_json", 2)),
+             ("대해 주세요", lines_of(person, "needs_personal_json", 2) or ([guide["treat"]] if guide else [])),
+             ("지치면", lines_of(person, "stress_personal_json", 2) or ([guide["signal"]] if guide else [])),
+             ("1:1 질문", [guide["question"]] if guide else [])]
+    body = html.Div([html.Div([html.B(label), html.Span(" · ".join(vals))], className="mc-line") for label, vals in lines if vals], className="mc-lines")
+    foot = []
     orient = orientation_top(r)
-    rows_ = [("끌리는 활동", interest_lines), ("이렇게 일해요", usual_lines), ("이렇게 대해 주세요", needs_lines),
-             ("이런 모습이 보이면 욕구를 점검", stress_lines), ("다음 1:1 질문", questions)]
-    right = [html.P([html.B("한눈에 "), "흥미 %s · 평소 %s · 바라는 대우 %s" % (
-        color_label(r, "interest"), color_label(r, "usual"), color_label(r, "needs"))], className="card-summary")]
-    right += [html.P([html.B(label + " "), " · ".join(vals)]) for label, vals in rows_ if vals]
-    extra = []
-    if orient:
-        extra.append("편한 근무환경 " + " · ".join(ORIENTATIONS[c] for c in orient))
-    if top:
-        extra.append("흥미 점수 상위 " + " · ".join(INTERESTS[k] for k in top))
-    if extra:
-        right.append(html.P(" / ".join(extra), className="small"))
-    cls = "profile member-card" + (" leader-card" if leader else "")
-    return html.Div([head, html.Div([left, html.Div(right, className="card-right")], className="card-body")], className=cls)
+    if orient:foot.append("편한 환경 " + "·".join(ORIENTATIONS[c] for c in orient))
+    top = interest_rank(interest_stats_for([person]))[:3]
+    if top:foot.append("흥미 점수 상위 " + "·".join(INTERESTS[k] for k in top))
+    return html.Div([head, top_block, body, html.Div(" / ".join(foot), className="mc-foot") if foot else None],
+                    className="profile member-card" + (" leader-card" if head_word else ""))
 
 
-def member_cards(rows, org, snap):
-    """조직장 카드를 먼저, 나머지는 가나다순"""
-    ordered = sorted(rows, key=lambda r: (txt(r.get("성명")), txt(r.get("employee_id"))))
-    heads = {txt(r.get("employee_id")) for r in org_head_rows(snap, org["org_key"])}
-    leaders = [r for r in ordered if txt(r.get("employee_id")) in heads]
-    others = [r for r in ordered if txt(r.get("employee_id")) not in heads]
-    content = []
-    if leaders:
-        content += [html.H3("조직장"), html.Div([member_card(r, snap, True) for r in leaders], className="profile-grid member-cards")]
-    if others:
-        content += [html.H3("구성원 · 가나다순"), html.Div([member_card(r, snap) for r in others], className="profile-grid member-cards")]
+def member_cards(rows, head_rows, snap, head_word="조직장"):
+    """조직장 카드를 먼저(표시만 하고 팀 집계에는 넣지 않음), 나머지는 가나다순. 결과 없는 사람은 카드 없이 이름만."""
+    key = lambda r: (txt(r.get("성명")), txt(r.get("employee_id")))
+    head_ids = {txt(r.get("employee_id")) for r in head_rows}
+    cards = [member_card(r, snap, head_word) for r in sorted(head_rows, key=key) if flag(r.get("analysis_eligible"))]
+    cards += [member_card(r, snap) for r in sorted(rows, key=key) if flag(r.get("analysis_eligible"))]
+    missing = [txt(r.get("성명")) + (" (%s)" % head_word if txt(r.get("employee_id")) in head_ids else "")
+               for r in sorted(list(head_rows) + list(rows), key=key) if not flag(r.get("analysis_eligible"))]
+    content = [html.Div(cards, className="profile-grid member-cards")] if cards else [empty("진단 결과가 있는 구성원이 없습니다.")]
+    if missing:
+        content.append(html.P("진단 결과가 없는 구성원 %s명: " % len(missing) + ", ".join(missing), className="small mc-missing"))
     return content
 
 
@@ -1311,6 +1343,15 @@ def team_interest_explanation(stats,rank):
         html.P("이 수치는 관심의 크기이며 능력·성과 점수가 아닙니다. 팀 평균이 높더라도 구성원 모두의 흥미가 같다는 뜻은 아니므로, 실제 업무를 맡길 때는 개인의 관심도 함께 확인하세요.",className="small")]
 
 
+def interest_usual_gap(rows, nums):
+    """03 평소행동 페이지 끝: 흥미(✱)와 평소행동(◆)의 색이 다른 구성원 (평소행동을 읽은 뒤에 보여줍니다)"""
+    diff=[r for r in rows if color_of(r,"interest") in FOUR_COLORS and color_of(r,"usual") in FOUR_COLORS and color_of(r,"interest")!=color_of(r,"usual")]
+    if not diff:return []
+    return [html.H3("끌리는 일과 평소 방식이 다른 구성원 %s명"%len(diff)),
+            html.P(", ".join("%s(흥미 %s · 평소 %s)"%(name_label(r,nums,len(rows)),color_of(r,"interest"),color_of(r,"usual")) for r in diff)),
+            html.P("하고 싶은 일(흥미)과 실제로 일하는 방식(평소행동)이 다른 사람입니다. 업무를 맡길 때 흥미 쪽 일을 일부 섞어 주면 몰입에 도움이 됩니다.",className="small")]
+
+
 def team_interest_map_explanation(rows, nums):
     """맵 흥미(✱) 설명: 가장 많은 색과 그 활동, 흥미와 평소행동의 색이 다른 구성원. (흥미 10개 영역 점수는 쓰지 않음)"""
     stats=map_stats(rows,"interest")
@@ -1320,10 +1361,6 @@ def team_interest_map_explanation(rows, nums):
     out=[html.H3("우리 팀이 끌리는 활동"),
          html.P("흥미 좌표가 확인된 %s명 중 가장 많은 색은 %s입니다."%(stats["n"]," · ".join("%s %s명"%(q["color"],q["count"]) for q in tops))),
          html.Div([html.P([html.B(q["color"]+" — "),MAP_COLOR_HINTS["interest"][q["color"]]]) for q in tops])]
-    diff=[r for r in rows if color_of(r,"interest") in FOUR_COLORS and color_of(r,"usual") in FOUR_COLORS and color_of(r,"interest")!=color_of(r,"usual")]
-    if diff:
-        out.append(html.P([html.B("흥미와 평소행동의 색이 다른 구성원 %s명 · "%len(diff)),", ".join(name_label(r,nums,len(rows)) for r in diff),
-                           " — 끌리는 일과 평소 일하는 방식이 다릅니다. 업무를 맡길 때 흥미 쪽 일을 일부 섞어 주면 몰입에 도움이 됩니다."]))
     out.append(html.P("흥미는 하고 싶은 일이며, 잘하는 일과 같은 뜻은 아닙니다. 흥미 10개 영역의 점수는 08 흥미 점수에 있습니다.",className="small"))
     return out
 
@@ -1368,7 +1405,13 @@ def org_page(snap,p,key):
     → 참고자료(전체 진단자 비교, 번호표, 해설 전문)
     """
     if key not in visible_orgs(p,snap) or not can_detail(p,snap,key):return empty("조회할 조직을 선택하세요.")
-    org=snap["orgs"][key];rows=snap["members"][key];title=txt(org["org_name"])
+    org=snap["orgs"][key];title=txt(org["org_name"])
+    # 조직장(팀장·파트장 등)은 팀 분포·평균에 넣지 않고 따로 보여줍니다.
+    # 명부에서 직책명이 조직장이고 이 조직 명단에 있는 사람만 해당합니다(명부에 따라 없을 수 있음).
+    all_rows=snap["members"][key]
+    head_rows=org_head_rows(snap,key);head_ids={txt(r.get("employee_id")) for r in head_rows}
+    rows=[r for r in all_rows if txt(r.get("employee_id")) not in head_ids]
+    team_eligible=sum(1 for r in rows if flag(r.get("analysis_eligible")))
     report,evidence,message=report_for(snap,key,"leader")
     nums=roster_number(rows)
     population=list(snap["people"].values());ref_interest=interest_stats_for(population)
@@ -1386,7 +1429,7 @@ def org_page(snap,p,key):
     interest_map=map_stats(rows,"interest");interest_top,_=majority(interest_map)
     stress_map=map_stats(rows,"stress")
     stress_top,_=majority(stress_map)
-    summary="구성원 %s명의 버크만 결과를 모아, 팀이 끌리는 일과 일하는 방식, 바라는 대우를 정리했습니다."%org["analysis_count"]
+    summary="구성원 %s명의 버크만 결과를 모아, 팀이 끌리는 일과 일하는 방식, 바라는 대우를 정리했습니다."%team_eligible
     # 표지 '우리 팀 한눈에': 기호·색 이름 없이 말로만 씁니다(처음 보는 사람도 바로 읽도록).
     def glance(kind,top,stats):
         if not top:return ["고르게 나뉩니다"]
@@ -1407,7 +1450,7 @@ def org_page(snap,p,key):
     first_steps=list(dict.fromkeys(first_steps))[:3]
     anchors=[("read-guide","읽는 법"),("interest","팀이 끌리는 활동 · 흥미"),("usual","팀이 일하는 방식 · 평소행동"),("needs","팀이 바라는 환경 · 욕구"),
              ("differ","평소행동과 욕구가 다른 구성원"),("leader","리더와 구성원"),("orientation","편한 근무환경 · 조직지향점"),("interest-score","흥미 점수 · 10개 영역"),
-             ("coaching","팀 운영 가이드"),("profiles","구성원 한눈에 보기")]
+             ("coaching","팀 운영 가이드"),("profiles","구성원 한눈에 보기"),("comparison","참고 · 전체 진단자와 비교")]
     # 표지 하단: 먼저 해볼 일을 세 칸 카드로 가로 배치(왼쪽 아래 빈 공간이 생기지 않도록)
     first_box=html.Div([html.H3("%s이 먼저 해볼 일"%head_word),
         html.Div([html.Div([html.Span(str(i+1),className="step-no"),html.P(brief(t,120))],className="cover-step") for i,t in enumerate(first_steps)],className="cover-steps")
@@ -1415,7 +1458,7 @@ def org_page(snap,p,key):
     toc=html.Div([html.H3("보고서 차례")]+[html.A([html.Span(name),html.Span("—",className="toc-page")],href="#"+a,**{"data-report-link":a}) for a,name in anchors],className="toc")
     cover=sheet("",None,[html.Div([html.Span(style={"background":PALETTE[c]}) for c in FOUR_COLORS],className="cover-stripe"),
         html.Div([html.Span("BIRKMAN · TEAM REPORT"),html.Span("조직장 열람용")],className="sheet-kicker"),html.Div(txt(org.get("org_path")),className="cover-path"),html.H1(title),
-        html.Div([html.B("진단 반영 %s명"%org["analysis_count"])," / 구성원 %s명 · 기준 %s"%(org["member_count"],txt(snap["meta"].get("processed_at"))[:10])],className="cover-meta"),
+        html.Div([html.B("진단 반영 %s명"%team_eligible)," / 구성원 %s명"%len(rows)+(" · %s %s 별도"%(head_word," ".join(txt(r.get("성명")) for r in head_rows)) if head_rows else "")+" · 기준 %s"%txt(snap["meta"].get("processed_at"))[:10]],className="cover-meta"),
         html.P(brief(report["overview"],340) if report else summary,className="cover-lead"),
         html.Div([html.Div([html.H3("우리 팀 한눈에"),html.Dl([x for label,value in glance_rows for x in (html.Dt(label),html.Dd(value))],className="glance"),
                             html.P("가장 많은 사람 기준입니다. 자세한 분포와 명단은 본문에 있습니다.",className="small")],className="cover-glance"),toc],className="cover-bottom"),first_box,
@@ -1431,11 +1474,11 @@ def org_page(snap,p,key):
 
     # ---------- 02 흥미(맵 ✱) ----------
     sheets.append(sheet("팀이 끌리는 활동","흥미 ✱ · 어떤 종류의 활동에 마음이 끌리는지를 맵 위치로 보여줍니다.",
-        [tip("새 업무를 맡기거나 역할을 나눌 때 참고하세요. 흥미와 평소행동의 색이 다르면 끌리는 일과 일하는 방식이 다른 사람입니다."),map_section("interest")]+team_interest_map_explanation(rows,nums),"interest","02 · 흥미"))
+        [tip("새 업무를 맡기거나 역할을 나눌 때 참고하세요. 흥미는 하고 싶은 일이며, 잘하는 일과 같은 뜻은 아닙니다."),map_section("interest")]+team_interest_map_explanation(rows,nums),"interest","02 · 흥미"))
 
     # ---------- 03 평소행동 ----------
     sheets.append(sheet("팀이 일하는 방식","평소행동 ◆ · 일이 잘 풀릴 때 주변에서 보이는 업무 방식입니다.",
-        [tip("색별로 몇 명이 모였는지 보세요. 가운데 선에 가까운 사람은 이웃 색의 특징도 함께 가집니다."),map_section("usual")]+usual_pattern_text(rows)+team_usual_explanation(rows),"usual","03 · 평소행동"))
+        [tip("색별로 몇 명이 모였는지 보세요. 가운데 선에 가까운 사람은 이웃 색의 특징도 함께 가집니다."),map_section("usual")]+usual_pattern_text(rows)+team_usual_explanation(rows)+interest_usual_gap(rows,nums),"usual","03 · 평소행동"))
 
     # ---------- 03 욕구·스트레스 ----------
     display,info=paired_map_rows(rows)
@@ -1486,25 +1529,20 @@ def org_page(snap,p,key):
         for c in FOUR_COLORS:
             who=[name_label(r,nums,len(rows)) for r in sorted(rows,key=lambda r:txt(r.get("성명"))) if color_of(r,"needs")==c]
             if who:groups.append({"needs":c+" · "+COLOR_TEXT[c][0],"who":", ".join(who),"check":LEADER_SELF_CHECK[c]})
-        leadbody=[tip("%s 본인의 결과가 아직 없어, 구성원이 바라는 대우를 기준으로 스스로 점검하는 표를 드립니다. %s이 진단을 받으면 이 페이지에 %s의 평소 방식과 구성원의 바라는 대우를 맞댄 비교가 나옵니다."%(head_word,head_word,head_word)),
+        why=("%s 본인의 결과가 아직 없어,"%head_word) if head_rows else ("이 %s 명단에서 직책명이 '%s'인 사람을 찾지 못해,"%({"team":"팀","part":"파트"}.get(org.get("org_level"),"조직"),head_word))
+        leadbody=[tip(why+" 구성원이 바라는 대우를 기준으로 스스로 점검하는 표를 드립니다. %s이 진단을 받으면 평소 방식과 구성원의 바라는 대우를 맞댄 비교로 바뀝니다."%head_word),
                   table([("needs","바라는 대우 ○"),("who","구성원"),("check","스스로 점검해 볼 것")],groups) if groups else empty("욕구 결과가 확인된 구성원이 없습니다.")]
     sheets.append(sheet("리더와 구성원","%s의 평소 방식이 구성원이 바라는 대우와 얼마나 가까운지 봅니다."%head_word,leadbody,"leader","06 · 리더와 구성원"))
 
-    # ---------- 06 조직지향점 ----------
-    groups=collections.defaultdict(list)
-    for r in rows:
-        for c in orientation_top(r):groups[c].append(name_label(r,nums,len(rows)))
-    orientbody=orientation_content(orientation)
-    if groups:
-        orientbody.append(html.Div([html.H3("분야별 구성원 · 가장 긴 막대 기준")]+[html.P([swatch(c),html.B(ORIENTATIONS[c]+" "),", ".join(groups[c])]) for c in ORIENTATIONS if groups.get(c)]))
-    orientbody.append(tip("우리 팀의 실제 업무는 네 환경 중 어디에 가까운가요? 가장 많은 환경과 다르다면 어떤 일에서 피로가 쌓이는지 살펴보세요."))
-    sheets.append(sheet("편한 근무환경 · 조직지향점","네 가지 근무환경에서 일하는 사람들과 얼마나 비슷한지를 보여줍니다.",orientbody,"orientation","07 · 조직지향점"))
+    # ---------- 07 조직지향점 ----------
+    sheets.append(sheet("편한 근무환경 · 조직지향점","개인 결과지의 조직지향점 막대를 구성원별로 모아 보았습니다.",
+        team_orientation_content(rows,nums),"orientation","07 · 조직지향점"))
 
     # ---------- 08 흥미 점수 · 10개 영역 (맵의 흥미를 보완하는 본문 자료) ----------
     sheets.append(sheet("흥미 점수 · 10개 영역","숫자·관리·과학 등 10개 영역의 0~100 점수입니다. 맵의 흥미(✱)와 함께 업무 배분·성장 대화에 참고하세요.",
         team_interest_explanation(interests,rank)+[html.H3("영역별로 보기 · 같은 색끼리 묶음"),interest_area_table(rows,snap,interests),
-        html.H3("구성원별 흥미 점수"),score_table(rows,interests,ref_interest),
-        html.P("짙을수록 관심이 높습니다. 테두리는 각자의 상위 3개이며 동점은 함께 표시합니다. —는 확인된 점수 없음. 전체 진단자 평균은 현재 명부에 연결된 유효 점수 기준입니다.",className="small")],"interest-score","08 · 흥미 점수"))
+        html.H3("구성원별 흥미 점수"),score_table(rows,interests,ref_interest,leaders=head_rows,head_word=head_word),
+        html.P("짙을수록 관심이 높습니다. 테두리는 각자의 상위 3개입니다. —는 결과 없음. %s 점수는 맨 아래에 따로 두었고 팀 평균에는 넣지 않았습니다."%head_word,className="small")],"interest-score","08 · 흥미 점수"))
 
     # ---------- 09 팀 운영 가이드 ----------
     coaching=[]
@@ -1530,8 +1568,8 @@ def org_page(snap,p,key):
     sheets.append(sheet("팀 운영 가이드","회의·피드백·업무 지시·공지에서 바로 시도할 방법입니다.",coaching,"coaching","09 · 팀 운영"))
 
     # ---------- 10 구성원 한눈에 보기 ----------
-    sheets.append(sheet("구성원 한눈에 보기","조직장을 먼저, 나머지는 가나다순입니다. 결과지 원문을 짧게 발췌했고, 전문은 '구성원 상세'에서 봅니다.",
-        member_cards(rows,org,snap),"profiles","10 · 구성원"))
+    sheets.append(sheet("구성원 한눈에 보기","조직장을 먼저, 나머지는 가나다순입니다. 원문을 짧게 줄였고, 전문은 '구성원 상세'에서 봅니다.",
+        member_cards(rows,head_rows,snap,head_word),"profiles","10 · 구성원"))
 
     comparison=[tip("우리 조직과 전체 진단자의 색 분포를 비교합니다. 색의 많고 적음 자체가 좋고 나쁨을 뜻하지는 않습니다.")]
     for k in ["interest","usual","needs"]:
@@ -1657,6 +1695,38 @@ CSS += r"""
 .report-sheet .interest-row{grid-template-columns:62mm 1fr 12mm}.report-sheet .interest-row .small{font-size:7.5pt;line-height:1.4}
 .report-sheet .interest-group-row{grid-template-columns:42mm 1fr 12mm}
 .color-names-inline{color:#333}
+/* 줄바꿈: 한국어 단어 중간에서 끊지 않기 */
+.report-sheet{word-break:keep-all;overflow-wrap:anywhere}.report-sheet h1,.report-sheet h2,.report-sheet h3{text-wrap:balance}
+.report-sheet p,.report-sheet li,.report-sheet td{text-wrap:pretty}
+.report-sheet .score-table td,.report-sheet .score-table th{word-break:normal;overflow-wrap:normal}
+.lead-tag{display:inline-block;font-size:7.5pt;font-weight:600;color:#234c49;background:#e3eeec;border-radius:2px;padding:0 1.5mm;margin-left:1.5mm;vertical-align:middle}
+.report-sheet .score-table .leader-row td{background:#fafbfc;color:#6a7781;border-top:2px dashed #c9d2d8}
+/* 구성원 카드: 2×2, 높이 고정 */
+.report-sheet .profile-grid.member-cards{grid-template-columns:1fr 1fr;gap:4mm}
+.report-sheet .member-card{height:var(--card-h,96mm);overflow:hidden;padding:3.2mm 3.5mm;display:flex;flex-direction:column;gap:2mm}
+.report-sheet .member-card.leader-card{border-color:#7fa29e;border-width:1.5px}
+.report-sheet .mc-head{display:flex;align-items:baseline;gap:1.5mm;border-bottom:1px solid var(--line);padding-bottom:1.6mm}
+.report-sheet .mc-head strong{font-size:11.5pt}.report-sheet .mc-sub{margin-left:auto;font-size:7.5pt;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45mm}
+.report-sheet .mc-top{display:grid;grid-template-columns:24mm 1fr;gap:3mm;align-items:center}
+.report-sheet .mc-top .birkman-map{width:24mm;height:24mm!important;margin:0}
+.report-sheet .mc-syms{font-size:8pt;line-height:1.75}.report-sheet .mc-symrow{display:flex;align-items:center;gap:1mm;white-space:nowrap}
+.report-sheet .mc-sym{width:3.5mm;text-align:center}.report-sheet .mc-kind{width:12mm;color:#64727e}
+.report-sheet .mc-lines{display:flex;flex-direction:column;gap:1.4mm;flex:1;min-height:0}
+.report-sheet .mc-line{font-size:8.3pt;line-height:1.5;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.report-sheet .mc-line b{display:inline-block;min-width:15mm;color:#2d5a56;font-weight:600}
+.report-sheet .mc-foot{font-size:7.3pt;color:#6a7781;border-top:1px solid var(--line);padding-top:1.4mm;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.report-sheet .mc-missing{margin-top:4mm}
+/* 07 조직지향점 */
+.report-sheet .orient-intro{background:#f5f7f9;padding:3.5mm 4mm;margin-bottom:4mm}.report-sheet .orient-intro h3{margin-top:0}
+.report-sheet .orient-intro p{font-size:9pt}.report-sheet .orientation-descriptions{display:grid;grid-template-columns:1fr 1fr;gap:1.5mm 6mm}
+.report-sheet .om-summary{font-size:9.5pt}
+.report-sheet .om-group{display:flex;align-items:center;gap:1.5mm;font-size:10.5pt;margin:4mm 0 2mm}
+.report-sheet .profile-grid.om-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:2.5mm}
+.report-sheet .om-card{border:1px solid var(--line);padding:2mm 2.5mm}
+.report-sheet .om-name{font-size:8.5pt;font-weight:600;margin-bottom:1mm;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.report-sheet .om-row{display:grid;grid-template-columns:8mm 1fr;align-items:center;gap:1mm;margin:.6mm 0}
+.report-sheet .om-label{font-size:6.8pt;color:#7a8791}.report-sheet .om-label.om-top{color:#1f2d36;font-weight:700}
+.report-sheet .om-track{height:2.6mm;background:#f1f4f7}
 .report-sheet .cover-stripe{display:flex;height:2.2mm;margin:-6mm 0 8mm}.report-sheet .cover-stripe span{flex:1}
 .report-sheet .glance{margin:0;display:grid;grid-template-columns:34mm 1fr;border-top:2px solid #263746}
 .report-sheet .glance dt,.report-sheet .glance dd{margin:0;padding:2.6mm 0;border-bottom:1px solid var(--line);font-size:9.5pt;line-height:1.55}
@@ -1680,13 +1750,6 @@ CSS += r"""
 .report-sheet .cover-step{background:#f2f5f7;border-top:3px solid #234c49;padding:3mm 3.5mm}
 .report-sheet .cover-step p{font-size:9pt;line-height:1.6;margin:1.5mm 0 0}
 .report-sheet .step-no{display:inline-block;width:6mm;height:6mm;line-height:6mm;text-align:center;border-radius:50%;background:#234c49;color:#fff;font-size:8.5pt;font-weight:bold}
-.report-sheet .profile-grid.member-cards{grid-template-columns:1fr;gap:3.5mm}
-.report-sheet .member-card .card-body{display:grid;grid-template-columns:34mm 1fr;gap:4mm;margin-top:2.5mm}
-.report-sheet .member-card .card-left .birkman-map{width:30mm;height:30mm!important;margin:0 0 2mm}
-.report-sheet .member-card .profile-colors{font-size:8pt}
-.report-sheet .member-card .card-right p{font-size:9pt;line-height:1.6;margin:0 0 1.6mm}
-.report-sheet .member-card .card-summary{background:#f2f5f7;padding:1.5mm 2.5mm}
-.report-sheet .member-card.leader-card{border-color:#9fb5b3}
 """
 # 기본 Dataiku URL/자산 설정을 유지하면서 인쇄용 CSS만 삽입합니다.
 if AUTH_MODE == "preview":
