@@ -38,7 +38,7 @@ PACKAGE_INSTALL_TIMEOUT = 300  # 다운로드/설치 전체 제한 시간(초)
 PDF_SELECTION = {}
 
 # 판독 방식이 달라지면 버전을 변경하여 과거 추출 캐시와 자동으로 구분합니다.
-PARSER_VERSION = "2026-10-08.2"
+PARSER_VERSION = "2026-10-15.1"   # 기호·조직지향점 판독 보강. 바뀌면 모든 PDF를 한 번 다시 읽습니다.
 
 # =====================================================================
 # 2. 도구와 자동 설치: 이미 설치된 PyMuPDF는 재설치하지 않습니다.
@@ -231,20 +231,26 @@ def map_bounds(page, drawings):
 
 
 def symbol_kind(d):
-    """별/다이아몬드/원/사각형을 도형의 선과 곡선으로 구분합니다."""
+    """별/다이아몬드/원/사각형을 도형의 선과 곡선으로 구분합니다.
+
+    같은 모양도 PDF를 만든 프로그램에 따라 그리는 방식이 다릅니다.
+    사각형: 're' 한 개, 'qu' 한 개, 또는 가로·세로 선 3~5개(닫힌 경로는 마지막 선이 생략될 수 있음)
+    마름모: 기울어진 선 3~5개 / 원: 곡선 4개 이상 / 별: 선 8개 이상
+    """
     items = d["items"]
     ops = [v[0] for v in items]
     if len(items) >= 8 and all(o == "l" for o in ops):
         return "interest"
-    if len(items) == 4 and all(o == "c" for o in ops):
+    if len(items) >= 4 and all(o == "c" for o in ops):
         return "needs"
-    if len(items) == 1 and ops == ["re"]:
+    if ops in (["re"], ["qu"]):
         return "stress"
-    if len(items) == 4 and all(o == "l" for o in ops):
-        axis = [abs(v[1].x-v[2].x) < 0.1 or abs(v[1].y-v[2].y) < 0.1 for v in items]
-        if all(axis):
+    if 3 <= len(items) <= 5 and all(o == "l" for o in ops):
+        lines = [v for v in items if abs(v[1].x-v[2].x) + abs(v[1].y-v[2].y) > 0.05]
+        axis = [abs(v[1].x-v[2].x) < 0.1 or abs(v[1].y-v[2].y) < 0.1 for v in lines]
+        if lines and all(axis):
             return "stress"
-        if not any(axis):
+        if lines and not any(axis):
             return "usual"
     return None
 
@@ -260,12 +266,14 @@ def symbols_in_map(drawings, box):
                 0.65 < r.width / max(r.height, 0.001) < 1.45):
             continue
         cx, cy = (r.x0+r.x1)/2, (r.y0+r.y1)/2
-        if not (box.x0-0.1 <= cx <= box.x1+0.1 and box.y0-0.1 <= cy <= box.y1+0.1):
+        # 맵 끝에 있는 기호는 중심이 테두리에 걸리거나 살짝 넘을 수 있습니다(맵 크기의 3%까지 허용).
+        mx, my = box.width*0.03, box.height*0.03
+        if not (box.x0-mx <= cx <= box.x1+mx and box.y0-my <= cy <= box.y1+my):
             continue
         kind = symbol_kind(d)
         if kind:
-            x = 2 * (cx-box.x0)/box.width - 1
-            y = 1 - 2 * (cy-box.y0)/box.height
+            x = max(-1.0, min(1.0, 2 * (cx-box.x0)/box.width - 1))
+            y = max(-1.0, min(1.0, 1 - 2 * (cy-box.y0)/box.height))
             record = {"x": round(x, 6), "y": round(y, 6),
                       "pdf_center": [round(cx, 3), round(cy, 3)],
                       "map_rect": [round(v, 3) for v in box]}
@@ -368,40 +376,43 @@ def extract_strengths(page, rows):
     return result
 
 
+ORIENTATION_LABEL = re.compile(r"^(빨강|초록|노랑|파랑)\s*[-–—－:·]?\s*(기획|영업|운영|관리)")
+
+
 def extract_orientation(page, rows, drawings):
     """네 막대를 같은 표 안에서 읽습니다. 길이는 PDF 단위이며 공식 점수가 아닙니다.
 
-    짧은 막대도 실제 결과일 수 있어 가로/세로 비율로 제외하지 않습니다.
-    대신 같은 행·색상·중심·높이를 대조합니다. 안 보이는 막대를 0으로 채우지 않습니다.
+    - 표의 네 이름표(빨강-운영/기술 등)는 색마다 가장 위에 있는 것을 씁니다.
+      아래쪽 '색상별 조직지향점' 설명 칸의 같은 이름은 자연히 제외됩니다.
+    - 막대는 이름표와 같은 줄, 이름표 오른쪽에 있는 같은 색 도형입니다.
+      한 막대가 여러 조각으로 그려졌거나 중복 그려졌으면 합쳐서 한 막대로 봅니다.
+    - 안 보이는 막대를 0으로 채우지 않습니다.
     """
-    cutoff = next((r["rect"].y0 for r in rows if compact(r["text"]) == "색상별조직지향점"), None)
-    if cutoff is None:
-        return {}
-    labels = [r for r in rows if r["rect"].y0 < cutoff and
-              re.match(r"^(빨강|초록|노랑|파랑)\s*[-–—－]", r["text"])]
-    if len(labels) != 4 or len({r["text"][:2] for r in labels}) != 4:
+    labels = {}
+    for r in sorted(rows, key=lambda z: z["rect"].y0):
+        m = ORIENTATION_LABEL.match(compact(r["text"]))
+        if m and m.group(1) not in labels:
+            labels[m.group(1)] = r
+    if len(labels) != 4:
         return {}
     bars = {}
-    for label in labels:
-        color = label["text"][:2]
+    for color, label in labels.items():
         lr = label["rect"]
         cy = (lr.y0+lr.y1)/2
-        ds = [d for d in drawings if color_of(d.get("fill")) == color and
-              d["rect"].x0 > page.rect.width*0.40 and d["rect"].y1 < cutoff and
+        ds = [d["rect"] for d in drawings if color_of(d.get("fill")) == color and
+              d["rect"].x0 >= lr.x1 and
               abs((d["rect"].y0+d["rect"].y1)/2-cy) < page.rect.height*0.02 and
               d["rect"].width > 0 and 0 < d["rect"].height < page.rect.height*0.06]
-        # 같은 사각형을 중복 그린 PDF도 한 막대로 처리합니다.
-        ds = list({tuple(round(v, 2) for v in d["rect"]): d for d in ds}.values())
-        if len(ds) != 1:
+        if not ds:
             return {}
-        r = ds[0]["rect"]
-        bars[color] = {"label": label["text"], "pdf_rect": [round(v, 3) for v in r]}
-    if len(bars) != 4:
-        return {}
+        r = fitz.Rect(ds[0])
+        for extra in ds[1:]:
+            r |= extra
+        bars[color] = {"label": label["text"], "pdf_rect": [round(v, 3) for v in r], "pieces": len(ds)}
     rects = [fitz.Rect(v["pdf_rect"]) for v in bars.values()]
     centers = [(r.x0+r.x1)/2 for r in rects]
     heights = [r.height for r in rects]
-    if max(centers)-min(centers) > page.rect.width*0.005 or max(heights)/min(heights) > 1.2:
+    if max(centers)-min(centers) > page.rect.width*0.01 or max(heights)/min(heights) > 1.3:
         return {}
     return {"method": "vector_geometry_only", "bars": bars,
             "note": "원본 막대 도형. 공식 점수가 아님. 개인 내 길이 비교와 최상위 분야 인원 집계에 사용."}
@@ -445,7 +456,7 @@ def extract_pdf(pdf_bytes):
             need_map = detail or ("버크만맵" in t and all(w in t for w in ("과제지향", "사람지향")))
             need_interests = "버크만흥미" in t and len(re.findall(r"\d{1,3}%", t)) >= 10
             need_strengths = "버크만인사이트" in t and "강점" in t
-            need_orientation = "조직지향점" in t and "직무분야종사자와의유사성" in t
+            need_orientation = "조직지향점" in t and ("유사성" in t or "유사정도" in t)
             if not any((need_map, need_interests, need_strengths, need_orientation)):
                 continue
             rows = lines_on_page(page)
@@ -456,6 +467,9 @@ def extract_pdf(pdf_bytes):
                 if detail:
                     desc = detail_text(page, rows, box, detail)
                     candidates = symbols.get(detail, [])
+                    # 거의 같은 자리(맵의 1% 이내)에 두 번 그린 기호는 하나로 봅니다.
+                    if len(candidates) > 1 and all(math.hypot(c["x"]-candidates[0]["x"], c["y"]-candidates[0]["y"]) < 0.02 for c in candidates):
+                        candidates = candidates[:1]
                     if len(candidates) == 1:
                         record = dict(candidates[0], page=number, description=desc,
                                       method="detail_page_vector")
@@ -481,22 +495,40 @@ def extract_pdf(pdf_bytes):
                     out["orientation"] = dict(orientation, page=number)
         for k in MAP_KINDS:
             choices = map_candidates[k]
+            summaries = overview_candidates[k]
+            if len(choices) > 1 and all(math.hypot(c["x"]-choices[0]["x"], c["y"]-choices[0]["y"]) < 0.02 for c in choices):
+                choices = choices[:1]
             if len(choices) != 1:
-                out["issues"].append(issue("MAP_MISSING", MAP_KINDS[k]+" 상세 맵을 확정하지 못했습니다.")); continue
-            chosen = choices[0]
+                # 상세 맵을 못 읽었어도 전체 맵에서 한 위치로 확정되면 그 좌표를 씁니다(설명 원문은 없음).
+                spots = {(round(s["x"], 2), round(s["y"], 2)) for s in summaries}
+                if not choices and summaries and len(spots) == 1:
+                    chosen = dict(summaries[0], method="overview_page_vector", overview_check="overview_only",
+                                  description={"intro": "", "personal": [], "general": [], "reported_color": ""})
+                    out["issues"].append(issue("MAP_OVERVIEW_ONLY", MAP_KINDS[k]+" 상세 맵 대신 전체 맵의 위치를 사용했습니다.", level="info", page=chosen["page"]))
+                else:
+                    out["issues"].append(issue("MAP_MISSING", MAP_KINDS[k]+" 상세 맵을 확정하지 못했습니다.")); continue
+            else:
+                chosen = choices[0]
             q = geometric_color(chosen["x"], chosen["y"])
             reported = chosen["description"]["reported_color"]
             if reported and q != "경계" and q != reported:
-                out["issues"].append(issue("MAP_COLOR_CONFLICT", MAP_KINDS[k]+" 좌표와 원문 색상 설명이 다릅니다.", page=chosen["page"])); continue
-            summaries = overview_candidates[k]
-            if summaries:
-                if any(math.hypot(chosen["x"]-s["x"], chosen["y"]-s["y"]) > 0.02 for s in summaries):
-                    out["issues"].append(issue("MAP_OVERVIEW_CONFLICT", MAP_KINDS[k]+" 전체 맵과 상세 맵의 위치가 다릅니다.", page=chosen["page"])); continue
-                chosen["overview_check"] = "matched"
-                chosen["overview_pages"] = [s["page"] for s in summaries]
-            else:
-                chosen["overview_check"] = "unavailable"
-                out["issues"].append(issue("MAP_OVERVIEW_UNAVAILABLE", MAP_KINDS[k]+" 상세 맵만 사용했습니다. 전체 맵 대조는 불가합니다.", level="info"))
+                near_axis = abs(chosen["x"]) < 0.10 or abs(chosen["y"]) < 0.10
+                if near_axis:
+                    # 가운데 선 가까이에서는 기호 그림의 중심과 원문 색이 엇갈릴 수 있습니다. 좌표는 두고 색은 원문을 따릅니다.
+                    out["issues"].append(issue("MAP_COLOR_NEAR_AXIS", MAP_KINDS[k]+" 가운데 선 근처라 색은 원문 설명(%s)을 따랐습니다." % reported, level="info", page=chosen["page"]))
+                    q = reported
+                else:
+                    out["issues"].append(issue("MAP_COLOR_CONFLICT", MAP_KINDS[k]+" 좌표와 원문 색상 설명이 다릅니다.", page=chosen["page"])); continue
+            if chosen.get("overview_check") != "overview_only":
+                if summaries:
+                    far = max(math.hypot(chosen["x"]-s["x"], chosen["y"]-s["y"]) for s in summaries)
+                    chosen["overview_check"] = "matched" if far <= 0.05 else "differs"
+                    chosen["overview_pages"] = [s["page"] for s in summaries]
+                    if far > 0.05:
+                        # 전체 맵은 겹치는 기호를 조금 비켜 그리기도 합니다. 상세 맵 좌표를 그대로 씁니다.
+                        out["issues"].append(issue("MAP_OVERVIEW_DIFFERS", MAP_KINDS[k]+" 전체 맵 위치와 차이가 있어 상세 맵 좌표를 사용했습니다.", level="info", page=chosen["page"]))
+                else:
+                    chosen["overview_check"] = "unavailable"
             chosen["quadrant"] = q
             out["maps"][k] = chosen
         if len(interest_candidates) == 1:
@@ -564,15 +596,16 @@ def prepare_roster(records, schema):
         r["part_key"] = org_key("part", ancestry+[("파트명", r["파트명"])]) if r["파트명"] else ""
         r["org_path"] = " > ".join(r[c] for c in ("본부명", "그룹명", "팀명", "파트명") if r[c])
         r["org_path_full"] = " > ".join(v for _, v in ancestry+[("파트명", r["파트명"])] if v)
-        r["org_status"] = "resolved" if r["team_key"] else "team_unassigned"
+        r["org_status"] = "resolved" if (r["team_key"] or r["part_key"]) else "team_unassigned"
         r["leader_candidate"] = {"팀장": "team_leader", "파트장": "part_leader"}.get(r["직책명"], "member")
         # leader_candidate는 관리자 설정의 참고값일 뿐 실제 권한을 부여하지 않습니다.
         if not r["identity_ok"]:
             issues.append(issue("MASTER_ID_INVALID", "사번 또는 성명이 비어 있거나 사번 형식이 잘못되었습니다.", r["employee_id"]))
         if not r["email_mapping_ok"]:
             issues.append(issue("EMAIL_INVALID", "회사 이메일이 비어 있거나 형식/도메인을 확인해야 합니다.", r["employee_id"]))
-        if not r["team_key"]:
-            issues.append(issue("TEAM_UNASSIGNED", "팀명이 없습니다. 상위 직책자/직속 조직인지 확인하세요.", r["employee_id"], level="info"))
+        if not r["team_key"] and not r["part_key"]:
+            # 팀 없이 그룹 바로 아래 있는 파트는 정상입니다. 팀·파트가 모두 없을 때만 알립니다(그룹 직속 등).
+            issues.append(issue("TEAM_UNASSIGNED", "팀명과 파트명이 모두 없습니다. 그룹 직속 등으로 집계합니다.", r["employee_id"], level="info"))
         if r["재직상태"] not in ("재직", "휴직"):
             issues.append(issue("EMPLOYMENT_STATUS_UNKNOWN", "재직상태 값이 재직/휴직 이외입니다.", r["employee_id"]))
         rows.append(r)
