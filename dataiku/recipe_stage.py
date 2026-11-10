@@ -27,11 +27,11 @@ except Exception:  # noqa: BLE001
 
 rows = []
 if ROSTER_DATASET:
-    df = dataiku.Dataset(ROSTER_DATASET).get_dataframe()
+    df = dataiku.Dataset(ROSTER_DATASET).get_dataframe(**flow.READ_OPTS)
     rows += flow.stage_dataframe(df, ROSTER_DATASET, "roster", v.get("hrli_roster_file_type", "full"), user,
                                  month=v.get("hrli_roster_month"))
 if TRAINING_DATASET:
-    df = dataiku.Dataset(TRAINING_DATASET).get_dataframe()
+    df = dataiku.Dataset(TRAINING_DATASET).get_dataframe(**flow.READ_OPTS)
     rows += flow.stage_dataframe(df, TRAINING_DATASET, "training", v.get("hrli_training_file_type", "full"), user)
 
 log = pd.DataFrame(rows, columns=["source", "kind", "month", "rows", "batch_id", "status", "note"])

@@ -1,8 +1,23 @@
 # Dataiku DSS 설치·운영 안내
 
-Dataiku DSS 14 기준으로 작성했다. **개발 환경에 Dataiku가 없어 실제 DSS에서는 실행해 보지 못했다.**
-로컬에서는 Dataiku처럼 미리 만든 Dash 앱을 하위 경로에 띄우고, Dataiku 로그인 확인만 흉내 내서 동작을 확인했다.
+Dataiku DSS 14 기준으로 작성했다. Dataiku 공식 문서(doc.dataiku.com의 DSS 14 문서, developer.dataiku.com)와 대조해
+아래 "문서 확인 결과"의 항목을 확인했다. **다만 실제 DSS에서는 아직 실행해 보지 못했다.** 로컬에서는 Dataiku처럼 미리 만든
+Dash 앱을 하위 경로에 띄우고 Dataiku 로그인 확인만 흉내 내서, Dash 4.5와 Dash 3.4 두 버전으로 동작을 확인했다.
 Dataiku 안에서 오류가 나면 메시지를 그대로 전달해 주면 맞춰 고친다.
+
+## 문서 확인 결과
+
+| 항목 | 결과 | 근거 |
+|---|---|---|
+| Dash 웹앱에서 `app`을 Dataiku가 미리 만들어 줌 | 일치 | Dash 웹앱 튜토리얼이 `app.layout`만 지정하는 방식 |
+| 브라우저의 Dataiku 사용자 확인(`get_auth_info_from_browser_headers`, `authIdentifier`) | 일치 | DSS 14 "Webapps and security"의 Dash 웹앱 예시 |
+| 노트북·레시피에서 내 로그인 ID(`get_auth_info()["authIdentifier"]`) | 일치 | Python API 레퍼런스 |
+| 관리 폴더 경로(`Folder.get_path()`) | 일치. 서버 로컬 파일시스템 폴더에서만 동작 | Python API 레퍼런스 |
+| 메일 채널 발송(`channel.send(project_key, to, subject, body)`) | 일치 | Python API 레퍼런스 |
+| 프로젝트 변수(`dataiku.get_custom_variables()`), 데이터셋 읽기·쓰기 | 일치 | Python API 레퍼런스 |
+| 공개 웹앱 등록 메뉴 | **고침**. 이전 안내의 메뉴 위치가 틀렸음 | DSS 14 "Public webapps" |
+| 데이터셋 읽기 기본 옵션 | **고침**. 기본값은 형식을 다시 추정해 사번 앞자리 0이 사라질 수 있어, 스키마 형식대로 읽게 바꿈 | Python API 레퍼런스 |
+| 지원 Dash 버전 | DSS 13에서 Dash 3 호환 템플릿으로 바뀜. Dash 3.x 권장 | DSS 13 변경 기록 |
 
 ## 전체 구조
 
@@ -29,8 +44,10 @@ Python 코드 환경에 다음 패키지를 넣는다(`requirements.txt`와 같�
 pandas  numpy  openpyxl  plotly  dash  scikit-learn  networkx
 ```
 
-확인한 버전은 Python 3.13, dash 4.5, plotly 7.1, pandas 3.0, scikit-learn 1.9, networkx 3.7이다.
-더 낮은 버전에서는 실행해 보지 않았다. 최소 Python 3.10, dash 2.17 이상을 권장한다.
+- **Dash는 3.x를 권장한다**(예: `dash>=3,<4`). Dataiku가 DSS 13에서 Dash 웹앱 템플릿을 Dash 3에 맞췄고,
+  이 앱도 Dash 3.4에서 동작을 확인했다. Dash 4.5에서도 확인했지만 Dataiku 쪽 지원 여부는 문서에서 확인하지 못했다.
+- 그 밖에 확인한 버전은 Python 3.13, plotly 7.1, pandas 3.0, scikit-learn 1.9, networkx 3.7이다.
+  더 낮은 버전에서는 실행해 보지 않았다. 최소 Python 3.10을 권장한다.
 
 ## 2. 프로젝트 라이브러리에 코드 올리기
 
@@ -70,6 +87,10 @@ Flow에서 관리 폴더(Managed folder)를 만든다. 이름은 `hrli_data`로 
 
 웹앱 백엔드는 한 프로세스로 둔다. DB 파일 하나를 쓰는 구조이기 때문이다.
 
+**웹앱이 실행되는 계정**: Dataiku 웹앱의 코드는 기본으로 "웹앱을 마지막으로 수정한 사람"의 권한으로 돈다(run-as-user).
+관리 폴더 쓰기, 데이터셋 읽기, 메일 채널 발송이 모두 이 계정 권한으로 이루어진다. 본인이 만들고 수정하면 본인 권한이다.
+다른 사람이 웹앱 코드를 수정하면 실행 계정이 바뀌므로, 웹앱 수정 권한도 최소한으로 둔다.
+
 ## 6. 데이터 올리기: 레시피 방식
 
 ### 데이터셋 준비
@@ -77,7 +98,8 @@ Flow에서 관리 폴더(Managed folder)를 만든다. 이름은 `hrli_data`로 
 엑셀을 업로드해 데이터셋 두 개를 만든다. 이름은 `roster_upload`(직원 명부), `training_upload`(교육 이력)로 한다.
 다른 이름을 쓰면 레시피 코드 맨 위의 이름도 바꾼다.
 
-- **사번은 문자열로**: 데이터셋 스키마에서 사번 컬럼 형식을 string으로 둔다. 숫자로 읽히면 앞자리 0이 사라진다.
+- **사번은 문자열로**: 데이터셋 스키마에서 사번 컬럼 형식을 string으로 둔다. 레시피는 스키마 형식대로 읽으므로
+  여기서 string으로 두면 앞자리 0이 보존된다. 업로드할 때 Dataiku가 형식을 자동으로 정하니 한 번 확인한다.
 - **매월 갱신**: 같은 데이터셋에 새 파일을 덮어 올리면 된다. 원본 파일은 레시피가 관리 폴더에 따로 보관한다.
 - **과거 명부 한꺼번에**: 명부에 `기준월` 컬럼(예: 2025-01)을 넣어 여러 달을 한 파일로 올리면, 레시피가 달별로 나눠
   오래된 달부터 따로 올린다. `기준월` 컬럼이 없으면 프로젝트 변수 `hrli_roster_month`의 값을 쓴다.
@@ -147,10 +169,11 @@ Dataiku 차트·대시보드나 다른 레시피에서 데이터를 쓰고 싶�
 기본으로 꺼져 있다. 계정이 없는 교육 담당자 등을 추가할 때만 켠다. 다음 세 가지가 모두 필요하다.
 
 1. **메일 발송 방법**: `webapp_backend.py`의 `mailer`를 Dataiku 메일 채널이나 사내 SMTP로 바꾼다.
-   - Dataiku 메일 채널: DSS 관리자가 만든 채널 ID가 필요하고, 웹앱 실행 계정이 그 채널을 쓸 권한이 있어야 한다.
+   - Dataiku 메일 채널: DSS 관리자가 만든 채널 ID가 필요하고, 웹앱 실행 계정(run-as-user)이 그 채널을 쓸 권한이 있어야 한다.
    - 사내 SMTP: DSS 서버에서 SMTP 서버로 접속되는지, 발신 주소가 허용되는지 확인한다. 비밀번호를 코드에 적지 않는다.
-2. **웹앱 공개 등록**: DSS 관리자가 Administration > Settings > Login & Security의 인증 예외 목록에
-   `프로젝트키.웹앱ID`를 추가하고 웹앱 백엔드를 재시작한다. 정확한 메뉴 이름은 DSS 버전에 따라 다를 수 있다.
+2. **웹앱 공개 등록**: DSS 관리자가 **Administration > Settings > Security & Audit > Other security settings**의
+   인증 예외 목록(authentication whitelist)에 `프로젝트키.웹앱ID`를 추가하고 웹앱 백엔드를 재시작한다.
+   웹앱ID는 웹앱 주소에서 밑줄(_) 앞부분이다. 예: 주소가 `/projects/HRLI/webapps/kUDF1mQ_hrli/view`면 `HRLI.kUDF1mQ`.
 3. **스위치 켜기**: 웹앱 > 데이터 관리 > 사용자 > "이메일 인증 로그인 켜기".
 
 공개 등록을 하면 Dataiku는 접속자를 확인하지 않고, **이 앱의 이메일 인증이 유일한 관문**이 된다. 그래서 다음을 지킨다.
@@ -173,7 +196,8 @@ Dataiku 차트·대시보드나 다른 레시피에서 데이터를 쓰고 싶�
 | `No module named dash` 등 | 웹앱·레시피·노트북의 코드 환경 지정 |
 | `get_path` 관련 오류 | 관리 폴더가 서버 로컬 파일시스템인지(3번). 레시피를 컨테이너에서 실행하도록 설정했다면 로컬 실행으로 바꾼다 |
 | 웹앱을 열면 "등록되어 있지 않습니다" | 사용자 화면의 Dataiku 로그인 ID가 실제 로그인 ID와 같은지. 처음이면 4번을 다시 확인 |
-| 웹앱을 열면 로그인 버튼만 있고 눌러도 실패 | Dataiku 로그인 확인 기능이 DSS 버전과 맞지 않을 수 있다. 오류 메시지를 전달해 주면 맞춰 고친다 |
+| 웹앱을 열면 로그인 버튼만 있고 눌러도 실패 | DSS 관리자 설정 Administration > Settings > Login & Security의 웹앱 보안 항목 "Hide access tokens"가 켜져 있으면 웹앱이 브라우저의 Dataiku 세션을 읽지 못할 수 있다. 그래도 안 되면 웹앱 Log 탭의 오류 메시지를 전달해 주면 맞춰 고친다 |
+| 웹앱 화면이 일부만 뜨거나 버튼이 반응하지 않음 | 코드 환경의 dash 버전(3.x 권장) |
 | 로그인 직후 다시 로그인 화면으로 돌아감 | HTTP로 접속 중인데 `https=True`로 둔 경우. 접속 주소와 설정을 맞춘다 |
 | 레시피 실행 시 "기준월 값을 해석할 수 없습니다" | 명부의 기준월 값 형식(예: 2026-01) |
 | 레시피 실행 시 "직원 명부는 기준월이 필요합니다" | 명부에 `기준월` 컬럼을 넣거나 프로젝트 변수 `hrli_roster_month`를 지정 |

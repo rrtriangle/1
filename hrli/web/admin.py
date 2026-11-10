@@ -266,7 +266,7 @@ def upload_dataset(n, name, kind, ftype, month, tick):
     except ImportError:
         return "Dataiku 안에서 실행할 때만 데이터셋을 불러올 수 있습니다. 파일 업로드를 이용하세요.", tick
     try:
-        df = dataiku.Dataset(name).get_dataframe()
+        df = dataiku.Dataset(name).get_dataframe(**flow.READ_OPTS)
     except Exception as e:  # noqa: BLE001 - 데이터셋 이름·권한 오류를 그대로 안내
         return f"데이터셋 '{name}'을 읽지 못했습니다: {str(e)[:200]}", tick
     try:

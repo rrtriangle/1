@@ -13,6 +13,9 @@ import pandas as pd
 from . import db, ingest, metrics
 
 MONTH_COLS = ("기준월", "명부기준월", "snapshot_month")
+# dataiku.Dataset.get_dataframe 옵션. 기본값(infer_with_pandas=True)은 pandas가 형식을 다시 추정해서,
+# 스키마에서 문자열로 둔 사번도 숫자로 바뀌어 앞자리 0이 사라질 수 있다. 스키마 형식을 그대로 쓰게 한다.
+READ_OPTS = {"infer_with_pandas": False, "use_nullable_integers": True}
 
 
 def _month(v) -> str | None:

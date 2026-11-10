@@ -150,8 +150,7 @@ def dataiku_identify(headers: dict) -> str | None:
         info = dataiku.api_client().get_auth_info_from_browser_headers(headers)
     except Exception:  # noqa: BLE001 - 로그인하지 않았거나 Dataiku 밖이면 확인 불가로 본다
         return None
-    login = info.get("authIdentifier") or info.get("associatedDSSUser")
-    return norm(login) or None
+    return norm(info.get("authIdentifier")) or None
 
 
 def default_identify() -> Identify | None:

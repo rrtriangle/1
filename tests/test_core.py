@@ -301,6 +301,22 @@ def test_flow_dates_from_dataset_do_not_shift():
     assert db.read("SELECT start_date, end_date FROM training_record").values.tolist() == [["2026-03-01", "2026-03-01"]]
 
 
+
+def test_flow_keeps_leading_zeros_and_nullable_ints():
+    # Dataiku가 스키마 형식대로 읽으면 사번은 문자열, 빈칸 있는 정수는 Int64로 들어온다
+    r = pd.DataFrame([{**emp("00123"), "기준월": "2026-01"}, {**emp("00456"), "기준월": "2026-01"}])
+    flow.stage_dataframe(r, "roster_upload", "roster", "full", "t")
+    ingest.approve_clean("t")
+    assert db.read("SELECT emp_no FROM employee ORDER BY 1")["emp_no"].tolist() == ["00123", "00456"]
+    t = pd.DataFrame([rec("00123"), rec("00456", start="2026-04-01")])
+    t["교육시간"] = pd.array([8, None], dtype="Int64")
+    flow.stage_dataframe(t, "training_upload", "training", "full", "t")
+    ingest.approve_clean("t")
+    got = db.read("SELECT emp_no, hours_raw FROM training_record ORDER BY 1")
+    assert got["emp_no"].tolist() == ["00123", "00456"] and got["hours_raw"].iat[0] == 8.0
+    assert pd.isna(got["hours_raw"].iat[1])                                    # 빈 시간은 0이 아니라 빈 값
+    assert flow.READ_OPTS["infer_with_pandas"] is False
+
 def test_approve_clean_stops_at_batch_needing_review():
     roster("2026-01", [emp("1")])
     training([rec("1")])
