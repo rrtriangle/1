@@ -1,4 +1,4 @@
-"""Dash 앱 구성: 이메일 인증 코드 로그인, 메뉴, 공통 기간 필터.
+"""Dash 앱 구성: 로그인(Dataiku 계정 / 선택적 이메일 인증), 메뉴, 공통 기간 필터.
 
 - 로컬 실행: python -m hrli.web.app
 - Dataiku Dash 웹앱: Dataiku가 만들어 준 app에 attach(app, ...)를 호출한다(dataiku/webapp_backend.py 참고).
@@ -27,19 +27,47 @@ MENU = [  # (키, 이름, 필요 권한, 화면 함수)
     ("admin", "데이터 관리", "manage", admin.skeleton),
 ]
 PUBLIC_OUTPUTS = {"root", "login-msg", "auth-tick"}  # 로그인 전에도 호출할 수 있는 콜백의 출력
-_mailer: auth.Mailer | None = None
+SKIP_AUTO = ("/_dash-component-suites/", "/_favicon", "/assets/", "/_reload-hash")
+_identify: auth.Identify | None = None
 
 
-def login_layout():
-    return html.Div([
-        html.H1("HR Learning Intelligence"), html.P("전사 교육 이력 관리 및 교육 전략 분석", className="note"),
-        dcc.Input(id="login-email", placeholder="등록된 이메일 주소", type="email", autoComplete="username"),
-        html.Button("인증 코드 받기", id="login-send", n_clicks=0),
-        dcc.Input(id="login-code", placeholder="메일로 받은 6자리 코드", inputMode="numeric", autoComplete="one-time-code",
-                  maxLength=6, n_submit=0),
-        html.Button("로그인", id="login-btn", n_clicks=0, className="primary"),
-        html.Div(id="login-msg", className="note"),
-    ], className="login")
+def login_layout(dss_login: str | None):
+    otp = auth.otp_enabled()
+    parts = [html.H1("HR Learning Intelligence"), html.P("전사 교육 이력 관리 및 교육 전략 분석", className="note")]
+    if _identify is not None:
+        if dss_login:
+            parts.append(html.P(f"Dataiku 사용자 '{dss_login}'은(는) 이 시스템에 등록되어 있지 않습니다. "
+                                "시스템 관리자에게 등록을 요청하세요.", className="error"))
+        parts.append(html.Button("Dataiku 계정으로 로그인", id="login-dku", n_clicks=0, className="primary"))
+    else:
+        parts.append(html.Div(html.Button(id="login-dku", n_clicks=0), style={"display": "none"}))
+    if otp:
+        parts += [html.Hr(), html.P("Dataiku 계정이 없으면 등록된 이메일로 인증 코드를 받아 로그인합니다.", className="note"),
+                  dcc.Input(id="login-email", placeholder="등록된 이메일 주소", type="email", autoComplete="username"),
+                  html.Button("인증 코드 받기", id="login-send", n_clicks=0),
+                  dcc.Input(id="login-code", placeholder="메일로 받은 6자리 코드", inputMode="numeric",
+                            autoComplete="one-time-code", maxLength=6, n_submit=0),
+                  html.Button("로그인", id="login-btn", n_clicks=0, className="primary")]
+    elif _identify is None:
+        parts.append(html.P("로그인할 수 있는 방법이 없습니다. Dataiku 웹앱으로 열거나, 관리자가 이메일 인증 로그인을 켜야 합니다.",
+                            className="error"))
+    parts.append(html.Div(id="login-msg", className="note"))
+    return html.Div(parts, className="login")
+
+
+def _start_session(user: dict, how: str) -> None:
+    flask.session.clear()
+    flask.session.permanent = True
+    flask.session["user"] = user
+    log(user, f"로그인({how})")
+
+
+def _try_dataiku_login() -> tuple[dict | None, str | None]:
+    """Dataiku에 로그인한 브라우저면 등록된 사용자인지 확인한다. (사용자, Dataiku 로그인 ID)"""
+    if _identify is None:
+        return None, None
+    login = _identify(dict(flask.request.headers))
+    return auth.get_user_by_login(login), login
 
 
 def filter_bar():
@@ -84,7 +112,21 @@ def layout():
 @callback(Output("root", "children"), Input("auth-tick", "data"))
 def render_root(_tick):
     user = current_user()
-    return shell(user) if user else login_layout()
+    return shell(user) if user else login_layout(flask.g.get("dss_login"))
+
+
+@callback(Output("auth-tick", "data", allow_duplicate=True), Output("login-msg", "children", allow_duplicate=True),
+          Input("login-dku", "n_clicks"), State("auth-tick", "data"), prevent_initial_call=True)
+def dataiku_login(n, tick):
+    if not n:
+        raise PreventUpdate
+    user, login = _try_dataiku_login()
+    if user is None:
+        db.log_access(login, "로그인 실패(Dataiku)")
+        return no_update, ("Dataiku 로그인 상태를 확인하지 못했습니다. Dataiku에 먼저 로그인하세요." if not login else
+                           f"Dataiku 사용자 '{login}'은(는) 등록되어 있지 않습니다.")
+    _start_session(user, "Dataiku")
+    return (tick or 0) + 1, ""
 
 
 @callback(Output("login-msg", "children"), Input("login-send", "n_clicks"), State("login-email", "value"),
@@ -92,7 +134,7 @@ def render_root(_tick):
 def send_code(n, email):
     if not n:
         raise PreventUpdate
-    return auth.request_code(email, _mailer)
+    return auth.request_code(email, auth.MAILER)
 
 
 @callback(Output("auth-tick", "data"), Output("login-msg", "children", allow_duplicate=True),
@@ -106,10 +148,7 @@ def do_login(n, s, email, code, tick):
     if not user:
         db.log_access(auth.norm(email), "로그인 실패")
         return no_update, "인증 코드가 올바르지 않거나 만료되었습니다. 코드를 다시 받아 주세요."
-    flask.session.clear()
-    flask.session.permanent = True
-    flask.session["user"] = user
-    log(user, "로그인")
+    _start_session(user, "이메일 인증")
     return (tick or 0) + 1, ""
 
 
@@ -122,6 +161,7 @@ def do_logout(n, tick):
     if user:
         log(user, "로그아웃")
     flask.session.clear()
+    flask.session["no_auto"] = True  # 로그아웃 직후 Dataiku 계정으로 자동 재로그인하지 않는다
     return (tick or 0) + 1
 
 
@@ -165,13 +205,18 @@ def _output_ids(body: dict) -> set[str]:
     return found
 
 
-def attach(app: Dash, data_dir: str | None = None, mailer: auth.Mailer | None = None, https: bool | None = None) -> Dash:
-    """주어진 Dash 앱에 화면·로그인·접근 통제를 붙인다. 로컬 실행과 Dataiku 웹앱이 함께 쓴다."""
-    global _mailer
+def attach(app: Dash, data_dir: str | None = None, mailer: auth.Mailer | None = None, https: bool | None = None,
+           identify: auth.Identify | None | str = "auto") -> Dash:
+    """주어진 Dash 앱에 화면·로그인·접근 통제를 붙인다. 로컬 실행과 Dataiku 웹앱이 함께 쓴다.
+
+    identify: Dataiku 로그인 사용자 확인 함수. "auto"면 Dataiku 안에서만 켜진다. None이면 Dataiku 로그인을 쓰지 않는다.
+    """
+    global _identify
     if data_dir:
         config.configure(data_dir=data_dir)
     db.init_db()
-    _mailer = mailer or auth.mailer_from_env()
+    auth.MAILER = mailer or auth.mailer_from_env()
+    _identify = auth.default_identify() if identify == "auto" else identify
     app.title = "HR Learning Intelligence"
     app.config.suppress_callback_exceptions = True
     app.index_string = app.index_string.replace("{%css%}", "{%css%}\n<style>" + CSS + "</style>")
@@ -187,8 +232,26 @@ def attach(app: Dash, data_dir: str | None = None, mailer: auth.Mailer | None = 
 
     @server.before_request
     def guard():
+        path = flask.request.path
+        if any(x in path for x in SKIP_AUTO):
+            return None
+        user = current_user()
+        if user:
+            # 로그인 중에 사용자가 중지되거나 역할이 바뀌면 다음 요청부터 반영한다
+            fresh = auth.get_user(user["username"])
+            if fresh is None:
+                flask.session.clear()
+                user = None
+            elif fresh != user:
+                flask.session["user"] = fresh
+        if user is None and not flask.session.get("no_auto"):
+            found, login = _try_dataiku_login()
+            flask.g.dss_login = login
+            if found:
+                _start_session(found, "Dataiku")
+                user = found
         # 로그인 전에는 로그인 화면을 그리고 인증하는 콜백만 허용한다(각 데이터 콜백의 권한 검사에 더한 이중 방어).
-        if not flask.request.path.endswith("/_dash-update-component") or current_user():
+        if user or not path.endswith("/_dash-update-component"):
             return None
         ids = _output_ids(flask.request.get_json(silent=True) or {})
         if ids and ids <= PUBLIC_OUTPUTS:

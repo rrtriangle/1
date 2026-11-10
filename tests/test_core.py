@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from hrli import analysis, auth, classify, config, db, ingest, metrics
+from hrli import analysis, auth, classify, config, db, flow, ingest, metrics
 
 
 class raises:
@@ -197,6 +197,9 @@ def test_edit_keeps_original_and_logs():
 def test_otp_login():
     sent = []
     mailer = lambda to, subject, body: sent.append((to, body))  # noqa: E731
+    auth.save_user("boss@corp.com", "admin")
+    auth.MAILER = mailer
+    auth.set_otp_enabled(True, "boss@corp.com")
     auth.save_user("Manager@Corp.com", "org_manager", "A그룹")
     assert auth.request_code("nobody@corp.com", mailer) == auth.SENT_MSG and not sent  # 미등록: 같은 문구, 발송 없음
     assert auth.request_code("manager@corp.com", mailer) == auth.SENT_MSG and len(sent) == 1
@@ -215,6 +218,8 @@ def test_otp_expiry_attempt_limit_and_inactive():
     sent = []
     mailer = lambda to, subject, body: sent.append(body)  # noqa: E731
     auth.save_user("a@corp.com", "admin")
+    auth.MAILER = mailer
+    auth.set_otp_enabled(True, "a@corp.com")
     auth.request_code("a@corp.com", mailer)
     code = re.search(r"\b(\d{6})\b", sent[-1]).group(1)
     wrong = "000000" if code != "000000" else "111111"
@@ -237,17 +242,97 @@ def test_otp_expiry_attempt_limit_and_inactive():
     assert auth.request_code("b@corp.com", mailer) == auth.SENT_MSG and len(sent) == 2  # 중지된 사용자에게는 발송 없음
 
 
+
+def test_otp_is_off_by_default_and_cannot_turn_on_without_mail():
+    auth.save_user("a@corp.com", "admin")
+    sent = []
+    assert not auth.otp_enabled()
+    assert auth.request_code("a@corp.com", lambda *x: sent.append(x)) == auth.OTP_OFF_MSG and not sent
+    auth.MAILER = None
+    with raises(ValueError):
+        auth.set_otp_enabled(True, "a@corp.com")
+    auth.MAILER = lambda *x: sent.append(x)
+    auth.set_otp_enabled(True, "a@corp.com")
+    assert auth.request_code("a@corp.com", auth.MAILER) == auth.SENT_MSG and len(sent) == 1
+    auth.set_otp_enabled(False, "a@corp.com")                                  # 끄면 발송된 코드도 폐기
+    assert db.read("SELECT COUNT(*) FROM otp").iat[0, 0] == 0
+    log = db.read("SELECT action FROM access_log")["action"].tolist()
+    assert "이메일 인증 로그인 켜기" in log and "이메일 인증 로그인 끄기" in log
+
+
+def test_dataiku_login_mapping():
+    auth.save_user("me@corp.com", "admin", dss_login="HongGD")
+    assert auth.get_user_by_login("honggd")["username"] == "me@corp.com"      # 대소문자 무시
+    assert auth.get_user_by_login("someone") is None
+    assert auth.get_user_by_login(None) is None
+    with raises(ValueError):
+        auth.save_user("other@corp.com", "analyst", dss_login="honggd")         # 한 Dataiku 계정은 한 사용자에게만
+    auth.save_user("t@corp.com", "trainer", dss_login="kim")
+    auth.save_user("t@corp.com", "trainer", dss_login="kim", active=False)
+    assert auth.get_user_by_login("kim") is None                               # 중지된 사용자는 로그인 불가
+    assert auth.dataiku_identify({}) is None                                   # Dataiku 밖에서는 확인 불가
+
+
+def roster_df(month_rows):
+    return pd.DataFrame([{**emp(no, grp=g), "기준월": m} for m, no, g in month_rows])
+
+
+def test_flow_stage_splits_months_and_skips_same_content():
+    df = roster_df([("2026.1", "1", "A그룹"), ("2026-01", "2", "A그룹"), ("202602", "1", "B그룹")])
+    rows = flow.stage_dataframe(df, "roster_upload", "roster", "full", "t")
+    assert [(r["month"], r["rows"], r["status"]) for r in rows] == [("2026-01", 2, "staged"), ("2026-02", 1, "staged")]
+    again = flow.stage_dataframe(df, "roster_upload", "roster", "full", "t")
+    assert [r["status"] for r in again] == ["skipped", "skipped"]                # 같은 내용은 다시 올리지 않는다
+    r = ingest.approve_clean("t")
+    assert r["approved"] == [1, 2] and r["waiting"] == []
+    e = db.read("SELECT emp_no, grp, roster_state FROM employee ORDER BY emp_no").values.tolist()
+    assert e == [["1", "B그룹", "명부확인"], ["2", "A그룹", "명부미포함"]]       # 월 순서대로 반영
+    with raises(ValueError):
+        flow.stage_dataframe(roster_df([("언젠가", "1", "A그룹")]), "x", "roster", "full", "t")
+
+
+def test_flow_dates_from_dataset_do_not_shift():
+    roster("2026-01", [emp("1")])
+    df = pd.DataFrame([rec("1", start="2026-03-01")])
+    df["시작일"] = pd.to_datetime(df["시작일"]).dt.tz_localize("UTC")            # Dataiku가 날짜를 UTC로 읽는 경우
+    df["종료일"] = pd.to_datetime(df["종료일"])
+    flow.stage_dataframe(df, "training_upload", "training", "full", "t")
+    ingest.approve_clean("t")
+    assert db.read("SELECT start_date, end_date FROM training_record").values.tolist() == [["2026-03-01", "2026-03-01"]]
+
+
+def test_approve_clean_stops_at_batch_needing_review():
+    roster("2026-01", [emp("1")])
+    training([rec("1")])
+    b1 = training([rec("1", hours=16)], approve=False)                         # 중복 의심 → 판단 필요
+    b2 = training([rec("1", start="2026-06-01")], approve=False)
+    r = ingest.approve_clean("t")
+    assert r["approved"] == [] and r["waiting"] == [b1, b2]                    # 뒤 배치도 순서를 지키려고 남긴다
+
+
+def test_export_tables():
+    roster("2026-01", [emp("1"), emp("2")])
+    training([rec("1"), rec("9")])
+    t = flow.export_tables()
+    assert set(t) == {"hrli_employee", "hrli_snapshot", "hrli_training", "hrli_training_all", "hrli_course",
+                      "hrli_batches", "hrli_change_log"}
+    assert len(t["hrli_training"]) == 1 and {"사번", "표준교육명", "교육분야", "분석용시간"} <= set(t["hrli_training"].columns)
+    assert sorted(t["hrli_training_all"]["통계반영"]) == ["미매칭", "반영"]
+    assert len(t["hrli_employee"]) == 2 and len(t["hrli_snapshot"]) == 2
+
+
 class CoreTests(unittest.TestCase):
     """각 테스트를 새 임시 DB에서 실행한다. 실행: python -m unittest discover -s tests"""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        self.saved = (config.DB_PATH, config.RAW_DIR, config.MIN_GROUP_SIZE)
+        self.saved = (config.DB_PATH, config.RAW_DIR, config.MIN_GROUP_SIZE, auth.MAILER)
         config.DB_PATH, config.RAW_DIR, config.MIN_GROUP_SIZE = self.tmp / "t.sqlite3", self.tmp / "raw", 1
+        auth.MAILER = None
         db.init_db()
 
     def tearDown(self):
-        config.DB_PATH, config.RAW_DIR, config.MIN_GROUP_SIZE = self.saved
+        config.DB_PATH, config.RAW_DIR, config.MIN_GROUP_SIZE, auth.MAILER = self.saved
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 

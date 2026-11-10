@@ -317,10 +317,7 @@ def approve(batch_id: int, user: str, path=None) -> dict:
                     continue
                 emp = p["emp_no"]
                 if r["category"] == "missing":
-                    con.execute("UPDATE employee SET roster_state='명부미포함' WHERE emp_no=?", (emp,))
-                    db.log_change(con, user, "update", "employee", emp, "roster_state", "명부확인", "명부미포함",
-                                  "명부에서 확인되지 않음", batch_id)
-                    continue
+                    continue  # 명부 미포함 판정은 아래에서 승인 시점 기준으로 다시 한다
                 attrs = [a for a in db.EMP_ATTRS if a in p]
                 old = con.execute("SELECT * FROM employee WHERE emp_no=?", (emp,)).fetchone()
                 if old is None:
@@ -347,6 +344,17 @@ def approve(batch_id: int, user: str, path=None) -> dict:
                 con.execute(f"INSERT INTO employee_snapshot (snapshot_month, emp_no, batch_id"
                             f"{''.join(', ' + a for a in attrs)}) VALUES (?,?,?{', ?' * len(attrs)})",
                             [month, emp, batch_id, *[p[a] for a in attrs]])
+            if b["file_type"] != "incremental" and is_latest:
+                # 전체 명부에 없는 직원은 퇴직 처리하지 않고 '명부미포함'으로만 표시한다. 여러 달을 한꺼번에 올려도
+                # 앞 달 반영 결과를 기준으로 판단하도록 승인 시점에 다시 확인한다. 담당자가 '반영 안 함'으로 둔 직원은 제외.
+                in_file = {json.loads(r["payload"])["emp_no"] for r in rows if r["category"] != "missing"}
+                kept = {json.loads(r["payload"])["emp_no"] for r in rows
+                        if r["category"] == "missing" and r["decision"] == "skip"}
+                for (emp,) in con.execute("SELECT emp_no FROM employee WHERE roster_state='명부확인'").fetchall():
+                    if emp not in in_file and emp not in kept:
+                        con.execute("UPDATE employee SET roster_state='명부미포함' WHERE emp_no=?", (emp,))
+                        db.log_change(con, user, "update", "employee", emp, "roster_state", "명부확인", "명부미포함",
+                                      "명부에서 확인되지 않음", batch_id)
             con.execute("UPDATE employee SET last_seen_month=(SELECT MAX(snapshot_month) FROM employee_snapshot s"
                         " WHERE s.emp_no=employee.emp_no)")
         else:
@@ -375,6 +383,25 @@ def approve(batch_id: int, user: str, path=None) -> dict:
         con.execute("UPDATE upload_batch SET status='approved', decided_by=?, decided_at=?, summary=? WHERE batch_id=?",
                     (user, db.now(), json.dumps(summary, ensure_ascii=False), batch_id))
     return applied
+
+
+def approve_clean(user: str, path=None) -> dict:
+    """담당자 판단이 필요한 행이 없는 검토 대기 배치를 업로드 순서대로 승인한다.
+
+    직원 명부는 기준월 순서가 중요하므로, 판단이 필요한 배치를 만나면 그 뒤의 같은 종류 배치는 승인하지 않는다.
+    """
+    staged = db.read("SELECT b.batch_id, b.kind, SUM(s.decision='pending') AS pending FROM upload_batch b"
+                     " LEFT JOIN staging_row s USING(batch_id) WHERE b.status='staged' GROUP BY b.batch_id"
+                     " ORDER BY b.batch_id", path=path)
+    approved, waiting, blocked = [], [], set()
+    for r in staged.itertuples():
+        if r.kind in blocked or (r.pending or 0) > 0:
+            waiting.append(int(r.batch_id))
+            blocked.add(r.kind)
+            continue
+        approve(int(r.batch_id), user, path)
+        approved.append(int(r.batch_id))
+    return {"approved": approved, "waiting": waiting}
 
 
 def reject(batch_id: int, user: str, reason: str = "", path=None) -> None:

@@ -14,17 +14,22 @@ DEMO_USERS = [("trainer@example.com", "trainer", None), ("analyst@example.com", 
               ("manager1@example.com", "org_manager", "1공장")]
 
 
-def init(demo: bool = False, admin_email: str | None = None, path=None, quiet: bool = False) -> list[str]:
-    """DB를 만들고 첫 관리자 이메일을 등록한다. demo=True면 가상 데이터와 시험용 사용자도 넣는다."""
+def init(demo: bool = False, admin_email: str | None = None, admin_dss_login: str | None = None, path=None,
+         quiet: bool = False) -> list[str]:
+    """DB를 만들고 첫 시스템 관리자를 등록한다. demo=True면 가상 데이터와 시험용 사용자도 넣는다.
+
+    admin_dss_login: 관리자의 Dataiku 로그인 ID. 넣어 두면 Dataiku 계정으로 웹앱에 자동 로그인된다.
+    """
     db.init_db(path)
-    accounts = [(admin_email or ("admin@example.com" if demo else None), "admin", None)]
+    accounts = [(admin_email or ("admin@example.com" if demo else None), "admin", None, admin_dss_login)]
     if demo:
-        accounts += DEMO_USERS
+        accounts += [(e, r, sc, None) for e, r, sc in DEMO_USERS]
     created = []
-    for email, role, scope in accounts:
+    for email, role, scope, login in accounts:
         if email and auth.get_user(email, path) is None:
-            auth.save_user(email, role, scope, path=path)
-            created.append(f"{auth.norm(email)} ({config.ROLES[role]})")
+            auth.save_user(email, role, scope, dss_login=login, path=path)
+            created.append(f"{auth.norm(email)} ({config.ROLES[role]}"
+                           + (f", Dataiku 로그인 ID {auth.norm(login)})" if login else ")"))
     if demo and db.read("SELECT 1 FROM upload_batch LIMIT 1", path=path).empty:
         files = sample_data.demo_files()
         for month, content in files["rosters"].items():
@@ -53,5 +58,6 @@ if __name__ == "__main__":
     ap.add_argument("--init", action="store_true")
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--admin-email", help="첫 시스템 관리자의 이메일")
+    ap.add_argument("--admin-dss-login", help="첫 시스템 관리자의 Dataiku 로그인 ID")
     a = ap.parse_args()
-    init(demo=a.demo, admin_email=a.admin_email)
+    init(demo=a.demo, admin_email=a.admin_email, admin_dss_login=a.admin_dss_login)

@@ -27,8 +27,9 @@ REC_ATTRS = [
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    username TEXT PRIMARY KEY,   -- 로그인 이메일(소문자)
+    username TEXT PRIMARY KEY,   -- 이메일(소문자). 이메일 인증 로그인과 사용자 식별에 쓴다
     name TEXT,
+    dss_login TEXT,              -- Dataiku 로그인 ID(소문자). 있으면 Dataiku 계정으로 자동 로그인
     role TEXT NOT NULL,
     org_scope TEXT,              -- 조직 관리자: 조회 가능한 그룹(grp)
     active INTEGER NOT NULL DEFAULT 1
@@ -183,6 +184,10 @@ def init_db(path: Path | str | None = None) -> None:
     con = connect(path)
     try:
         con.executescript(SCHEMA)
+        # 이전 버전 DB에 없는 컬럼 추가
+        if "dss_login" not in [r[1] for r in con.execute("PRAGMA table_info(users)")]:
+            con.execute("ALTER TABLE users ADD COLUMN dss_login TEXT")
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_users_dss ON users(dss_login) WHERE dss_login IS NOT NULL")
         if not con.execute("SELECT 1 FROM column_mapping LIMIT 1").fetchone():
             rows = [(k, std, src) for k, m in DEFAULT_MAPPING.items() for std, srcs in m.items() for src in srcs]
             con.executemany("INSERT INTO column_mapping VALUES (?,?,?)", rows)

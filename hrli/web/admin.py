@@ -9,7 +9,7 @@ import pandas as pd
 from dash import Input, Output, State, callback, ctx, dcc, html
 from dash.exceptions import PreventUpdate
 
-from .. import auth, classify, config, db, ingest
+from .. import auth, classify, config, db, flow, ingest
 from .common import KO, require, section, table
 
 CAT_KO = {"new": "신규", "changed": "변경", "duplicate": "중복(반영 안 함)", "suspect": "중복 의심(검토 필요)",
@@ -73,6 +73,10 @@ def body(tab, _tick):
                     dcc.Dropdown(id="bt-pick", options=opts, value=int(staged.iloc[0]) if len(staged) else None,
                                  placeholder="배치를 선택하세요"),
                     html.Div(id="bt-detail")),
+            section("일괄 승인",
+                    html.Button("확인할 것이 없는 검토 대기 배치 모두 승인", id="bt-approve-clean", n_clicks=0),
+                    note="'중복 의심'처럼 담당자 판단이 필요한 건이 없는 배치만 업로드 순서대로 승인한다. 오류 행은 반영되지 않는다. "
+                         "과거 명부를 여러 달 한꺼번에 올렸을 때 쓴다. 판단이 필요한 배치는 위에서 하나씩 처리한다."),
             section("업로드 이력", table(_batch_table(), page_size=10)),
         ]
     if tab == "quality":
@@ -197,21 +201,37 @@ def body(tab, _tick):
                 section("데이터 수정 이력(최근 500건)", table(ch, page_size=12)),
                 section("접근·다운로드 이력(최근 500건)", table(ac, page_size=12))]
     if tab == "users" and auth.can(user, "users"):
-        u = db.read("SELECT username AS 이메일, name AS 이름, role AS 역할, org_scope AS 조회범위, active AS 사용 FROM users")
+        u = db.read("SELECT username AS 이메일, name AS 이름, dss_login AS \"Dataiku 로그인 ID\", role AS 역할,"
+                    " org_scope AS 조회범위, active AS 사용 FROM users ORDER BY active DESC, role, username")
         u["역할"] = u["역할"].map(config.ROLES)
-        return [section("사용자 관리", table(u),
-                        html.Div([
-                            html.Label(["이메일", dcc.Input(id="usr-name", type="email", autoComplete="off")]),
-                            html.Label(["이름(선택)", dcc.Input(id="usr-pw", autoComplete="off")]),
-                            html.Label(["역할", dcc.Dropdown(id="usr-role", clearable=False, value="analyst", options=[
-                                {"label": v, "value": k} for k, v in config.ROLES.items()])]),
-                            html.Label(["조회 범위(조직 관리자: 그룹·공장명)", dcc.Input(id="usr-scope")]),
-                            html.Label(["사용", dcc.Dropdown(id="usr-active", clearable=False, value=1, options=[
-                                {"label": "사용", "value": 1}, {"label": "중지", "value": 0}])]),
-                            html.Button("사용자 저장", id="usr-save", n_clicks=0, className="primary"),
-                        ], className="controls"),
-                        note="여기 등록된 이메일만 인증 코드로 로그인할 수 있다. 같은 이메일로 저장하면 역할·범위·사용 여부가 바뀐다. "
-                             "중지한 사용자는 다음 로그인부터 막힌다.")]
+        u["사용"] = u["사용"].map({1: "사용", 0: "중지"})
+        otp_on = auth.otp_enabled()
+        mail = "설정됨" if auth.MAILER is not None else ("시험 모드(서버 로그에 코드 출력)" if config.OTP_DEBUG else "설정 안 됨")
+        return [
+            section("사용자 관리", table(u, columns=[{"name": c, "id": c} for c in u.columns]),
+                    html.Div([
+                        html.Label(["이메일(필수)", dcc.Input(id="usr-email", type="email", autoComplete="off")]),
+                        html.Label(["이름(선택)", dcc.Input(id="usr-name", autoComplete="off")]),
+                        html.Label(["Dataiku 로그인 ID(계정이 있으면)", dcc.Input(id="usr-dss", autoComplete="off")]),
+                        html.Label(["역할", dcc.Dropdown(id="usr-role", clearable=False, value="trainer", options=[
+                            {"label": v, "value": k} for k, v in config.ROLES.items()])]),
+                        html.Label(["조회 범위(조직 관리자: 그룹·공장명)", dcc.Input(id="usr-scope")]),
+                        html.Label(["사용", dcc.Dropdown(id="usr-active", clearable=False, value=1, options=[
+                            {"label": "사용", "value": 1}, {"label": "중지", "value": 0}])]),
+                        html.Button("사용자 저장", id="usr-save", n_clicks=0, className="primary"),
+                    ], className="controls"),
+                    note="Dataiku 로그인 ID를 적어 두면 그 Dataiku 계정으로 웹앱을 열 때 자동으로 로그인된다. "
+                         "Dataiku 계정이 없는 사람은 비워 두고, 아래의 이메일 인증 로그인을 켜야 들어올 수 있다. "
+                         "같은 이메일로 저장하면 내용이 바뀌고, 중지하면 로그인 중이어도 다음 동작부터 막힌다."),
+            section("Dataiku 계정이 없는 사람의 접속(이메일 인증 로그인)",
+                    html.Ul([html.Li(f"현재 상태: {'켜짐' if otp_on else '꺼짐(기본)'}"),
+                             html.Li(f"인증 메일 발송 방법: {mail}")]),
+                    html.Div([html.Button("이메일 인증 로그인 켜기", id="otp-on", n_clicks=0, disabled=otp_on),
+                              html.Button("끄기", id="otp-off", n_clicks=0, disabled=not otp_on)], className="controls"),
+                    note="이 스위치만으로는 외부에 열리지 않는다. Dataiku 계정이 없는 사람이 웹앱 주소에 들어오려면 DSS 관리자가 "
+                         "웹앱을 공개로 등록해야 하고, 그때부터는 이 앱의 이메일 인증이 유일한 관문이 된다. 켜기 전에 보안 담당 "
+                         "부서의 승인을 받고, DSS가 HTTPS로 서비스되는지 확인한다. 끄면 발송된 인증 코드도 모두 폐기된다."),
+        ]
     raise PreventUpdate
 
 
@@ -249,12 +269,13 @@ def upload_dataset(n, name, kind, ftype, month, tick):
         df = dataiku.Dataset(name).get_dataframe()
     except Exception as e:  # noqa: BLE001 - 데이터셋 이름·권한 오류를 그대로 안내
         return f"데이터셋 '{name}'을 읽지 못했습니다: {str(e)[:200]}", tick
-    bid = ingest.stage(df.to_csv(index=False).encode("utf-8"), f"dataset_{name}.csv", kind, ftype, user["username"],
-                       month if kind == "roster" else None)
-    b = ingest.batches().set_index("batch_id").loc[bid]
-    if b["status"] == "failed":
-        return f"배치 #{bid} 검증 실패(원본은 보관됨): {b['notes']}", (tick or 0) + 1
-    return f"배치 #{bid}: 데이터셋 '{name}' {len(df):,}행을 불러왔습니다. 아래에서 검토한 뒤 승인하세요.", (tick or 0) + 1
+    try:
+        rows = flow.stage_dataframe(df, name, kind, ftype, user["username"], month if kind == "roster" else None)
+    except ValueError as e:
+        return f"처리하지 못했습니다: {e}", tick
+    parts = [f"#{r['batch_id']} {r['month'] or ''} {STATUS_KO.get(r['status'], '건너뜀(이미 올라간 내용)')}".strip()
+             for r in rows]
+    return f"데이터셋 '{name}' {len(df):,}행: " + ", ".join(parts) + ". 아래에서 검토한 뒤 승인하세요.", (tick or 0) + 1
 
 
 @callback(Output("bt-detail", "children"), Input("bt-pick", "value"))
@@ -323,6 +344,19 @@ def batch_staged_action(a, u, s, ap, rj, bid, sel, rows, tick):
     nos = [int(rows[i]["행"]) for i in sel if i < len(rows)]
     dec = {"bt-accept": "accept", "bt-update": "update", "bt-skip": "skip"}[trig]
     return _batch_action(lambda: ingest.set_decision(bid, nos, dec) or f"{len(nos)}건을 '{DEC_KO[dec]}'(으)로 정했습니다.", tick)
+
+
+@callback(Output("adm-msg", "children", allow_duplicate=True), Output("tick", "data", allow_duplicate=True),
+          Input("bt-approve-clean", "n_clicks"), State("tick", "data"), prevent_initial_call=True)
+def batch_approve_clean(n, tick):
+    user = require("manage")
+    if not n:
+        raise PreventUpdate
+    r = ingest.approve_clean(user["username"])
+    msg = f"{len(r['approved'])}개 배치를 승인했습니다."
+    if r["waiting"]:
+        msg += f" 판단이 필요한 배치 {len(r['waiting'])}개(#{', #'.join(map(str, r['waiting']))})는 남겨 두었습니다."
+    return msg, (tick or 0) + 1
 
 
 @callback(Output("adm-msg", "children", allow_duplicate=True), Output("tick", "data", allow_duplicate=True),
@@ -457,15 +491,31 @@ def employee_save(n, emp_no, col, val, reason, tick):
 
 
 @callback(Output("adm-msg", "children", allow_duplicate=True), Output("tick", "data", allow_duplicate=True),
-          Input("usr-save", "n_clicks"), State("usr-name", "value"), State("usr-pw", "value"), State("usr-role", "value"),
-          State("usr-scope", "value"), State("usr-active", "value"), State("tick", "data"), prevent_initial_call=True)
-def user_save(n, email, name, role, scope, active, tick):
+          Input("usr-save", "n_clicks"), State("usr-email", "value"), State("usr-name", "value"), State("usr-dss", "value"),
+          State("usr-role", "value"), State("usr-scope", "value"), State("usr-active", "value"), State("tick", "data"),
+          prevent_initial_call=True)
+def user_save(n, email, name, dss_login, role, scope, active, tick):
     admin_user = require("users")
     if not n:
         raise PreventUpdate
     try:
-        auth.save_user(email, role, (scope or "").strip() or None, (name or "").strip() or None, bool(active))
+        auth.save_user(email, role, (scope or "").strip() or None, (name or "").strip() or None, bool(active),
+                       dss_login=(dss_login or "").strip() or None)
     except ValueError as e:
         return f"저장하지 못했습니다: {e}", tick
     db.log_access(admin_user["username"], "사용자 저장", f"{auth.norm(email)} ({role}, {'사용' if active else '중지'})")
     return f"사용자 '{auth.norm(email)}'을 저장했습니다.", (tick or 0) + 1
+
+
+@callback(Output("adm-msg", "children", allow_duplicate=True), Output("tick", "data", allow_duplicate=True),
+          Input("otp-on", "n_clicks"), Input("otp-off", "n_clicks"), State("tick", "data"), prevent_initial_call=True)
+def otp_switch(on, off, tick):
+    admin_user = require("users")
+    if not (on or off):
+        raise PreventUpdate
+    flag = ctx.triggered_id == "otp-on"
+    try:
+        auth.set_otp_enabled(flag, admin_user["username"])
+    except ValueError as e:
+        return f"바꾸지 못했습니다: {e}", tick
+    return ("이메일 인증 로그인을 켰습니다." if flag else "이메일 인증 로그인을 껐습니다."), (tick or 0) + 1
