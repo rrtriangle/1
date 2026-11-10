@@ -1,3 +1,6 @@
+"""화면 스타일. 별도 assets 폴더 없이도(Dataiku 웹앱) 적용되도록 페이지에 직접 넣는다."""
+
+CSS = """
 :root { --ink:#0b0b0b; --ink2:#52514e; --muted:#898781; --line:#e1e0d9; --page:#f9f9f7; --surface:#fcfcfb; --accent:#2a78d6; }
 * { box-sizing: border-box; }
 body { margin:0; background:var(--page); color:var(--ink); font-family:Pretendard,'Noto Sans KR','Malgun Gothic',sans-serif; font-size:14px; }
@@ -37,3 +40,9 @@ button.primary { background:var(--accent); border-color:var(--accent); color:#ff
 .profile { background:#eef4fc; border-radius:8px; padding:12px 14px; line-height:1.8; margin:12px 0; }
 .login { max-width:340px; margin:14vh auto; background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:28px; display:flex; flex-direction:column; gap:10px; }
 .login h1 { font-size:20px; margin:0; }
+.navmenu label { display:block; color:#d6d3ca; padding:9px 10px; border-radius:6px; cursor:pointer; }
+.navmenu label:hover { background:#2e3b4b; color:#fff; }
+.navmenu input { display:none; }
+.navmenu label:has(input:checked) { background:#2e3b4b; color:#fff; font-weight:600; }
+.who button { margin-top:6px; padding:4px 10px; font-size:12px; }
+"""

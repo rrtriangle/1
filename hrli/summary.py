@@ -1,16 +1,14 @@
 """분석 결과 요약(기획안 2.6-⑤, 8.2).
 
-수치는 전부 Python(metrics/analysis)이 계산한다. 이 모듈은 그 집계 결과를 문장으로 정리할 뿐이다.
-- rule_summary: AI 없이 항상 동작하는 규칙 기반 요약
-- ai_summary: 선택 기능. 개인 식별정보가 없는 집계 payload만 외부 AI에 전달한다.
+수치는 전부 Python(metrics/analysis)이 계산한다. 이 모듈은 그 집계 결과를 정해진 규칙으로 문장화한다.
+사내에서 외부 AI 서비스를 쓸 수 없으므로 AI 호출은 넣지 않았다. build_payload가 만드는 집계 결과에는
+개인 식별정보가 없으므로, 나중에 사내 승인된 AI가 생기면 이 payload를 입력으로 쓰면 된다.
 """
 from __future__ import annotations
 
 import json
 
 import pandas as pd
-
-from . import config
 
 PII_KEYS = {"emp_no", "name", "사번", "성명"}
 
@@ -63,39 +61,3 @@ def rule_summary(p: dict) -> str:
     lines.append(f"\n_분모 기준: {p['분모 기준']}. 이 요약은 Python 집계 결과를 규칙으로 정리한 것이며, "
                  "참여 현황은 교육 기회 검토용 참고 자료다._")
     return "\n".join(lines)
-
-
-SYSTEM = """당신은 HR 교육 담당자를 돕는 분석 보조자다. 사용자가 주는 JSON은 Python이 계산한 전사 교육 집계 결과다.
-이 JSON에 있는 수치만 인용해 한국어로 요약하라. 새 수치를 계산하거나 추정하지 말고, JSON에 없는 사실을 만들지 마라.
-각 해석 뒤에는 근거가 된 지표와 값을 괄호로 적어라. 교육 참여 현황은 교육 기회와 운영 특성을 보여 줄 뿐이므로
-개인 역량이나 조직의 우열을 평가하는 표현은 쓰지 마라.
-구성: 1) 전사 현황 요약 2) 조직·직종별 특징 3) 편중과 사각지대 4) 비교 기간 대비 변화 5) 차기 교육 기획 시 고려사항."""
-
-
-def ai_summary(payload: dict) -> str:
-    """Claude로 집계 결과를 해석한다. 비활성·오류 시에는 이유를 밝히고 규칙 기반 요약으로 대신한다."""
-    if not config.AI_ENABLED:
-        return rule_summary(payload) + "\n\n_AI 요약은 꺼져 있다(HRLI_AI_ENABLED=1로 활성화)._"
-    try:
-        import anthropic
-    except ImportError:
-        return rule_summary(payload) + "\n\n_anthropic 패키지가 없어 규칙 기반 요약을 표시했다._"
-    try:
-        resp = anthropic.Anthropic().beta.messages.create(
-            model=config.AI_MODEL,
-            max_tokens=16000,
-            thinking={"type": "adaptive"},
-            output_config={"effort": "medium"},
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",  # 안전 분류기가 거절하면 서버가 대체 모델로 다시 실행
-            system=SYSTEM,
-            messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-        )
-    except anthropic.APIConnectionError as e:
-        return rule_summary(payload) + f"\n\n_AI 서비스에 연결하지 못해 규칙 기반 요약을 표시했다({e})._"
-    except anthropic.APIStatusError as e:
-        return rule_summary(payload) + f"\n\n_AI 요청이 실패해 규칙 기반 요약을 표시했다(HTTP {e.status_code})._"
-    if resp.stop_reason == "refusal":
-        return rule_summary(payload) + "\n\n_AI가 요청을 처리하지 않아 규칙 기반 요약을 표시했다._"
-    text = "".join(b.text for b in resp.content if b.type == "text")
-    return text + f"\n\n_AI({resp.model})가 Python 집계 결과를 해석한 초안이다. 담당자 검토가 필요하다._"

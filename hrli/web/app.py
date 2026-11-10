@@ -1,33 +1,44 @@
-"""Dash 앱: 로그인, 메뉴, 공통 기간 필터. 실행: python -m hrli.web.app"""
+"""Dash 앱 구성: 이메일 인증 코드 로그인, 메뉴, 공통 기간 필터.
+
+- 로컬 실행: python -m hrli.web.app
+- Dataiku Dash 웹앱: Dataiku가 만들어 준 app에 attach(app, ...)를 호출한다(dataiku/webapp_backend.py 참고).
+
+주소(URL)에 의존하지 않도록 메뉴 이동과 로그인 전환을 모두 콜백으로 처리한다.
+Dataiku는 웹앱을 자체 경로 아래에서 띄우기 때문이다.
+"""
 from __future__ import annotations
 
 import os
-import secrets
-from datetime import date
+from datetime import date, timedelta
 
 import flask
-from dash import Dash, Input, Output, State, callback, dcc, html
+from dash import Dash, Input, Output, State, callback, dcc, html, no_update
+from dash.exceptions import PreventUpdate
 
-from .. import auth, config, db, metrics
+from .. import auth, config, db
 from . import admin, pages, person_plan  # noqa: F401 - 콜백 등록
 from .common import current_user, log
+from .style import CSS
 
-MENU = [  # (경로, 이름, 필요 권한)
-    ("/", "전사 교육 현황", "analysis"), ("/person", "개인별 교육 이력", "person"),
-    ("/org", "조직·직종별 분석", "analysis"), ("/course", "교육 과정 분석", "analysis"),
-    ("/gaps", "사각지대·편중 분석", "analysis"), ("/plan", "차기 교육 설계 지원", "analysis"),
-    ("/admin", "데이터 관리", "manage"),
+MENU = [  # (키, 이름, 필요 권한, 화면 함수)
+    ("home", "전사 교육 현황", "analysis", pages.home), ("person", "개인별 교육 이력", "person", person_plan.person),
+    ("org", "조직·직종별 분석", "analysis", pages.org), ("course", "교육 과정 분석", "analysis", pages.course),
+    ("gaps", "사각지대·편중 분석", "analysis", pages.gaps), ("plan", "차기 교육 설계 지원", "analysis", person_plan.plan),
+    ("admin", "데이터 관리", "manage", admin.skeleton),
 ]
+PUBLIC_OUTPUTS = {"root", "login-msg", "auth-tick"}  # 로그인 전에도 호출할 수 있는 콜백의 출력
+_mailer: auth.Mailer | None = None
 
 
 def login_layout():
     return html.Div([
         html.H1("HR Learning Intelligence"), html.P("전사 교육 이력 관리 및 교육 전략 분석", className="note"),
-        dcc.Input(id="login-user", placeholder="아이디", autoComplete="username"),
-        dcc.Input(id="login-pw", placeholder="비밀번호", type="password", autoComplete="current-password",
-                  n_submit=0),
+        dcc.Input(id="login-email", placeholder="등록된 이메일 주소", type="email", autoComplete="username"),
+        html.Button("인증 코드 받기", id="login-send", n_clicks=0),
+        dcc.Input(id="login-code", placeholder="메일로 받은 6자리 코드", inputMode="numeric", autoComplete="one-time-code",
+                  maxLength=6, n_submit=0),
         html.Button("로그인", id="login-btn", n_clicks=0, className="primary"),
-        html.Div(id="login-msg", className="error"), dcc.Location(id="login-redirect"),
+        html.Div(id="login-msg", className="note"),
     ], className="login")
 
 
@@ -54,34 +65,64 @@ def filter_bar():
 
 
 def shell(user: dict):
-    links = [dcc.Link(name, href=path, className="nav") for path, name, perm in MENU if auth.can(user, perm)]
+    items = [{"label": name, "value": key} for key, name, perm, _ in MENU if auth.can(user, perm)]
     scope = f" · {user['org_scope']}" if user["role"] == "org_manager" else ""
     return html.Div([
-        dcc.Location(id="url"), dcc.Store(id="tick", data=0),
-        html.Nav([html.Div("HR Learning Intelligence", className="brand"), *links,
-                  html.Div([html.Div(f"{user['username']} ({config.ROLES[user['role']]}{scope})"),
-                            html.A("로그아웃", href="/logout")], className="who")], className="side"),
+        dcc.Store(id="tick", data=0),
+        html.Nav([html.Div("HR Learning Intelligence", className="brand"),
+                  dcc.RadioItems(id="nav", options=items, value=items[0]["value"], className="navmenu"),
+                  html.Div([html.Div(user["username"]), html.Div(f"{config.ROLES[user['role']]}{scope}"),
+                            html.Button("로그아웃", id="logout-btn", n_clicks=0)], className="who")], className="side"),
         html.Main([filter_bar(), html.Div(id="period-note", className="note"), html.Div(id="page")]),
     ], className="shell")
 
 
-def serve_layout():
+def layout():
+    return html.Div([dcc.Store(id="auth-tick", data=0), html.Div(id="root")])
+
+
+@callback(Output("root", "children"), Input("auth-tick", "data"))
+def render_root(_tick):
     user = current_user()
     return shell(user) if user else login_layout()
 
 
-@callback(Output("login-redirect", "href"), Output("login-msg", "children"),
-          Input("login-btn", "n_clicks"), Input("login-pw", "n_submit"),
-          State("login-user", "value"), State("login-pw", "value"), prevent_initial_call=True)
-def do_login(_n, _s, username, password):
-    user = auth.verify(username, password)
+@callback(Output("login-msg", "children"), Input("login-send", "n_clicks"), State("login-email", "value"),
+          prevent_initial_call=True)
+def send_code(n, email):
+    if not n:
+        raise PreventUpdate
+    return auth.request_code(email, _mailer)
+
+
+@callback(Output("auth-tick", "data"), Output("login-msg", "children", allow_duplicate=True),
+          Input("login-btn", "n_clicks"), Input("login-code", "n_submit"),
+          State("login-email", "value"), State("login-code", "value"), State("auth-tick", "data"),
+          prevent_initial_call=True)
+def do_login(n, s, email, code, tick):
+    if not (n or s):
+        raise PreventUpdate
+    user = auth.verify_code(email, code)
     if not user:
-        db.log_access(username, "로그인 실패")
-        return None, "아이디 또는 비밀번호가 올바르지 않습니다."
+        db.log_access(auth.norm(email), "로그인 실패")
+        return no_update, "인증 코드가 올바르지 않거나 만료되었습니다. 코드를 다시 받아 주세요."
     flask.session.clear()
+    flask.session.permanent = True
     flask.session["user"] = user
     log(user, "로그인")
-    return "/", ""
+    return (tick or 0) + 1, ""
+
+
+@callback(Output("auth-tick", "data", allow_duplicate=True), Input("logout-btn", "n_clicks"),
+          State("auth-tick", "data"), prevent_initial_call=True)
+def do_logout(n, tick):
+    if not n:
+        raise PreventUpdate
+    user = current_user()
+    if user:
+        log(user, "로그아웃")
+    flask.session.clear()
+    return (tick or 0) + 1
 
 
 @callback(Output("f-sub", "options"), Output("f-sub", "value"), Output("f-sub", "disabled"), Input("f-kind", "value"))
@@ -93,50 +134,72 @@ def sub_options(kind):
     return [{"label": a, "value": b} for a, b in opts], 1, False
 
 
-@callback(Output("page", "children"), Input("url", "pathname"))
-def route(pathname):
+@callback(Output("page", "children"), Input("nav", "value"))
+def route(key):
     """메뉴별 화면 틀만 그린다. 내용은 각 화면의 콜백이 공통 필터에 맞춰 채운다."""
     user = current_user()
     if not user:
-        return dcc.Location(id="relogin", href="/", refresh=True)
-    for path, name, perm in MENU:
-        if path == (pathname or "/"):
+        raise PreventUpdate
+    for k, name, perm, builder in MENU:
+        if k == key:
             if not auth.can(user, perm):
                 return html.Div("이 메뉴를 볼 권한이 없습니다.", className="error")
-            builder = {"/": pages.home, "/org": pages.org, "/course": pages.course, "/gaps": pages.gaps,
-                       "/person": person_plan.person, "/plan": person_plan.plan, "/admin": admin.skeleton}[path]
             return [html.H2(name), builder(user)]
     return html.Div("없는 화면입니다.", className="error")
 
 
-def create_app() -> Dash:
+def _output_ids(body: dict) -> set[str]:
+    found: set[str] = set()
+
+    def walk(o):
+        if isinstance(o, dict):
+            if "id" in o and "property" in o:
+                found.add(o["id"] if isinstance(o["id"], str) else "?")
+            else:
+                for v in o.values():
+                    walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+    walk(body.get("outputs"))
+    return found
+
+
+def attach(app: Dash, data_dir: str | None = None, mailer: auth.Mailer | None = None, https: bool | None = None) -> Dash:
+    """주어진 Dash 앱에 화면·로그인·접근 통제를 붙인다. 로컬 실행과 Dataiku 웹앱이 함께 쓴다."""
+    global _mailer
+    if data_dir:
+        config.configure(data_dir=data_dir)
     db.init_db()
-    app = Dash(__name__, suppress_callback_exceptions=True, title="HR Learning Intelligence", update_title=None)
-    key = os.environ.get("HRLI_SECRET_KEY")
-    if not key:
-        key = secrets.token_hex(32)  # 지정하지 않으면 재시작 때마다 로그인이 풀린다
-    app.server.secret_key = key
-    app.server.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
-                             SESSION_COOKIE_SECURE=os.environ.get("HRLI_HTTPS", "0") == "1",
-                             MAX_CONTENT_LENGTH=50 * 1024 * 1024)
-    app.layout = serve_layout
+    _mailer = mailer or auth.mailer_from_env()
+    app.title = "HR Learning Intelligence"
+    app.config.suppress_callback_exceptions = True
+    app.index_string = app.index_string.replace("{%css%}", "{%css%}\n<style>" + CSS + "</style>")
+    server = app.server
+    server.secret_key = auth.secret()
+    if https is None:
+        https = os.environ.get("HRLI_HTTPS", "0") == "1"
+    server.config.update(SESSION_COOKIE_NAME="hrli_session", SESSION_COOKIE_HTTPONLY=True,
+                         SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_SECURE=bool(https),
+                         PERMANENT_SESSION_LIFETIME=timedelta(hours=config.SESSION_HOURS),
+                         MAX_CONTENT_LENGTH=50 * 1024 * 1024)
+    app.layout = layout
 
-    @app.server.route("/logout")
-    def logout():
-        flask.session.clear()
-        return flask.redirect("/")
-
-    @app.server.before_request
+    @server.before_request
     def guard():
-        # 로그인 전에는 로그인 화면을 그리는 데 필요한 요청만 허용한다.
-        if current_user() or not flask.request.path.startswith("/_dash-update-component"):
+        # 로그인 전에는 로그인 화면을 그리고 인증하는 콜백만 허용한다(각 데이터 콜백의 권한 검사에 더한 이중 방어).
+        if not flask.request.path.endswith("/_dash-update-component") or current_user():
             return None
-        body = flask.request.get_json(silent=True) or {}
-        if "login-redirect" in str(body.get("output", "")):
+        ids = _output_ids(flask.request.get_json(silent=True) or {})
+        if ids and ids <= PUBLIC_OUTPUTS:
             return None
         return flask.abort(401)
 
     return app
+
+
+def create_app() -> Dash:
+    return attach(Dash(__name__, update_title=None))
 
 
 if __name__ == "__main__":

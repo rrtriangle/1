@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import pandas as pd
-from dash import Input, Output, State, callback, dcc, html
+from dash import Input, Output, callback, dcc, html
 
-from .. import ai_summary, analysis, classify, config, metrics
+from .. import analysis, classify, config, metrics, summary
 from ..metrics import LABELS
 from . import charts
 from .common import FILTERS, build_ctx, card, grid, kpi_text, options, require, section, table
@@ -23,16 +23,13 @@ def period_note(*f):
 # ================================================================ 전사 교육 현황
 
 def home(user):
-    return html.Div([dcc.Loading(html.Div(id="home-body")),
-                     section("분석 결과 요약", html.Button("AI 요약 생성(선택 기능)", id="ai-btn", n_clicks=0),
-                             dcc.Loading(dcc.Markdown(id="ai-out")),
-                             note="수치는 모두 Python이 계산한다. AI는 개인 식별정보가 없는 집계 결과만 받아 문장으로 정리한다.")])
+    return dcc.Loading(html.Div(id="home-body"))
 
 
 def _payload(c):
     k = metrics.kpis(c.fact, c.pop)
     prev = metrics.kpis(metrics.in_period(c.fact_all, c.compare[0]), c.population(c.compare[0])) if c.compare else None
-    return ai_summary.build_payload(c.period.label, k, prev, metrics.group_summary(c.fact, c.pop, "grp"),
+    return summary.build_payload(c.period.label, k, prev, metrics.group_summary(c.fact, c.pop, "grp"),
                                     metrics.group_summary(c.fact, c.pop, "job_family"),
                                     metrics.share(c.fact, "field"), c.pop_note)
 
@@ -88,15 +85,9 @@ def home_body(*f):
                                                 "진행 중인 연도는 연중 누계다."),
             section("교육 대상별 현황", targets, note=f"{c.basis_label}. 인원 {config.MIN_GROUP_SIZE}명 미만 집단은 표시하지 않는다."),
             section("교육 구성", comp), section("주요 교육 과정", top),
-            section("요약(규칙 기반)", dcc.Markdown(ai_summary.rule_summary(_payload(c))))]
+            section("분석 결과 요약", dcc.Markdown(summary.rule_summary(_payload(c))),
+                    note="Python이 계산한 집계 결과를 정해진 규칙으로 문장화한 것이다. 외부 AI 서비스는 쓰지 않는다.")]
     return out
-
-
-@callback(Output("ai-out", "children"), Input("ai-btn", "n_clicks"), [State(i.component_id, i.component_property)
-                                                                      for i in FILTERS], prevent_initial_call=True)
-def ai_out(_n, *f):
-    c = build_ctx(require("analysis"), *f)
-    return ai_summary.ai_summary(_payload(c))
 
 
 # ================================================================ 조직·직종별 분석

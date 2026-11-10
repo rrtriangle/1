@@ -63,6 +63,10 @@ def body(tab, _tick):
                         html.Label(["명부 기준월(YYYY-MM)", dcc.Input(id="up-month", value=f"{date.today():%Y-%m}")]),
                         dcc.Upload(html.Button("Excel/CSV 파일 선택", className="primary"), id="up-file", multiple=False),
                     ], className="controls"),
+                    html.Div([
+                        html.Label(["또는 Dataiku 데이터셋 이름", dcc.Input(id="up-dataset", placeholder="예: training_history")]),
+                        html.Button("데이터셋에서 불러오기", id="up-dataset-btn", n_clicks=0),
+                    ], className="controls"),
                     note="업로드하면 원본을 보관하고 기존 데이터와 비교만 한다. 아래에서 검토·승인하기 전에는 통계에 반영되지 않는다. "
                          "파일에 없는 기존 직원·이력은 삭제하지 않는다."),
             section("② 배치 검토·승인·복구",
@@ -193,18 +197,21 @@ def body(tab, _tick):
                 section("데이터 수정 이력(최근 500건)", table(ch, page_size=12)),
                 section("접근·다운로드 이력(최근 500건)", table(ac, page_size=12))]
     if tab == "users" and auth.can(user, "users"):
-        u = db.read("SELECT username AS 아이디, role AS 역할, org_scope AS 조회범위, active AS 사용 FROM users")
+        u = db.read("SELECT username AS 이메일, name AS 이름, role AS 역할, org_scope AS 조회범위, active AS 사용 FROM users")
         u["역할"] = u["역할"].map(config.ROLES)
         return [section("사용자 관리", table(u),
                         html.Div([
-                            html.Label(["아이디", dcc.Input(id="usr-name", autoComplete="off")]),
-                            html.Label(["비밀번호(8자 이상)", dcc.Input(id="usr-pw", type="password", autoComplete="new-password")]),
+                            html.Label(["이메일", dcc.Input(id="usr-name", type="email", autoComplete="off")]),
+                            html.Label(["이름(선택)", dcc.Input(id="usr-pw", autoComplete="off")]),
                             html.Label(["역할", dcc.Dropdown(id="usr-role", clearable=False, value="analyst", options=[
                                 {"label": v, "value": k} for k, v in config.ROLES.items()])]),
                             html.Label(["조회 범위(조직 관리자: 그룹·공장명)", dcc.Input(id="usr-scope")]),
-                            html.Button("계정 생성·갱신", id="usr-save", n_clicks=0, className="primary"),
+                            html.Label(["사용", dcc.Dropdown(id="usr-active", clearable=False, value=1, options=[
+                                {"label": "사용", "value": 1}, {"label": "중지", "value": 0}])]),
+                            html.Button("사용자 저장", id="usr-save", n_clicks=0, className="primary"),
                         ], className="controls"),
-                        note="같은 아이디로 저장하면 비밀번호와 역할이 바뀐다.")]
+                        note="여기 등록된 이메일만 인증 코드로 로그인할 수 있다. 같은 이메일로 저장하면 역할·범위·사용 여부가 바뀐다. "
+                             "중지한 사용자는 다음 로그인부터 막힌다.")]
     raise PreventUpdate
 
 
@@ -223,6 +230,31 @@ def upload(contents, filename, kind, ftype, month, tick):
     if b["status"] == "failed":
         return f"배치 #{bid} 검증 실패(원본은 보관됨): {b['notes']}", (tick or 0) + 1
     return f"배치 #{bid} 업로드 완료. 아래에서 비교 결과를 검토한 뒤 승인하세요.", (tick or 0) + 1
+
+
+@callback(Output("adm-msg", "children", allow_duplicate=True), Output("tick", "data", allow_duplicate=True),
+          Input("up-dataset-btn", "n_clicks"), State("up-dataset", "value"), State("up-kind", "value"),
+          State("up-type", "value"), State("up-month", "value"), State("tick", "data"), prevent_initial_call=True)
+def upload_dataset(n, name, kind, ftype, month, tick):
+    """Dataiku 프로젝트의 데이터셋을 읽어 파일 업로드와 똑같은 검토 절차에 올린다."""
+    user = require("manage")
+    if not n or not (name or "").strip():
+        raise PreventUpdate
+    name = name.strip()
+    try:
+        import dataiku
+    except ImportError:
+        return "Dataiku 안에서 실행할 때만 데이터셋을 불러올 수 있습니다. 파일 업로드를 이용하세요.", tick
+    try:
+        df = dataiku.Dataset(name).get_dataframe()
+    except Exception as e:  # noqa: BLE001 - 데이터셋 이름·권한 오류를 그대로 안내
+        return f"데이터셋 '{name}'을 읽지 못했습니다: {str(e)[:200]}", tick
+    bid = ingest.stage(df.to_csv(index=False).encode("utf-8"), f"dataset_{name}.csv", kind, ftype, user["username"],
+                       month if kind == "roster" else None)
+    b = ingest.batches().set_index("batch_id").loc[bid]
+    if b["status"] == "failed":
+        return f"배치 #{bid} 검증 실패(원본은 보관됨): {b['notes']}", (tick or 0) + 1
+    return f"배치 #{bid}: 데이터셋 '{name}' {len(df):,}행을 불러왔습니다. 아래에서 검토한 뒤 승인하세요.", (tick or 0) + 1
 
 
 @callback(Output("bt-detail", "children"), Input("bt-pick", "value"))
@@ -426,14 +458,14 @@ def employee_save(n, emp_no, col, val, reason, tick):
 
 @callback(Output("adm-msg", "children", allow_duplicate=True), Output("tick", "data", allow_duplicate=True),
           Input("usr-save", "n_clicks"), State("usr-name", "value"), State("usr-pw", "value"), State("usr-role", "value"),
-          State("usr-scope", "value"), State("tick", "data"), prevent_initial_call=True)
-def user_save(n, name, pw, role, scope, tick):
+          State("usr-scope", "value"), State("usr-active", "value"), State("tick", "data"), prevent_initial_call=True)
+def user_save(n, email, name, role, scope, active, tick):
     admin_user = require("users")
     if not n:
         raise PreventUpdate
     try:
-        auth.create_user((name or "").strip(), pw or "", role, (scope or "").strip() or None)
+        auth.save_user(email, role, (scope or "").strip() or None, (name or "").strip() or None, bool(active))
     except ValueError as e:
         return f"저장하지 못했습니다: {e}", tick
-    db.log_access(admin_user["username"], "사용자 계정 생성·갱신", f"{name} ({role})")
-    return f"계정 '{name}'을 저장했습니다.", (tick or 0) + 1
+    db.log_access(admin_user["username"], "사용자 저장", f"{auth.norm(email)} ({role}, {'사용' if active else '중지'})")
+    return f"사용자 '{auth.norm(email)}'을 저장했습니다.", (tick or 0) + 1

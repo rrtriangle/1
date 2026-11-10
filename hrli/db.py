@@ -27,11 +27,22 @@ REC_ATTRS = [
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    username TEXT PRIMARY KEY,
-    pw_hash TEXT NOT NULL,
+    username TEXT PRIMARY KEY,   -- 로그인 이메일(소문자)
+    name TEXT,
     role TEXT NOT NULL,
     org_scope TEXT,              -- 조직 관리자: 조회 가능한 그룹(grp)
     active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS otp (
+    username TEXT PRIMARY KEY,   -- 이메일당 유효한 인증 코드는 하나
+    code_hash TEXT NOT NULL,     -- 코드는 저장하지 않고 해시만 보관
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS column_mapping (
     kind TEXT NOT NULL,          -- roster / training

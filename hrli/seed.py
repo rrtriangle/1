@@ -1,33 +1,30 @@
 """DB 초기화와 계정 생성, 데모 데이터 적재.
 
-  python -m hrli.seed --init            # 빈 DB + 관리자 계정
-  python -m hrli.seed --demo            # 가상 데이터까지 적재(검증·시연용)
+  python -m hrli.seed --init --admin-email me@company.com   # 빈 DB + 첫 관리자
+  python -m hrli.seed --demo                               # 가상 데이터와 시험용 사용자까지 적재
 """
 from __future__ import annotations
 
 import argparse
-import os
-import secrets
 
 from . import auth, config, db, ingest, sample_data
 
 
-def _password(env: str) -> tuple[str, bool]:
-    pw = os.environ.get(env)
-    return (pw, False) if pw else (secrets.token_urlsafe(9), True)
+DEMO_USERS = [("trainer@example.com", "trainer", None), ("analyst@example.com", "analyst", None),
+              ("manager1@example.com", "org_manager", "1공장")]
 
 
-def init(demo: bool = False, path=None, quiet: bool = False) -> dict:
+def init(demo: bool = False, admin_email: str | None = None, path=None, quiet: bool = False) -> list[str]:
+    """DB를 만들고 첫 관리자 이메일을 등록한다. demo=True면 가상 데이터와 시험용 사용자도 넣는다."""
     db.init_db(path)
-    accounts = [("admin", "admin", None)]
+    accounts = [(admin_email or ("admin@example.com" if demo else None), "admin", None)]
     if demo:
-        accounts += [("trainer", "trainer", None), ("analyst", "analyst", None), ("manager1", "org_manager", "1공장")]
-    created = {}
-    for name, role, scope in accounts:
-        if db.read("SELECT 1 FROM users WHERE username=?", (name,), path).empty:
-            pw, generated = _password(f"HRLI_{name.upper()}_PASSWORD")
-            auth.create_user(name, pw, role, scope, path)
-            created[name] = pw if generated else "(환경변수 값)"
+        accounts += DEMO_USERS
+    created = []
+    for email, role, scope in accounts:
+        if email and auth.get_user(email, path) is None:
+            auth.save_user(email, role, scope, path=path)
+            created.append(f"{auth.norm(email)} ({config.ROLES[role]})")
     if demo and db.read("SELECT 1 FROM upload_batch LIMIT 1", path=path).empty:
         files = sample_data.demo_files()
         for month, content in files["rosters"].items():
@@ -44,10 +41,10 @@ def init(demo: bool = False, path=None, quiet: bool = False) -> dict:
                         " ('field','어학','어학 교육 시간은 임의 입력 가능성이 있어 시간 통계 제외','seed',?)", (db.now(),))
     if not quiet:
         print(f"DB: {path or config.DB_PATH}")
-        for name, pw in created.items():
-            print(f"계정 생성: {name} / {pw}")
-        if created:
-            print("위 임시 비밀번호는 다시 표시되지 않습니다.")
+        for c in created:
+            print(f"사용자 등록: {c}")
+        if db.read("SELECT 1 FROM users WHERE role='admin' AND active=1", path=path).empty:
+            print("주의: 시스템 관리자가 없습니다. --admin-email 로 관리자 이메일을 등록하세요.")
     return created
 
 
@@ -55,5 +52,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--init", action="store_true")
     ap.add_argument("--demo", action="store_true")
+    ap.add_argument("--admin-email", help="첫 시스템 관리자의 이메일")
     a = ap.parse_args()
-    init(demo=a.demo)
+    init(demo=a.demo, admin_email=a.admin_email)

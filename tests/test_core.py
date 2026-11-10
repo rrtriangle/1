@@ -1,20 +1,29 @@
-"""적재 규칙과 지표 정의에 대한 테스트. 임시 DB에서 돈다."""
+"""적재 규칙·지표 정의·로그인에 대한 테스트. 내장 unittest만 쓴다."""
 import io
 from datetime import date
 
+import re
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+
 import pandas as pd
-import pytest
 
 from hrli import analysis, auth, classify, config, db, ingest, metrics
 
 
-@pytest.fixture()
-def env(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "DB_PATH", tmp_path / "t.sqlite3")
-    monkeypatch.setattr(config, "RAW_DIR", tmp_path / "raw")
-    monkeypatch.setattr(config, "MIN_GROUP_SIZE", 1)
-    db.init_db()
-    return tmp_path
+class raises:
+    """with raises(ValueError): ... 형태로 예외 발생을 확인한다."""
+    def __init__(self, exc):
+        self.exc = exc
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, typ, val, tb):
+        assert typ is not None and issubclass(typ, self.exc), f"{self.exc.__name__}가 발생해야 한다"
+        return True
 
 
 def xlsx(rows):
@@ -50,7 +59,7 @@ def cats(batch_id):
     return ingest.staging(batch_id)["category"].value_counts().to_dict()
 
 
-def test_roster_change_snapshot_and_missing_is_not_retirement(env):
+def test_roster_change_snapshot_and_missing_is_not_retirement():
     roster("2026-01", [emp("1"), emp("2")])
     b = roster("2026-02", [emp("1", grp="B그룹")])
     assert cats(b) == {"changed": 1, "missing": 1}
@@ -62,14 +71,14 @@ def test_roster_change_snapshot_and_missing_is_not_retirement(env):
     assert len(db.read("SELECT * FROM change_log WHERE col='grp'")) == 1
 
 
-def test_backfilled_roster_does_not_overwrite_latest(env):
+def test_backfilled_roster_does_not_overwrite_latest():
     roster("2026-03", [emp("1", grp="B그룹")])
     roster("2026-01", [emp("1", grp="A그룹")])
     assert db.read("SELECT grp FROM employee").iat[0, 0] == "B그룹"
     assert len(db.read("SELECT * FROM employee_snapshot")) == 2
 
 
-def test_training_dedup_suspect_unmatched_error(env):
+def test_training_dedup_suspect_unmatched_error():
     roster("2026-01", [emp("1")])
     training([rec("1")])
     b = training([rec("1"),                         # 완전히 동일 → 중복
@@ -78,7 +87,7 @@ def test_training_dedup_suspect_unmatched_error(env):
                   rec("9"),                         # 명부에 없는 사번
                   rec("1", name=None)], approve=False)  # 교육명 누락
     assert cats(b) == {"duplicate": 1, "new": 1, "suspect": 1, "unmatched": 1, "error": 1}
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         ingest.approve(b, "t")                      # 검토 안 한 중복 의심 건이 있으면 승인 불가
     s = ingest.staging(b)
     ingest.set_decision(b, [int(s.loc[s["category"] == "suspect", "row_no"].iat[0])], "update")
@@ -88,7 +97,7 @@ def test_training_dedup_suspect_unmatched_error(env):
     assert len(metrics.load_fact()) == 2            # 미매칭 이력은 보관하되 통계에는 넣지 않는다
 
 
-def test_source_id_detects_change_and_full_file_never_deletes(env):
+def test_source_id_detects_change_and_full_file_never_deletes():
     roster("2026-01", [emp("1")])
     training([rec("1", 교육이력ID="T1"), rec("1", start="2026-03-01", 교육이력ID="T2")])
     b = training([rec("1", hours=4, 교육이력ID="T1")], approve=False)  # T2가 빠진 전체 파일
@@ -98,7 +107,7 @@ def test_source_id_detects_change_and_full_file_never_deletes(env):
     assert r["hours_raw"].tolist() == [4.0, 8.0]    # T1 수정, T2는 삭제되지 않음
 
 
-def test_rollback_restores_previous_state(env):
+def test_rollback_restores_previous_state():
     roster("2026-01", [emp("1")])
     b1 = training([rec("1", 교육이력ID="T1")])
     b2 = training([rec("1", hours=99, 교육이력ID="T1"), rec("1", start="2026-04-01", 교육이력ID="T2")])
@@ -114,7 +123,7 @@ def test_rollback_restores_previous_state(env):
     assert b1
 
 
-def test_fatal_file_keeps_raw_and_changes_nothing(env):
+def test_fatal_file_keeps_raw_and_changes_nothing():
     b = ingest.stage(xlsx([{"이름": "x"}]), "잘못된파일.xlsx", "training", "full", "t")
     row = ingest.batches().iloc[0]
     assert row["status"] == "failed" and "필수 항목" in row["notes"]
@@ -131,7 +140,7 @@ def test_hunet_rule_and_unknown_stays_unclassified():
     assert len(sim) == 1
 
 
-def test_metric_definitions(env):
+def test_metric_definitions():
     roster("2026-01", [emp("1"), emp("2"), emp("3", grp="B그룹"), emp("4", grp="B그룹", status="퇴직")])
     training([rec("1"), rec("2"),                                    # 같은 과정 1회 운영에 2명
               rec("1", name="비즈니스 영어 회화", start="2026-03-02", hours=100, inst="휴넷", typ="사내"),
@@ -153,7 +162,7 @@ def test_metric_definitions(env):
     assert sorted(t["emp_no"]) == ["2", "3"]
 
 
-def test_org_basis_at_time_uses_snapshot(env):
+def test_org_basis_at_time_uses_snapshot():
     roster("2026-01", [emp("1", grp="A그룹")])
     roster("2026-02", [emp("1", grp="B그룹")])
     training([rec("1", start="2026-01-15"), rec("1", start="2025-06-01")])
@@ -172,7 +181,7 @@ def test_period_comparison_uses_same_length():
     assert (q.start, q.end) == (date(2025, 10, 1), date(2025, 12, 31))
 
 
-def test_edit_keeps_original_and_logs(env):
+def test_edit_keeps_original_and_logs():
     roster("2026-01", [emp("1")])
     training([rec("1", hours=300)])
     db.update_field("training_record", 1, "hours_adj", 8.0, "t", "입력 오류 보정")
@@ -181,14 +190,72 @@ def test_edit_keeps_original_and_logs(env):
     assert metrics.load_fact()["hours"].iat[0] == 8.0
     lg = db.read("SELECT * FROM change_log WHERE tbl='training_record'").iloc[0]
     assert (lg["new_value"], lg["reason"], lg["username"]) == ("8.0", "입력 오류 보정", "t")
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.update_field("training_record", 1, "record_id", 5, "t")
 
 
-def test_auth_roles(env):
-    auth.create_user("m", "password-1", "org_manager", "A그룹")
-    assert auth.verify("m", "wrong") is None
-    u = auth.verify("m", "password-1")
+def test_otp_login():
+    sent = []
+    mailer = lambda to, subject, body: sent.append((to, body))  # noqa: E731
+    auth.save_user("Manager@Corp.com", "org_manager", "A그룹")
+    assert auth.request_code("nobody@corp.com", mailer) == auth.SENT_MSG and not sent  # 미등록: 같은 문구, 발송 없음
+    assert auth.request_code("manager@corp.com", mailer) == auth.SENT_MSG and len(sent) == 1
+    code = re.search(r"\b(\d{6})\b", sent[0][1]).group(1)
+    assert code not in db.read("SELECT code_hash FROM otp").iat[0, 0]           # 코드 원문은 저장하지 않는다
+    assert "다시 요청" in auth.request_code("manager@corp.com", mailer)            # 재발송 대기
+    wrong = "000000" if code != "000000" else "111111"
+    assert auth.verify_code("manager@corp.com", wrong) is None
+    u = auth.verify_code(" MANAGER@corp.com ", code)
+    assert u["role"] == "org_manager" and u["org_scope"] == "A그룹"
+    assert auth.verify_code("manager@corp.com", code) is None                   # 1회용
     assert auth.can(u, "analysis") and not auth.can(u, "person") and not auth.can(u, "manage")
-    with pytest.raises(ValueError):
-        auth.create_user("x", "short", "admin")
+
+
+def test_otp_expiry_attempt_limit_and_inactive():
+    sent = []
+    mailer = lambda to, subject, body: sent.append(body)  # noqa: E731
+    auth.save_user("a@corp.com", "admin")
+    auth.request_code("a@corp.com", mailer)
+    code = re.search(r"\b(\d{6})\b", sent[-1]).group(1)
+    wrong = "000000" if code != "000000" else "111111"
+    for _ in range(config.OTP_MAX_ATTEMPTS):
+        assert auth.verify_code("a@corp.com", wrong) is None
+    assert auth.verify_code("a@corp.com", code) is None                         # 횟수 초과 후에는 맞는 코드도 거부
+    with db.tx() as con:
+        con.execute("DELETE FROM otp")
+    auth.request_code("a@corp.com", mailer)
+    code = re.search(r"\b(\d{6})\b", sent[-1]).group(1)
+    with db.tx() as con:
+        con.execute("UPDATE otp SET expires_at='2000-01-01T00:00:00'")
+    assert auth.verify_code("a@corp.com", code) is None                         # 만료
+    assert "보내지 못했습니다" in auth.request_code("a@corp.com", None)             # 메일 설정 없음 → 코드 폐기
+    assert db.read("SELECT COUNT(*) FROM otp").iat[0, 0] == 0
+    with raises(ValueError):
+        auth.save_user("a@corp.com", "admin", active=False)                     # 마지막 관리자는 중지 불가
+    auth.save_user("b@corp.com", "analyst")
+    auth.save_user("b@corp.com", "analyst", active=False)
+    assert auth.request_code("b@corp.com", mailer) == auth.SENT_MSG and len(sent) == 2  # 중지된 사용자에게는 발송 없음
+
+
+class CoreTests(unittest.TestCase):
+    """각 테스트를 새 임시 DB에서 실행한다. 실행: python -m unittest discover -s tests"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.saved = (config.DB_PATH, config.RAW_DIR, config.MIN_GROUP_SIZE)
+        config.DB_PATH, config.RAW_DIR, config.MIN_GROUP_SIZE = self.tmp / "t.sqlite3", self.tmp / "raw", 1
+        db.init_db()
+
+    def tearDown(self):
+        config.DB_PATH, config.RAW_DIR, config.MIN_GROUP_SIZE = self.saved
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+for _name, _fn in list(globals().items()):
+    if _name.startswith("test_") and callable(_fn):
+        setattr(CoreTests, _name, (lambda f: lambda self: f())(_fn))
+        del globals()[_name]
+del _name, _fn
+
+if __name__ == "__main__":
+    unittest.main()
