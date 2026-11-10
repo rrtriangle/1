@@ -1,0 +1,11 @@
+pandas>=2.2
+numpy>=1.26
+openpyxl>=3.1
+plotly>=5.20
+dash>=2.17
+scikit-learn>=1.4
+scipy>=1.12
+networkx>=3.2
+# 선택: AI 요약 기능(HRLI_AI_ENABLED=1)을 켤 때만 필요
+anthropic>=1.0
+pytest>=8.0
