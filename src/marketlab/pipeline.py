@@ -7,7 +7,8 @@ import traceback
 from datetime import datetime
 from typing import Callable
 
-from .collectors import base, indicators, krx_cache, marcap, nasdaqtrader, opendart, sec_edgar, yfinance_us
+from .collectors import (base, indicators, krx_cache, marcap, nasdaqtrader, opendart, sec_edgar, yfinance_minute,
+                         yfinance_us)
 from .config import get_settings
 from .logging_setup import get_logger, log_event
 from .storage.catalog import init_catalog
@@ -108,6 +109,17 @@ def ingest_indicators(summary: dict | None = None) -> dict:
     return summary
 
 
+def ingest_minute(summary: dict | None = None, market: str = "ALL", **kw) -> dict:
+    """분봉 수집. market='ALL' 이면 설정(sources.yfinance_minute.markets)에 적힌 시장을 차례로 받는다."""
+    summary = summary if summary is not None else {"steps": []}
+    cfg = get_settings().source("yfinance_minute")
+    markets = list(cfg.get("markets") or ["KR"]) if market == "ALL" else [market]
+    for m in markets:
+        _step(summary, f"minute_{m}", yfinance_minute.collect, market=m, symbols=kw.get("symbols"),
+              limit=kw.get("limit"), max_minutes=kw.get("max_minutes"))
+    return summary
+
+
 def _compact(res: dict) -> dict:
     res = dict(res or {})
     if "per_year" in res:
@@ -124,7 +136,7 @@ def run_job(kind: str, market: str | None = None, mode: str = "incremental", **k
     with base.exclusive_lock("ingest"):
         base.clear_stop()
         base.mark_stale_runs()
-        if kind in ("ingest", "update") and not network_available():
+        if kind in ("ingest", "update", "minute") and not network_available():
             summary["skipped"] = "네트워크 연결 없음"
             _save_summary(summary, "last_" + kind)
             return summary
@@ -141,11 +153,18 @@ def run_job(kind: str, market: str | None = None, mode: str = "incremental", **k
                 ingest_us("incremental", summary, revalidate=True)
                 ingest_indicators(summary)
                 research_live(summary)
+                mcfg = get_settings().source("yfinance_minute")
+                if mcfg.get("enabled", True) and mcfg.get("in_update", True):
+                    ingest_minute(summary)   # 시간 예산이 있는 작업이라 맨 마지막에 둔다
+            elif kind == "minute":
+                ingest_minute(summary, market or "ALL", limit=kw.get("limit"), symbols=kw.get("symbols"),
+                              max_minutes=kw.get("max_minutes"))
             elif kind == "retry":
                 _step(summary, "yfinance_retry", yfinance_us.collect, mode="incremental", retry_failed_only=True)
                 _step(summary, "us_standardize", lambda: _compact(us_prices.run()))
-            summary["validation"] = _step(summary, "validate", lambda: {
-                k: v for k, v in checks.run(deep=kw.get("deep", False)).items() if k in ("dataset_issues", "checks")})
+            if kind != "minute":   # 분봉만 받는 실행은 일봉 검증을 다시 돌리지 않는다
+                summary["validation"] = _step(summary, "validate", lambda: {
+                    k: v for k, v in checks.run(deep=kw.get("deep", False)).items() if k in ("dataset_issues", "checks")})
         except (StorageRisk, StorageUnavailable) as e:
             summary["storage_error"] = str(e)
             raise_alert("error", "storage", f"저장공간/저장장치 문제로 중단: {e}")

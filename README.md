@@ -48,6 +48,7 @@ marketlab disk-plan                       # 저장공간 계획 + 외장 SSD 필
 marketlab ingest --market KR --mode full  # 한국 전체 (marcap 1995~ + KRX 목록·상장폐지·지수)  ≈ 5분, 0.9GB
 marketlab ingest --market US --mode full  # 미국 전체 (Nasdaq Trader 목록 + yfinance 전 종목)   ≈ 수 시간
 marketlab ingest --market IND             # 지수·환율·금리 (FRED, Yahoo, KRX)
+marketlab minute                          # 1분봉 (한국 전 종목, 키 불필요). 아래 '분봉 수집' 참고
 marketlab update --all                    # 증분 갱신 + 최근 거래일 재검증 + 품질 검증
 marketlab retry                           # 실패·차단된 종목만 재시도
 marketlab stop                            # 진행 중인 수집을 안전하게 중지 (상태 저장 후 종료)
@@ -67,6 +68,23 @@ Python 을 몰라도 쓸 수 있도록 `scripts/` 에 더블클릭 실행 파일
 
 미국 전체 수집은 Yahoo 호출 제한 때문에 오래 걸립니다. 중간에 멈추거나 Mac 을 꺼도 괜찮습니다. 같은 명령을 다시 실행하면 이미 받은 종목은 건너뛰고 이어서 진행합니다.
 `--limit 500` 처럼 나눠서 실행할 수도 있습니다.
+
+### 분봉 수집 (1분봉)
+
+```bash
+marketlab minute --max-minutes 0          # 처음 한 번: 최근 약 30일치를 끝까지 받기 (한국 전 종목 ≈ 4~5시간)
+marketlab minute                          # 평소: 새로 확정된 날만 추가 (시간 예산 60분, 남으면 다음 실행에서)
+marketlab minute --symbols 005930 000660  # 특정 종목만
+```
+- **왜 매일 받아야 하나**: 과거 분봉은 무료로 구할 수 없습니다. Yahoo 는 1분봉을 최근 약 30일만 보관하므로, 사라지기 전에 받아 직접 쌓습니다.
+  자동 갱신(`marketlab update`)이 마지막 단계에서 함께 실행하므로 한 번 설치해 두면 손댈 일이 없습니다.
+- **이어받기**: 종목마다 '어느 날짜까지 받았는지' 기록하고 그 다음 날부터 받습니다. 가장 오래 못 받은 종목부터 처리하므로
+  하루에 다 못 돌아도 며칠에 걸쳐 순환합니다. Mac 을 30일 넘게 꺼 두면 그 사이 분봉은 복구할 수 없습니다.
+- **용량 절약**: 장이 끝나 확정된 날의 봉만 한 번씩 저장하고(중복 없음), 거래가 없던 분은 저장하지 않습니다. zstd Parquet.
+  한국 전 종목 기준 연 2~4GB 로 추정합니다(실측 전 추정치). 미국까지 켜면 몇 배로 늘어납니다 → `config/settings.yaml` 의 `sources.yfinance_minute.markets`.
+- **한계**: Yahoo 한국 분봉은 KRX 정규장 기준이고 NXT(대체거래소) 체결은 없습니다. 비공식 원천이라 드물게 누락 봉이 있고, 코넥스 종목은 없습니다.
+  수집 뒤 액면분할이 생기면 그 이전 분봉은 분할 전 가격 그대로입니다. 한국투자증권 API 키가 생기면 약 1년치 과거 분봉을 추가로 채울 수 있습니다(미구현).
+- 읽기: `MarketData().minute_bars("KR-005930-19950502", "2026-11-01", "2026-11-10")` (ts 는 UTC, 봉 시작 시각)
 
 ## 3. 처리 흐름
 
@@ -178,7 +196,7 @@ US 로직 테스트는 Yahoo 응답 함수만 대체하고, 재개·중지·서�
 ```
 config/settings.yaml      설정 (경로, 예산, DuckDB, 원천별 호출 간격, 갱신 시각, 검증 기준)
 src/marketlab/
-  collectors/             marcap, krx_cache, nasdaqtrader, yfinance_us, stooq, indicators, sec_edgar, opendart
+  collectors/             marcap, krx_cache, nasdaqtrader, yfinance_us, yfinance_minute, stooq, indicators, sec_edgar, opendart
   transforms/             kr_prices(표준화·증권 마스터·기업행위·거래일), kr_breadth, us_prices
   validation/checks.py    데이터셋 검증, 원천 간 비교, 품질 지표, 보고서
   storage/                catalog(DuckDB), diskguard, diskplan, parquet_io

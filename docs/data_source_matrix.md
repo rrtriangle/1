@@ -57,6 +57,12 @@
 - **주의**: 접속이 막혀도 yfinance 는 네트워크 오류 대신 `YFTzMissingError: possibly delisted` 를 돌려줍니다(개발환경에서 확인).
   그래서 수집기는 SPY 조회로 실제 응답 여부를 확인한 뒤 진행하고, 차단 중의 빈 응답을 상장폐지로 기록하지 않습니다.
 
+### 4-1. Yahoo Finance 1분봉 — `collectors/yfinance_minute.py` (2026-11-10 추가)
+- 용도: 한국(.KS/.KQ)·미국 1분봉 OHLCV. 키 불필요. **개발환경에서는 Yahoo 접속과 duckdb/pyarrow 설치가 막혀 실제 수집은 검증하지 못했습니다** → 맥북에서 `marketlab minute --symbols 005930 --max-minutes 5` 로 먼저 확인하세요
+- 제한: 1분봉은 최근 약 30일만 보관, 요청당 최대 8일 → 종목당 7일 구간으로 나눠 요청하고 매일 증분으로 쌓는다
+- 한국 데이터는 KRX 정규장 기준(지연 시세), NXT 체결 미포함, 코넥스 없음. 수정주가 아님(수집 시점 값)
+- 대안: 한국투자증권 Open API(무료 키, 과거 약 1년 분봉), 키움 REST API. 네이버 금융 화면 수집은 약관상 채택하지 않음
+
 ### 5. Stooq — https://stooq.com/dbh/ , https://stooq.com/db/h/
 - 종목별 CSV(`/q/d/l/?s=aapl.us&i=d`)는 2026년 3월경부터 사이트에서 CAPTCHA 로 발급받는 API 키를 요구한다는 보고가 있음(pandas-datareader 이슈). 일일 호출 한도 존재
 - 대량 DB zip(일봉 전체)은 사람 확인 후 수동 다운로드 → **자동 우회하지 않음**. 사용자가 받은 zip 을 `marketlab import-stooq` 로 가져온다

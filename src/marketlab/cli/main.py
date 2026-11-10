@@ -7,6 +7,7 @@
     marketlab ingest --market US --mode full [--limit N] [--symbols AAPL MSFT]
     marketlab ingest --market IND          지수·환율·금리
     marketlab update --all                 증분 갱신 (launchd 가 호출)
+    marketlab minute [--market KR]         1분봉 수집 (전 종목, 이어받기)
     marketlab retry                        실패 종목 재시도
     marketlab stop                         진행 중인 수집 중지 요청
     marketlab validate [--deep]            품질 검증 + reports/quality_report.md
@@ -60,6 +61,11 @@ def main(argv: list[str] | None = None) -> int:
     up = sub.add_parser("update")
     up.add_argument("--all", action="store_true", required=True)
     up.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
+    mn = sub.add_parser("minute", help="1분봉 수집 (yfinance, 키 불필요). 못 받은 종목은 다음 실행에서 이어받음")
+    mn.add_argument("--market", default="ALL", choices=["KR", "US", "ALL"], help="ALL = 설정의 markets")
+    mn.add_argument("--limit", type=int, help="이번 실행에서 처리할 최대 종목 수")
+    mn.add_argument("--symbols", nargs="*", help="특정 종목만 (예: 005930 000660 또는 AAPL)")
+    mn.add_argument("--max-minutes", type=float, help="시장별 최대 실행 시간(분). 0 = 제한 없음")
     sub.add_parser("retry")
     sub.add_parser("stop")
     va = sub.add_parser("validate")
@@ -119,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
         r = plan(include_sec=args.with_sec, include_stooq_bulk_gb=args.stooq_gb)
         print(Path(get_settings().paths.reports / "disk_plan.md").read_text(encoding="utf-8"))
         return 2 if r["assessment"]["risk"] else 0
-    elif args.cmd in ("ingest", "update", "retry"):
+    elif args.cmd in ("ingest", "update", "retry", "minute"):
         from ..collectors.base import AlreadyRunning
         from ..pipeline import run_job
         try:
@@ -127,6 +133,9 @@ def main(argv: list[str] | None = None) -> int:
                 r = run_job("ingest", market=args.market, mode=args.mode, limit=args.limit, symbols=args.symbols)
             elif args.cmd == "update":
                 r = run_job("update", market="ALL", mode="incremental")
+            elif args.cmd == "minute":
+                r = run_job("minute", market=args.market, limit=args.limit, symbols=args.symbols,
+                            max_minutes=args.max_minutes)
             else:
                 r = run_job("retry")
         except AlreadyRunning as e:

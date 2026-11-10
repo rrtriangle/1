@@ -228,6 +228,29 @@ class MarketData:
         df["price_basis"] = f"adjusted:{adjust}@{as_of_d.isoformat()}"
         return df
 
+    def minute_bars(self, ids: str | Sequence[str], start: str | date | None = None,
+                    end: str | date | None = None, country: str | None = None) -> pd.DataFrame:
+        """1분봉 조회 (marketlab minute 로 쌓은 데이터). start/end 는 거래소 현지 날짜(둘 다 포함).
+
+        ts 는 봉의 시작 시각(UTC)이다. 거래가 없던 분은 행이 없다. 가격은 수집 시점 값 그대로(이후 분할 미반영).
+        """
+        ids = [ids] if isinstance(ids, str) else list(ids)
+        cols = ["security_id", "symbol", "ts", "trade_date", "open", "high", "low", "close", "volume"]
+        countries = [country] if country else sorted({i.split("-")[0] for i in ids})
+        base = self.s.paths.raw / "yfinance_minute" / "interval=1m"
+        globs = [(base / f"country={c}" / "fetch_date=*" / "*.parquet").as_posix()
+                 for c in countries if any((base / f"country={c}").glob("fetch_date=*/*.parquet"))]
+        if not globs or not ids:
+            return pd.DataFrame(columns=cols)
+        return self.con.execute(f"""
+            SELECT {", ".join(cols)}
+            FROM read_parquet([{", ".join(f"'{g}'" for g in globs)}], hive_partitioning = false, filename = true)
+            WHERE security_id IN (SELECT unnest(?::VARCHAR[]))
+              AND trade_date BETWEEN ? AND ?
+            QUALIFY row_number() OVER (PARTITION BY security_id, ts ORDER BY filename DESC) = 1
+            ORDER BY security_id, ts
+        """, [ids, _d(start) if start else date(1900, 1, 1), _d(end)]).df()
+
     def returns(self, ids: str | Sequence[str], start=None, end=None, as_of=None, total_return: bool = False) -> pd.DataFrame:
         adj: Adjust = "total_return" if total_return else "all_corporate"
         df = self.prices(ids, start, end, adjust=adj, as_of=as_of, columns=["security_id", "trade_date", "close", "usable"])
