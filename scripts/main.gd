@@ -18,6 +18,8 @@ var log_box: RichTextLabel
 var roster_box: VBoxContainer
 var roster_buttons := {}
 var hint_label: Label
+var live_rate: HSlider
+var live_rate_label: Label
 var modal: Control
 var modal_box: VBoxContainer
 var modal_scroll: ScrollContainer
@@ -154,9 +156,31 @@ func _build_ui() -> void:
 	world.room_clicked.connect(_on_room_clicked)
 	world.person_clicked.connect(_on_person_pressed)
 	ui.add_child(world)
+	var rate_row := HBoxContainer.new()
+	rate_row.position = Vector2(378, 990)
+	rate_row.size = Vector2(1140, 30)
+	ui.add_child(rate_row)
+	var rlab := Label.new()
+	rlab.text = "반응기 가동률"
+	rate_row.add_child(rlab)
+	live_rate = HSlider.new()
+	live_rate.min_value = 60
+	live_rate.max_value = 120
+	live_rate.step = 5
+	live_rate.value = sim.rate
+	live_rate.custom_minimum_size = Vector2(260, 24)
+	live_rate.focus_mode = Control.FOCUS_NONE
+	live_rate.value_changed.connect(func(v: float) -> void:
+		sim.rate = int(v)
+		live_rate_label.text = _rate_text(int(v)))
+	rate_row.add_child(live_rate)
+	live_rate_label = Label.new()
+	live_rate_label.add_theme_font_size_override("font_size", 15)
+	live_rate_label.text = _rate_text(sim.rate)
+	rate_row.add_child(live_rate_label)
 	hint_label = Label.new()
-	hint_label.position = Vector2(378, 990)
-	hint_label.size = Vector2(1140, 80)
+	hint_label.position = Vector2(378, 1028)
+	hint_label.size = Vector2(1140, 50)
 	hint_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	hint_label.add_theme_color_override("font_color", DIM)
 	hint_label.add_theme_font_size_override("font_size", 15)
@@ -272,6 +296,20 @@ func _button(parent: Control, text: String, cb: Callable, disabled: bool = false
 	b.focus_mode = Control.FOCUS_NONE
 	b.alignment = HORIZONTAL_ALIGNMENT_LEFT
 	b.pressed.connect(cb)
+	parent.add_child(b)
+	return b
+
+
+## 켜고 끄는 버튼. 체크 상자 대신 글자로 상태를 보여 준다 ([ ] / [V])
+func _toggle(parent: Control, text: String, on: bool, cb: Callable) -> Button:
+	var b := Button.new()
+	b.toggle_mode = true
+	b.button_pressed = on
+	b.focus_mode = Control.FOCUS_NONE
+	b.text = ("[V] " if on else "[  ] ") + text
+	b.toggled.connect(func(v: bool) -> void:
+		b.text = ("[V] " if v else "[  ] ") + text
+		cb.call(v))
 	parent.add_child(b)
 	return b
 
@@ -605,11 +643,13 @@ func _open_meeting() -> void:
 		_rich(modal_box, "들어온 돈 [color=#9f9]+%s[/color]   나간 돈 [color=#f96]−%s[/color]   →   [b]%s%s[/b]" % [_money(inc), _money(cost), "+" if inc - cost >= 0 else "", _money(inc - cost)], 18)
 		var lg: Array = last_report["log"]
 		if lg.size() > 0:
-			_label(modal_box, "· " + "\n· ".join(lg.slice(maxi(0, lg.size() - 12))), 15, TEXT)
+			_label(modal_box, "\n".join(lg.slice(maxi(0, lg.size() - 14))), 15, TEXT)
 		var ch: Array = last_report["people"]
 		if ch.size() > 0:
 			_label(modal_box, "눈여겨볼 사람: " + " / ".join(ch), 15, Color(1.0, 0.75, 0.6))
 		_label(modal_box, "박 씨: \"%s\"" % last_report["park"], 16, Color(0.8, 0.8, 0.92))
+		if sh == "day":
+			_label(modal_box, "(밤엔 트럭이 오지 않아 들어온 돈이 없다. 월급·유지비는 교대마다 나간다)", 14, DIM)
 		_label(modal_box, "결재: 공장장 ______ (인)", 14, DIM)
 
 	# 근무표
@@ -674,16 +714,10 @@ func _open_meeting() -> void:
 	sl.value_changed.connect(upd)
 	upd.call(sl.value)
 	if sh == "night" and sim.research["extra"] >= 2:
-		var pc := CheckBox.new()
-		pc.text = "수칙 「2인 1조」: 밤에 반응실·정제실을 두 명씩 (창고는 빈다 → 정제실 출구가 막힌다)"
-		pc.button_pressed = sim.pair_rule
-		pc.focus_mode = Control.FOCUS_NONE
-		pc.toggled.connect(func(on: bool) -> void:
+		_toggle(modal_box, "수칙 「2인 1조」: 밤에 반응실·정제실을 두 명씩 (창고는 빈다 → 정제실 출구가 막힌다)", sim.pair_rule, func(on: bool) -> void:
 			sim.pair_rule = on
-			plan_posts = sim.default_posts(c, sh)
 			_open_meeting_keep())
-		modal_box.add_child(pc)
-	if sh == "day":
+	if sh == "day" and d >= 2:
 		var trow := HBoxContainer.new()
 		modal_box.add_child(trow)
 		_label(trow, "오늘 연구 주제", 16).custom_minimum_size = Vector2(160, 0)
@@ -696,7 +730,24 @@ func _open_meeting() -> void:
 		trow.add_child(tob)
 		_label(trow, "  관찰 기록 %d개 (밤에 이상한 일을 겪거나 조사하면 쌓인다)" % sim.records, 15, DIM)
 
-	# 대타
+	# 설비 투자 (2일차부터)
+	if d >= 2:
+		_sep(modal_box)
+		_label(modal_box, "설비 투자 (지금 예산 %s)" % _money(sim.money), 20, Color(0.7, 0.8, 0.95))
+		var shop := VBoxContainer.new()
+		modal_box.add_child(shop)
+		_fill_shop(shop)
+
+	# 대타 (3일차 밤부터: 프롤로그에서 한 번에 하나씩 가르친다)
+	if d >= 3 and not (d == 3 and sh == "day"):
+		_meeting_substitutes(c)
+	_sep(modal_box)
+	var go := _button(modal_box, "결재하고 근무 시작", _start_shift)
+	go.add_theme_font_size_override("font_size", 22)
+	go.custom_minimum_size = Vector2(400, 50)
+
+
+func _meeting_substitutes(c: int) -> void:
 	_sep(modal_box)
 	_label(modal_box, "대타 (급할 때만: 위반 기록 +1, 수당 −%d, 피로 +%d)" % [Defs.CALL_PAY, Defs.HOLD_FATIGUE], 20, Color(0.7, 0.8, 0.95))
 	var outgoing := sim.people.filter(func(q: Person) -> bool: return q.on_site and q.on_duty and not q.is_staff() and q.crew != c and not q.gone)
@@ -705,35 +756,50 @@ func _open_meeting() -> void:
 		var fl := HFlowContainer.new()
 		modal_box.add_child(fl)
 		for q in outgoing:
-			var cb := CheckBox.new()
-			cb.text = "%s (피로 %d)" % [q.name, q.fatigue]
-			cb.focus_mode = Control.FOCUS_NONE
-			cb.toggled.connect(func(on: bool) -> void:
+			_toggle(fl, "%s (피로 %d)" % [q.name, q.fatigue], false, func(on: bool) -> void:
 				if on:
 					plan_holds.append(q)
 				else:
 					plan_holds.erase(q))
-			fl.add_child(cb)
 	var off := sim.callable_people().filter(func(q: Person) -> bool: return q.crew != c)
 	if off.size() > 0:
 		_label(modal_box, "미리 부르기: 쉬는 조에서 한 명 더 나오게 한다 (교대 시작과 함께 온다)", 15, DIM)
 		var fl2 := HFlowContainer.new()
 		modal_box.add_child(fl2)
 		for q in off.slice(0, 8):
-			var cb2 := CheckBox.new()
-			cb2.text = "%s (%d조, 피로 %d)" % [q.name, q.crew, q.fatigue]
-			cb2.focus_mode = Control.FOCUS_NONE
-			cb2.toggled.connect(func(on: bool) -> void:
+			_toggle(fl2, "%s (%d조, 피로 %d)" % [q.name, q.crew, q.fatigue], false, func(on: bool) -> void:
 				if on:
 					plan_calls.append(q)
 				else:
 					plan_calls.erase(q))
-			fl2.add_child(cb2)
 
-	_sep(modal_box)
-	var go := _button(modal_box, "결재하고 근무 시작", _start_shift)
-	go.add_theme_font_size_override("font_size", 22)
-	go.custom_minimum_size = Vector2(400, 50)
+
+func _fill_shop(box: VBoxContainer) -> void:
+	for c in box.get_children():
+		c.queue_free()
+	for item in ["cctv", "chair", "party"]:
+		var d: Dictionary = Defs.SHOP[item]
+		var row := HBoxContainer.new()
+		box.add_child(row)
+		var owned_txt := ""
+		if item != "party" and sim.owned.has(item):
+			owned_txt = " (있음)"
+		elif item == "party" and not sim.can_buy("party") and sim.money >= d["cost"]:
+			owned_txt = " (이번 주 함)"
+		var b := _button(row, "%s  −%d%s" % [d["name"], d["cost"], owned_txt], func() -> void:
+			sim.buy(item)
+			_fill_shop(box), not sim.can_buy(item))
+		b.custom_minimum_size = Vector2(300, 0)
+		_label(row, d["what"], 15, DIM).custom_minimum_size = Vector2(760, 0)
+	var row2 := HBoxContainer.new()
+	box.add_child(row2)
+	_label(row2, "비상 조명 −%d (방마다):" % Defs.SHOP["em"]["cost"], 16).custom_minimum_size = Vector2(220, 0)
+	for id in Defs.EM_ROOMS:
+		var has: bool = sim.owned.has("em_" + id)
+		_button(row2, Defs.ROOMS[id]["name"] + (" ✓" if has else ""), func() -> void:
+			sim.buy("em", id)
+			_fill_shop(box), not sim.can_buy("em", id))
+	_label(box, "      " + Defs.SHOP["em"]["what"], 15, DIM)
 
 
 func _open_meeting_keep() -> void:
@@ -800,6 +866,8 @@ func _start_shift() -> void:
 	var plan := {"posts": plan_posts.duplicate(), "holds": plan_holds.duplicate(), "calls": [], "rate": sim.rate,
 		"pair": sim.pair_rule, "target": sim.research_target}
 	sim.begin_shift(plan)
+	live_rate.set_value_no_signal(sim.rate)
+	live_rate_label.text = _rate_text(sim.rate)
 	for q in plan_calls:
 		sim._call_in(q, "회의에서 미리 부름", 0, extra_post)
 	sfx.play("stamp")

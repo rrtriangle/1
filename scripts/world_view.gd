@@ -64,7 +64,8 @@ func _draw() -> void:
 	var hall_col := Color(0.18, 0.19, 0.22) if not night else Color(0.09, 0.095, 0.11)
 	for y in Defs.HALL_Y:
 		draw_rect(Rect2(0, y - 22, Defs.MAP_SIZE.x, 44), hall_col)
-	draw_rect(Rect2(Defs.LINK_X - 20, Defs.HALL_Y[0], 40, Defs.HALL_Y[1] - Defs.HALL_Y[0]), hall_col)
+	for lx in Defs.LINK_X:
+		draw_rect(Rect2(lx - 20, Defs.HALL_Y[0], 40, Defs.HALL_Y[1] - Defs.HALL_Y[0]), hall_col)
 	_text(Vector2(Defs.MAP_SIZE.x - 90, Defs.HALL_Y[0] + 5), "복도", 12, Color(0.45, 0.47, 0.5))
 	_text(Vector2(Defs.MAP_SIZE.x - 90, Defs.HALL_Y[1] + 5), "복도", 12, Color(0.45, 0.47, 0.5))
 	# 생산 흐름 화살표
@@ -83,14 +84,14 @@ func _draw() -> void:
 			var i: int = counts.get(p.room, 0)
 			counts[p.room] = i + 1
 			pos = _slot(p.room, i)
-			if not sim.lit[p.room]:
-				# 불 꺼진 방은 안이 보이지 않는다
+			if not sim.lit[p.room] and not sim.owned.has("cctv"):
+				# 불 꺼진 방은 안이 보이지 않는다 (CCTV가 있으면 흑백으로 보인다)
 				_person_spots.append([pos, p])
 				continue
 		_draw_person(pos, p)
 		_person_spots.append([pos, p])
 	# '한 명 더': 불이 켜져 있으면 사람이 하나 더 보인다 (이름표가 없다)
-	if sim.entity_room != "" and sim.lit[sim.entity_room]:
+	if sim.entity_room != "" and (sim.lit[sim.entity_room] or sim.owned.has("cctv")):
 		var i2: int = counts.get(sim.entity_room, 0)
 		var ep := _slot(sim.entity_room, i2)
 		var ppl := sim.in_room(sim.entity_room)
@@ -154,7 +155,7 @@ func _draw_room(id: String, night: bool) -> void:
 		draw_rect(Rect2(br.position, Vector2(br.size.x * k, br.size.y)), col)
 		if c["kind"] == "pressure":
 			_text(br.position + Vector2(0, 24), "역압! %d분 남음" % c["left"], 15, col)
-	if sim.entity_room == id and sim.research["extra"] >= 1:
+	if sim.entity_room == id and (sim.research["extra"] >= 1 or sim.owned.has("cctv")):
 		_text(r.position + Vector2(10, 64), "인원 불일치", 15, Color(1.0, 0.4, 0.4))
 	# 안내 강조
 	if focus_room == id and clock < focus_until:

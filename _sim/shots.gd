@@ -7,6 +7,7 @@ var out := "user://"
 var step := 0
 var wait := 0
 var shots := 0
+var shot_done := {}
 
 
 func _init() -> void:
@@ -105,4 +106,41 @@ func _tick() -> void:
 		7:
 			Engine.time_scale = 1.0
 			_shot("map_night1")
+			step = 8
+		8:
+			# 2일차 아침 회의, 3일차 밤 '한 명 더'까지 빨리 간다
+			Engine.time_scale = 40.0
+			if main.radio_open:
+				var k: String = main.current_radio.get("kind", "")
+				if k == "errand" and not shot_done.has("errand"):
+					shot_done["errand"] = true
+					Engine.time_scale = 1.0
+					_shot("radio_errand")
+				if k == "extra" and not shot_done.has("extra"):
+					shot_done["extra"] = true
+					Engine.time_scale = 1.0
+					_shot("radio_extra")
+					_press_first_choice()
+					step = 9
+					return
+				_press_first_choice()
+			elif main.modal.visible:
+				if main.phase == "meeting" and main.sim.day == 2 and main.sim.shift == "day" and not shot_done.has("m2"):
+					shot_done["m2"] = true
+					Engine.time_scale = 1.0
+					_shot("meeting_day2")
+					main.modal_scroll.scroll_vertical = 700
+					step = 10
+					return
+				if main.phase == "meeting":
+					main._start_shift()
+				else:
+					_press_first_choice()
+		10:
+			_shot("meeting_day2_lower")
+			step = 8
+		9:
+			Engine.time_scale = 1.0
+			_press_first_choice()
+			_shot("after_extra")
 			quit()

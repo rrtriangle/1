@@ -12,7 +12,7 @@ const WEEK_DAYS := 7
 
 # ---------------------------------------------------------------- 돈
 const START_MONEY := 1500.0
-const SELL_PRICE := 60.0        # 세정액 드럼 1개
+const SELL_PRICE := 65.0        # 세정액 드럼 1개
 const RAW_PRICE := 20.0         # 원료 드럼 1개
 const WAGE_PER_SHIFT := 20.0    # 직원 1명, 교대 1번 (근무 여부와 관계없이 월급으로 나간다)
 const UPKEEP_PER_SHIFT := 50.0  # 공장 유지비
@@ -37,7 +37,8 @@ const TRUCK_CAP := 15
 
 # ---------------------------------------------------------------- 사람
 const WALK_PX_PER_MIN := 22.0   # 맵 가로를 건너는 데 약 1시간
-const CALL_TRAVEL_MIN := 40     # 호출받은 사람이 집에서 정문까지 오는 시간
+const CALL_TRAVEL_MIN := 40     # 호출받은 사람이 집에서 정문까지 오는 시간 (평균)
+const CALL_TRAVEL_SPREAD := 20  # ±. 집이 먼 사람, 잠이 덜 깬 사람
 const FATIGUE_WORK_H := 2.5     # 근무 중 시간당 피로
 const FATIGUE_NIGHT_H := 3.0
 const FATIGUE_REST_SHIFT := 25.0  # 쉬는 교대마다 회복
@@ -49,7 +50,7 @@ const HOLD_FATIGUE := 15.0      # 붙잡기: 이미 12시간 일한 사람이 �
 const PRESSURE_K := 0.04        # 역압: 시간당 확률 = K × ((가동률 − 80) ÷ 20)²
 const PRESSURE_NIGHT := 1.5
 const PRESSURE_DAY := 0.4
-const PRESSURE_WINDOW := 120    # 전조에서 폭발까지 (분)
+const PRESSURE_WINDOW := 75     # 전조에서 폭발까지 (분). 반장은 제때 오고, 호출은 아슬아슬하다
 const EXTRA_ALONE := 0.02       # 한 명 더: 밤에 혼자 있는 방, 시간당
 const EXTRA_DARK := 0.05        # 불 꺼진 방이면 더한다
 const EXTRA_STAGE3 := 0.04      # 검은 무늬(오염 75+) 직원이 있으면 더한다
@@ -61,13 +62,22 @@ const PERFECT_P := 0.2          # 직접 대응이 성공했을 때 ★ 완벽�
 const RADIO_GAP := 25           # 무전 사이 최소 간격 (분)
 
 # ---------------------------------------------------------------- 연구
-const RESEARCH_STAGES := {"extra": [4, 9, 16], "pressure": [3, 7, 13]}  # 단계별 누적 관찰 기록
+const RESEARCH_STAGES := {"extra": [6, 15, 26], "pressure": [5, 12, 21]}  # 단계별 누적 관찰 기록
 const RESEARCH_NAMES := {"extra": "한 명 더", "pressure": "역압"}
+
+# ---------------------------------------------------------------- 설비 투자 (돈을 쓰는 곳)
+const SHOP := {
+	"em": {"name": "비상 조명", "cost": 120, "what": "방 하나. 정전이 와도 그 방 불은 안 꺼진다"},
+	"cctv": {"name": "생산동 CCTV", "cost": 350, "what": "조정실에서 인원을 센다. '인원 불일치'가 바로 뜨고, 불 꺼진 방 안도 보인다"},
+	"chair": {"name": "휴게실 안마의자", "cost": 200, "what": "휴게실에서 피로가 두 배로 풀린다"},
+	"party": {"name": "회식", "cost": 200, "what": "전원 스트레스 −20. 한 주에 한 번"},
+}
+const EM_ROOMS := ["reactor", "refine", "store", "tank", "dock"]
 
 # ---------------------------------------------------------------- 맵 (맵 화면 좌표, 1140×930)
 const MAP_SIZE := Vector2(1140, 930)
 const HALL_Y := [300.0, 660.0]  # 위 복도, 아래 복도
-const LINK_X := 25.0            # 두 복도를 잇는 왼쪽 통로
+const LINK_X := [25.0, 625.0]  # 두 복도를 잇는 통로 (왼쪽 끝, 가운데)
 const ROOMS := {
 	"lab": {"name": "연구소", "rect": Rect2(50, 30, 230, 220), "hall": 0,
 		"does": "관찰 기록을 연구해 대처법(근무 수칙)을 찾는다", "who": "연구원 (낮)"},
@@ -77,20 +87,20 @@ const ROOMS := {
 		"does": "고장을 고치고 설비를 점검한다", "who": "정비원 (낮)"},
 	"rest": {"name": "휴게실", "rect": Rect2(730, 30, 200, 220), "hall": 0,
 		"does": "쉬면 피로가 빨리 풀린다", "who": "누구나"},
-	"tank": {"name": "원료 탱크", "rect": Rect2(50, 350, 150, 260), "hall": 1,
+	"tank": {"name": "원료 탱크", "rect": Rect2(50, 350, 130, 260), "hall": 1,
 		"does": "주간 08:30에 원료가 들어온다 (드럼당 20)", "who": "-"},
-	"reactor": {"name": "반응실", "rect": Rect2(220, 350, 250, 260), "hall": 1,
+	"reactor": {"name": "반응실", "rect": Rect2(200, 350, 230, 260), "hall": 1,
 		"does": "원료를 반응시켜 미정제 케미컬을 만든다", "who": "1~2명"},
-	"control": {"name": "조정실", "rect": Rect2(490, 350, 150, 260), "hall": 1,
+	"control": {"name": "조정실", "rect": Rect2(450, 350, 140, 260), "hall": 1,
 		"does": "반장이 무전을 받고 지시한다. CCTV가 있어 혼자여도 안전하다", "who": "반장"},
-	"refine": {"name": "정제실", "rect": Rect2(660, 350, 240, 260), "hall": 1,
+	"refine": {"name": "정제실", "rect": Rect2(670, 350, 220, 260), "hall": 1,
 		"does": "미정제를 세정액 드럼으로 정제한다", "who": "1~2명"},
-	"store": {"name": "창고", "rect": Rect2(920, 350, 200, 260), "hall": 1,
+	"store": {"name": "창고", "rect": Rect2(910, 350, 210, 260), "hall": 1,
 		"does": "정제실 드럼을 옮겨 쌓는다. 비면 정제실이 막힌다", "who": "1명"},
 	"gate": {"name": "정문·경비실", "rect": Rect2(50, 710, 250, 200), "hall": 1,
 		"does": "박 씨가 출입을 기록한다. 출퇴근은 여기로", "who": "박 씨"},
 	"dock": {"name": "출하장", "rect": Rect2(870, 710, 250, 200), "hall": 1,
-		"does": "주간 10시·16시 트럭이 드럼을 싣고 간다 (드럼당 60)", "who": "-"},
+		"does": "주간 10시·16시 트럭이 드럼을 싣고 간다 (드럼당 65)", "who": "-"},
 }
 const PRODUCTION := ["reactor", "refine", "store"]
 const PATROL_ROUTE := ["reactor", "tank", "refine", "store", "dock", "control"]
@@ -176,8 +186,14 @@ static func path_to(from_pos: Vector2, from_room: String, to: String) -> Array[V
 	var h_to: int = ROOMS[to]["hall"]
 	out.append(Vector2(x_from, HALL_Y[h_from]))
 	if h_from != h_to:
-		out.append(Vector2(LINK_X, HALL_Y[h_from]))
-		out.append(Vector2(LINK_X, HALL_Y[h_to]))
+		# 가까운 통로로 건너간다
+		var x_to := room_center(to).x
+		var link: float = LINK_X[0]
+		for lx in LINK_X:
+			if absf(x_from - lx) + absf(lx - x_to) < absf(x_from - link) + absf(link - x_to):
+				link = lx
+		out.append(Vector2(link, HALL_Y[h_from]))
+		out.append(Vector2(link, HALL_Y[h_to]))
 	out.append(door_point(to))
 	out.append(room_center(to))
 	return out

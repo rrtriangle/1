@@ -56,7 +56,12 @@ var entity_since := -1
 var entity_reported := false
 var last_radio_t := -999
 var radio_count := 0
-var filler_slots: Array = []
+var next_gap := 90            # 다음 잔잔한 무전까지 (분). 무전이 끊기지 않게 한다
+var kinds_shift := {}         # 이번 교대에 나온 무전 종류 (반복 줄이기)
+var last_filler := ""
+var used_text := {}           # 이미 쓴 문구
+var owned := {}               # 설비 투자: "cctv", "chair", "em_<방>"
+var party_week := -1
 var perfect_shift := false    # ★ 완벽한 차단: 이번 교대 역압 면역
 var anomaly_rooms_last_night: Array = []
 var anomaly_rooms_tonight: Array = []
@@ -69,6 +74,7 @@ var park_used := {}
 var errand_state := ""        # "", "asked", "away", "back", "refused"
 var errand_person: Person = null
 var tut_fired := {}
+var history: Array = []       # 분석용: [{day, shift, t, what, ...}]
 
 
 func setup(seed_value: int = -1) -> void:
@@ -273,10 +279,11 @@ func begin_shift(plan: Dictionary) -> void:
 				if p.on_site:
 					_go_home(p)
 	# 이번 교대의 잔잔한 무전 시점 (2개)
-	filler_slots.clear()
-	for i in 2:
-		filler_slots.append(rng.randi_range(70, 650))
-	filler_slots.sort()
+	kinds_shift.clear()
+	next_gap = rng.randi_range(50, 80)
+	door_open.clear()
+	for p in people:
+		p.contam_k = 0.7 if day < mask_until_day else 1.0
 	sound.emit("night" if is_night() else "day")
 
 
@@ -344,6 +351,8 @@ func walk_minutes(p: Person, to: String) -> int:
 func _call_in(p: Person, why: String, delay: int = Defs.CALL_TRAVEL_MIN, post_override: String = "") -> void:
 	if p == null:
 		return
+	if delay == Defs.CALL_TRAVEL_MIN:
+		delay += rng.randi_range(-Defs.CALL_TRAVEL_SPREAD, Defs.CALL_TRAVEL_SPREAD)
 	p.arrive_at = now() + delay
 	p.on_duty = true
 	p.post = post_override if post_override != "" else ("assist" if not is_night() else "patrol")
@@ -376,6 +385,41 @@ func order(p: Person, id: String) -> String:
 	if id == "rest":
 		return "%s → 휴게실: 쉰다. 시간당 피로 −15." % p.name
 	return "%s → %s (걸어서 약 %d분)." % [p.name, rname, w]
+
+
+# ================================================================ 설비 투자
+
+func can_buy(item: String, room: String = "") -> bool:
+	var cost: float = Defs.SHOP[item]["cost"]
+	if money < cost:
+		return false
+	match item:
+		"em":
+			return not owned.has("em_" + room)
+		"party":
+			return party_week != (day - 1) / Defs.WEEK_DAYS
+	return not owned.has(item)
+
+
+func buy(item: String, room: String = "") -> void:
+	if not can_buy(item, room):
+		return
+	var cost: float = Defs.SHOP[item]["cost"]
+	_pay(cost, Defs.SHOP[item]["name"])
+	match item:
+		"em":
+			owned["em_" + room] = true
+			_note("%s에 비상 조명을 달았다 (−%d)." % [Defs.ROOMS[room]["name"], cost])
+		"party":
+			party_week = (day - 1) / Defs.WEEK_DAYS
+			for p in people:
+				if not p.gone:
+					p.add_stress(-20.0)
+			_note("회식을 했다. 전원 스트레스 −20 (−%d)." % cost)
+		_:
+			owned[item] = true
+			_note("%s을(를) 들였다 (−%d)." % [Defs.SHOP[item]["name"], cost])
+	sound.emit("build")
 
 
 # ================================================================ 시간 흐름
@@ -427,7 +471,7 @@ func _tick_minute() -> void:
 			var target := p.post_room() if p.post != "patrol" else "control"
 			_send(p, target, _arrived_post.bind(p))
 			_park_says_arrival(p)
-	if t == 90:
+	if t == 30:
 		for p in people:
 			if p.leaving and p.on_site and not p.walking():
 				_go_home(p)
@@ -440,9 +484,10 @@ func _tick_minute() -> void:
 		_day_schedule()
 	if t % 60 == 0:
 		_hourly()
-	if filler_slots.size() > 0 and t >= filler_slots[0] and not (day == 1 and shift == "day"):
-		filler_slots.pop_front()
+	# 무전이 한동안 없으면 잔잔한 일이 생긴다 (교대 끝 40분 전까지)
+	if t - last_radio_t >= next_gap and radio_queue.is_empty() and t < Defs.SHIFT_MIN - 40 and not (day == 1 and shift == "day" and t < 240):
 		_filler_event()
+		next_gap = rng.randi_range(110, 160)
 	if t >= Defs.SHIFT_MIN:
 		_end_shift()
 
@@ -479,7 +524,8 @@ func _produce(m: float) -> void:
 	tank -= re
 	buffer += re
 	# 정제실
-	var rf := minf(Defs.REFINE_RATE * _room_eff("refine") * h, buffer)
+	var rf_k := 0.7 if refine_slow_until > now() else 1.0
+	var rf := minf(Defs.REFINE_RATE * _room_eff("refine") * h * rf_k, buffer)
 	rf = minf(rf, Defs.OUTBOX_CAP - outbox)
 	rf = maxf(rf, 0.0)
 	buffer -= rf
@@ -525,7 +571,7 @@ func _hourly() -> void:
 	for p in on_site_people():
 		if p.on_duty and not p.walking():
 			if p.room == "rest":
-				p.fatigue = maxf(0.0, p.fatigue - 15.0)
+				p.fatigue = maxf(0.0, p.fatigue - (30.0 if owned.has("chair") else 15.0))
 				p.add_stress(-4.0)
 			else:
 				p.fatigue = minf(100.0, p.fatigue + (Defs.FATIGUE_NIGHT_H if is_night() else Defs.FATIGUE_WORK_H))
@@ -556,6 +602,8 @@ func _hourly() -> void:
 				k2 += Defs.EXTRA_DARK
 			if stage3:
 				k2 += Defs.EXTRA_STAGE3
+			if door_open.has(id):
+				k2 += 0.04
 			if rng.randf() < k2:
 				_spawn_entity(id)
 				break
@@ -691,7 +739,7 @@ func _earn(v: float) -> void:
 
 
 func _note(s: String) -> void:
-	shift_log.append(s)
+	shift_log.append("%s · %s" % [clock_text(), s])
 	log_line.emit(s)
 
 
@@ -801,8 +849,10 @@ func research_line() -> String:
 func _new_radio(kind: String, speaker: String, text: String, room: String, choices: Array) -> Dictionary:
 	var ev := {"kind": kind, "speaker": speaker, "text": text, "room": room, "choices": choices,
 		"t": t, "clock": clock_text()}
+	history.append({"day": day, "shift": shift, "t": t, "what": "radio", "kind": kind})
 	radio_queue.append(ev)
 	last_radio_t = t
+	kinds_shift[kind] = kinds_shift.get(kind, 0) + 1
 	radio_count += 1
 	highlight.emit(room)
 	sound.emit("radio")
@@ -829,9 +879,19 @@ func resolve(ev: Dictionary, idx: int) -> Dictionary:
 	if c["pct"] >= 0.0:
 		ok = rng.randf() * 100.0 < c["pct"]
 	var fn: String = "_r_" + ev["kind"]
+	var r: Dictionary = {"text": "", "tone": "info"}
 	if has_method(fn):
-		return call(fn, ev, key, ok)
-	return {"text": "", "tone": "info"}
+		r = call(fn, ev, key, ok)
+	# 보고서에 남긴다 (무전 → 고른 것 → 결과)
+	if r["tone"] != "none" and r["text"] != "" and not ev["kind"] in ["tutorial", "research", "result"]:
+		var first_line: String = r["text"].split("\n")[0]
+		var core := first_line.trim_prefix("실패. ").trim_prefix("성공. ").substr(0, 12)
+		for old in shift_log.slice(maxi(0, shift_log.size() - 3)):
+			if core != "" and String(old).contains(core):
+				shift_log.erase(old)
+		var mark: String = {"good": "○", "bad": "×", "perfect": "★", "info": "·"}.get(r["tone"], "·")
+		shift_log.append("%s %s %s: %s → %s" % [ev["clock"], mark, ev["speaker"], c["label"], first_line])
+	return r
 
 
 func _tone(ok: bool) -> String:
@@ -848,7 +908,7 @@ func _start_pressure() -> void:
 	var speaker := op.name if op != null else (leader.name if leader != null else "무전")
 	if research["pressure"] >= 1:
 		ev_text += "\n(연구 1단계: 계기가 이상하다. 숫자를 그대로 믿으면 안 된다)"
-	ev_text += "\n\n2시간 안에 막지 못하면 터집니다."
+	ev_text += "\n\n%d분 안에 막지 못하면 터집니다." % Defs.PRESSURE_WINDOW
 	var choices: Array = []
 	if op != null:
 		var pct := 30.0 + op.eff_skill() * 0.45 + (5.0 if op.has_trait("꼼꼼함") else 0.0)
@@ -865,8 +925,9 @@ func _start_pressure() -> void:
 	vets.sort_custom(func(a: Person, b: Person) -> bool: return a.skill > b.skill)
 	if not vets.is_empty():
 		var v: Person = vets[0]
-		choices.append(_choice("숙련자 %s 호출 (약 %d분 뒤 도착)" % [v.name, Defs.CALL_TRAVEL_MIN + walk_minutes_from_gate("reactor")], "call",
-			30.0 + v.eff_skill() * 0.65, "%s 숙련 %d. 위반 기록 1, 수당 %d" % [v.name, v.skill, Defs.CALL_PAY]))
+		var eta := Defs.CALL_TRAVEL_MIN + walk_minutes_from_gate("reactor")
+		choices.append(_choice("숙련자 %s 호출 (%d~%d분 뒤 도착)" % [v.name, eta - Defs.CALL_TRAVEL_SPREAD, eta + Defs.CALL_TRAVEL_SPREAD], "call",
+			30.0 + v.eff_skill() * 0.65, "%s 숙련 %d. 남은 시간 %d분 — 늦으면 터진다. 위반 기록 1, 수당 %d" % [v.name, v.skill, Defs.PRESSURE_WINDOW, Defs.CALL_PAY]))
 	var stop_why := "확실하지만 반응실이 3시간 멈춘다"
 	if leader != null and leader.has_trait("안전 제일"):
 		stop_why = "윤 반장이 먼저 권한다: \"세웁시다.\" 3시간 정지"
@@ -986,6 +1047,7 @@ var _pending_call_pressure := {}
 
 
 func _leader_at_pressure(l: Person, pct: float) -> void:
+	history.append({"day": day, "shift": shift, "t": t, "what": "arrive", "kind": "pressure_leader", "left": _pressure_crisis().get("left", -1)})
 	if _pressure_crisis().is_empty():
 		_send(l, "control", Callable())
 		return
@@ -1015,7 +1077,7 @@ func _spawn_entity(id: String) -> void:
 	entity_since = now()
 	entity_reported = false
 	anomaly_rooms_tonight.append(id)
-	if research["extra"] >= 1:
+	if research["extra"] >= 1 or owned.has("cctv"):
 		_note("[인원 대조] %s: 명단보다 한 명 많다." % Defs.ROOMS[id]["name"])
 		popup.emit("인원 불일치", id, BAD)
 		sound.emit("alert")
@@ -1060,7 +1122,7 @@ func _radio_extra(p: Person) -> void:
 	var off := callable_people()
 	if not off.is_empty():
 		var v: Person = off[0]
-		choices.append(_choice("휴무 조 %s 호출해 같이 확인 (약 %d분)" % [v.name, Defs.CALL_TRAVEL_MIN + walk_minutes_from_gate(id)], "call",
+		choices.append(_choice("휴무 조 %s 호출해 같이 확인 (약 1시간)" % v.name, "call",
 			minf(95.0, 25.0 + (p.eff_observe() + v.eff_observe()) * 0.55), "자리는 안 비지만 늦다. 위반 기록 1, 수당 %d" % Defs.CALL_PAY))
 	choices.append(_choice("당장 그 방에서 나와라", "leave", -1.0, "확실히 피하지만 %s 일이 멈춘다" % rname))
 	var warn := "" if p.ignored == 0 else " (경고: %s은(는) 벌써 %d번 무시했다)" % [p.name, p.ignored]
@@ -1075,6 +1137,8 @@ func _nearest_helper(id: String, not_p: Person) -> Person:
 	var bd := 1e9
 	for q in people:
 		if q == not_p or not q.on_duty or not q.on_site or q.broken or q.is_staff():
+			continue
+		if q.busy_until > now() or (q == errand_person and errand_state == "away"):
 			continue
 		if q.room == id:
 			continue
@@ -1132,7 +1196,7 @@ func _r_extra(ev: Dictionary, key: String, ok: bool) -> Dictionary:
 			var pct: float = ev["choices"].filter(func(c: Dictionary) -> bool: return c["key"] == "call")[0]["pct"]
 			_call_in(v, "한 명 더 확인", Defs.CALL_TRAVEL_MIN, id)
 			_pending_pair_call = {"who": v, "with": p, "room": id, "pct": pct}
-			return {"text": "%s: \"...지금요? 알겠습니다.\" 정문까지 약 %d분." % [v.name, Defs.CALL_TRAVEL_MIN], "tone": "info"}
+			return {"text": "%s: \"...지금요? 알겠습니다.\" (정문을 지나면 박 씨가 알려 준다)" % v.name, "tone": "info"}
 		"leave":
 			entity_room = ""
 			p.add_stress(5.0)
@@ -1162,6 +1226,7 @@ var _pending_pair_call := {}
 
 
 func _pair_arrived(helper: Person, p: Person, id: String, pct: float) -> void:
+	history.append({"day": day, "shift": shift, "t": t, "what": "arrive", "kind": "pair", "still": entity_room == id})
 	var r: Dictionary
 	if entity_room != id:
 		r = {"text": "%s이(가) 도착했을 땐 이미 아무도 없었다." % helper.name, "tone": "info"}
@@ -1195,11 +1260,15 @@ func _outage() -> void:
 	var n := 1 if rng.randf() < 0.6 else 2
 	var rooms: Array = []
 	for id in cand:
-		if lit[id]:
+		if lit[id] and not owned.has("em_" + id):
 			lit[id] = false
 			rooms.append(id)
 		if rooms.size() >= n:
 			break
+	if rooms.is_empty():
+		_note("정전. 비상 조명 덕분에 불은 꺼지지 않았다.")
+		popup.emit("정전 (비상 조명 유지)", "control", GOOD)
+		return
 	var names := ", ".join(rooms.map(func(id: String) -> String: return Defs.ROOMS[id]["name"]))
 	var l := duty_leader()
 	var choices: Array = []
@@ -1281,6 +1350,7 @@ func _park_says_arrival(p: Person) -> void:
 
 
 func _vet_at_pressure(v: Person, pct: float) -> void:
+	history.append({"day": day, "shift": shift, "t": t, "what": "arrive", "kind": "pressure_call", "left": _pressure_crisis().get("left", -1)})
 	if _pressure_crisis().is_empty():
 		_note("%s이(가) 도착했지만 이미 끝난 뒤였다." % v.name)
 		return
@@ -1295,35 +1365,321 @@ func _vet_at_pressure(v: Person, pct: float) -> void:
 # ---------------------------------------------------------------- 잔잔한 무전 (교대마다 2번쯤)
 
 func _filler_event() -> void:
-	if t - last_radio_t < Defs.RADIO_GAP or not radio_queue.is_empty():
-		filler_slots.append(t + 30)
-		filler_slots.sort()
-		return
 	var opts: Array = []
 	var tired := on_site_people().filter(func(q: Person) -> bool: return q.on_duty and q.fatigue >= 45 and not q.walking() and q.busy_until <= now() and q.role != "반장")
 	if not tired.is_empty():
 		opts.append("drowsy")
+	var smokers := on_site_people().filter(func(q: Person) -> bool: return q.on_duty and q.has_trait("줄담배") and q.working(now()))
+	if not smokers.is_empty():
+		opts.append("smoke")
+	if _crew_pair().size() == 2:
+		opts.append("quarrel")
 	if is_night():
-		opts.append("noise")
-		if day > 1:
+		opts += ["noise", "phone", "door", "cold", "headcount"]
+		if day > 1 and kinds_shift.get("park", 0) == 0:
 			opts.append("park")
 	else:
-		opts.append("visitor")
+		opts += ["visitor", "filter", "supply"]
 		if day > 1:
 			opts.append("complaint")
+	# 한 교대에 같은 종류는 한 번, 바로 앞과 같은 것은 피한다
+	opts = opts.filter(func(k: String) -> bool: return kinds_shift.get(k, 0) == 0 and k != last_filler)
 	if opts.is_empty():
 		return
-	match opts[rng.randi() % opts.size()]:
+	# 말다툼·추위 같은 일상은 덜 자주
+	var weights := {"quarrel": 0.4, "cold": 0.6, "supply": 0.5, "smoke": 0.7}
+	var total := 0.0
+	for o in opts:
+		total += weights.get(o, 1.0)
+	var roll := rng.randf() * total
+	var k: String = opts[0]
+	for o in opts:
+		roll -= weights.get(o, 1.0)
+		if roll <= 0.0:
+			k = o
+			break
+	last_filler = k
+	match k:
 		"drowsy":
 			_radio_drowsy(tired[rng.randi() % tired.size()])
+		"smoke":
+			_radio_smoke(smokers[0])
+		"quarrel":
+			_radio_quarrel()
 		"noise":
 			_radio_noise()
+		"phone":
+			_radio_phone()
+		"door":
+			_radio_door()
+		"cold":
+			_radio_cold()
+		"headcount":
+			_radio_headcount()
 		"park":
 			_radio_park()
 		"visitor":
 			_radio_visitor()
+		"filter":
+			_radio_filter()
+		"supply":
+			_radio_supply()
 		"complaint":
 			_radio_complaint()
+
+
+## 아직 안 쓴 문구 하나를 고른다. 다 썼으면 처음부터.
+func _pick_text(key: String, pool: Array) -> String:
+	var left := pool.filter(func(x: String) -> bool: return not used_text.has(key + x))
+	if left.is_empty():
+		for x in pool:
+			used_text.erase(key + x)
+		left = pool
+	var c: String = left[rng.randi() % left.size()]
+	used_text[key + c] = true
+	return c
+
+
+func _crew_pair() -> Array:
+	var ppl := on_site_people().filter(func(q: Person) -> bool: return q.on_duty and q.role == "조원" and q.working(now()))
+	if ppl.size() < 2:
+		return []
+	ppl.shuffle()
+	return [ppl[0], ppl[1]]
+
+
+func _radio_smoke(p: Person) -> void:
+	var text := _pick_text("smoke", [
+		"%s: \"공장장님, 담배 한 대만 피우고 오면 안 될까요? 손이 떨려서요.\"",
+		"%s: \"10분만요. 진짜 10분.\" 벌써 라이터를 꺼내 들었다.",
+		"%s이(가) 흡연 구역 쪽을 자꾸 쳐다본다. 반장이 어떻게 할지 묻는다.",
+	]) % p.name
+	var choices := [
+		_choice("다녀오게 한다", "go", -1.0, "스트레스 −10, 20분 자리가 빈다"),
+		_choice("교대 끝나고 피우라고 한다", "no", -1.0, "스트레스 +6"),
+	]
+	_new_radio("smoke", p.name, text, p.room, choices)["who"] = p
+
+
+func _r_smoke(ev: Dictionary, key: String, _ok: bool) -> Dictionary:
+	var p: Person = ev["who"]
+	if key == "go":
+		p.add_stress(-10.0)
+		p.busy_until = now() + 20
+		p.busy_what = "담배 피우는 중"
+		return {"text": "%s이(가) 밖으로 나갔다. 20분 뒤 돌아온다." % p.name, "tone": "info"}
+	p.add_stress(6.0)
+	return {"text": "%s이(가) 한숨을 쉬고 다시 일한다." % p.name, "tone": "info"}
+
+
+func _radio_quarrel() -> void:
+	var pr := _crew_pair()
+	var a: Person = pr[0]
+	var b: Person = pr[1]
+	var l := duty_leader()
+	var text := _pick_text("quarrel", [
+		"%s랑 %s이(가) 무전으로 싸워요. 누가 드럼 순서를 바꿨다고요.",
+		"%s이(가) %s한테 \"너 아까 거기 없었잖아\"라고 해요. %s은(는) 계속 있었다고 하고요.",
+		"%s, %s 둘이 교대 인수인계 때문에 언성이 높아졌어요.",
+	])
+	text = text.replace("%s", "{}")
+	text = text.format([a.name, b.name, b.name], "{}")
+	var choices: Array = []
+	if l != null:
+		var pct := 30.0 + l.nerve * 0.6 - (15.0 if l.has_trait("신참 반장") else 0.0)
+		choices.append(_choice("%s이(가) 말린다" % l.name, "leader", pct, "%s 담력 %d%s" % [l.name, l.nerve, " · 신참 반장 −15" if l.has_trait("신참 반장") else ""]))
+	choices.append(_choice("그냥 둔다", "leave", -1.0, "둘 다 스트레스 +10"))
+	var ev := _new_radio("quarrel", l.name if l != null else "무전", text, a.room, choices)
+	ev["a"] = a
+	ev["b"] = b
+
+
+func _r_quarrel(ev: Dictionary, key: String, ok: bool) -> Dictionary:
+	var a: Person = ev["a"]
+	var b: Person = ev["b"]
+	if key == "leader" and ok:
+		a.add_stress(-5.0)
+		b.add_stress(-5.0)
+		return {"text": "반장이 둘을 진정시켰다. 둘 다 조금 풀렸다.", "tone": "good"}
+	a.add_stress(10.0)
+	b.add_stress(10.0)
+	return {"text": "말다툼은 교대 끝까지 이어졌다. 둘 다 스트레스 +10.", "tone": "bad" if key == "leader" else "info"}
+
+
+func _radio_phone() -> void:
+	var l := duty_leader()
+	if l == null:
+		return
+	var text := _pick_text("phone", [
+		"조정실 내선이 울려요. 받으면 아무 말도 없고, 기계 소리만 들려요.",
+		"내선 번호 0번에서 전화가 와요. 0번은 없는 번호인데요.",
+		"전화를 받았는데... 제 목소리가 들려요. 몇 초 늦게.",
+	])
+	var pct := 20.0 + l.eff_observe() * 0.6
+	var choices := [
+		_choice("끝까지 들어 본다", "listen", pct, "%s 관찰 %d. 성공하면 관찰 기록 +1, 실패하면 오염 +6" % [l.name, l.eff_observe()]),
+		_choice("받지 말고 선을 뽑아라", "pull", -1.0, "스트레스 +3"),
+	]
+	_new_radio("phone", l.name, text, "control", choices)["who"] = l
+
+
+func _r_phone(ev: Dictionary, key: String, ok: bool) -> Dictionary:
+	var p: Person = ev["who"]
+	if key == "pull":
+		p.add_stress(3.0)
+		return {"text": "선을 뽑았다. 그 뒤로 전화는 울리지 않았다. 울리면 안 되는 거니까.", "tone": "info"}
+	if ok:
+		records += 1
+		return {"text": "기계 소리 사이로 숫자를 세는 목소리가 들렸다. 하나, 둘, 셋, 넷, 다섯, 여섯. 오늘 야간조는 다섯 명이다. 관찰 기록 +1.", "tone": "good"}
+	p.add_contam(6.0)
+	p.add_stress(8.0)
+	return {"text": "%s이(가) 수화기를 한참 들고 있었다. 내려놓은 뒤 무엇을 들었는지 기억하지 못한다. 오염 +6." % p.name, "tone": "bad"}
+
+
+func _radio_door() -> void:
+	var where: String = ["창고", "출하장", "원료 탱크"][rng.randi() % 3]
+	var id: String = {"창고": "store", "출하장": "dock", "원료 탱크": "tank"}[where]
+	var patrol: Person = null
+	for q in people:
+		if q.post == "patrol" and q.on_duty and q.on_site and not q.walking():
+			patrol = q
+	var l := duty_leader()
+	var text := "%s 비상문이 열려 있다고 CCTV에 떠요. 아까 분명히 닫혀 있었는데." % where
+	var choices: Array = []
+	if patrol != null:
+		choices.append(_choice("순찰 %s이(가) 가서 닫는다 (%d분)" % [patrol.name, walk_minutes(patrol, id)], "patrol", -1.0, "순찰이 그쪽으로 간다"))
+	choices.append(_choice("그냥 둔다", "leave", -1.0, "오늘 밤 그 방에 '한 명 더'가 생길 확률이 오른다"))
+	var ev := _new_radio("door", l.name if l != null else "무전", text, id, choices)
+	ev["patrol"] = patrol
+
+
+func _r_door(ev: Dictionary, key: String, _ok: bool) -> Dictionary:
+	var id: String = ev["room"]
+	if key == "patrol":
+		var p: Person = ev["patrol"]
+		_send(p, id, _door_closed.bind(p, id))
+		return {"text": "%s이(가) %s(으)로 간다." % [p.name, Defs.ROOMS[id]["name"]], "tone": "info"}
+	door_open[id] = true
+	return {"text": "문은 열린 채로 있다.", "tone": "info"}
+
+
+var door_open := {}
+
+
+func _door_closed(p: Person, id: String) -> void:
+	door_open.erase(id)
+	if rng.randf() < 0.3:
+		records += 1
+		_result_radio(p.name, {"text": "문을 닫았다. 문틀 안쪽에 젖은 손자국이 있다. 안에서 민 자국이다. 관찰 기록 +1.", "tone": "good"})
+	else:
+		_note("%s이(가) %s 비상문을 닫았다." % [p.name, Defs.ROOMS[id]["name"]])
+
+
+func _radio_cold() -> void:
+	var ppl := on_site_people().filter(func(q: Person) -> bool: return q.on_duty and q.working(now()) and q.room in ["store", "tank", "dock"])
+	if ppl.is_empty():
+		return
+	var p: Person = ppl[0]
+	var text := _pick_text("cold", [
+		"%s: \"창고가 너무 추워요. 입김이 나와요. 여름인데.\"",
+		"%s: \"여기 온도계가 영하를 가리켜요. 손가락이 안 움직여요.\"",
+	]) % p.name
+	var choices := [
+		_choice("난로를 켜 준다", "heat", -1.0, "−20. 피로 −8"),
+		_choice("참으라고 한다", "no", -1.0, "피로 +8, 스트레스 +5"),
+	]
+	_new_radio("cold", p.name, text, p.room, choices)["who"] = p
+
+
+func _r_cold(ev: Dictionary, key: String, _ok: bool) -> Dictionary:
+	var p: Person = ev["who"]
+	if key == "heat":
+		_pay(20, "난로")
+		p.fatigue = maxf(0.0, p.fatigue - 8.0)
+		return {"text": "난로를 켰다. 한참 뒤에야 따뜻해졌다. (−20)", "tone": "info"}
+	p.fatigue += 8.0
+	p.add_stress(5.0)
+	return {"text": "%s은(는) 장갑을 두 겹 끼고 버틴다." % p.name, "tone": "info"}
+
+
+func _radio_headcount() -> void:
+	var l := duty_leader()
+	if l == null:
+		return
+	var text := "정기 인원 점검 시간입니다. 무전으로 다 이름 대게 할까요? 2분이면 됩니다."
+	var choices := [
+		_choice("점검한다", "yes", -1.0, "'한 명 더'가 있으면 무전 대답이 하나 많다"),
+		_choice("건너뛴다", "no", -1.0, ""),
+	]
+	_new_radio("headcount", l.name, text, "control", choices)
+
+
+func _r_headcount(_ev: Dictionary, key: String, _ok: bool) -> Dictionary:
+	if key == "no":
+		return {"text": "점검을 건너뛰었다.", "tone": "info"}
+	if entity_room != "":
+		var id := entity_room
+		var who := in_room(id).filter(func(q: Person) -> bool: return q.on_duty)
+		var r := _detected(who, id)
+		r["text"] = "\"%s입니다.\" ... 그리고 같은 방에서 한 번 더, 같은 목소리로 같은 이름이 들렸다.\n" % (who[0].name if who.size() > 0 else "...") + r["text"]
+		return r
+	var n := on_site_people().filter(func(q: Person) -> bool: return q.on_duty).size()
+	return {"text": "%d명 모두 대답했다. 숫자가 맞다." % n, "tone": "good"}
+
+
+func _radio_filter() -> void:
+	var m: Person = null
+	for q in people:
+		if q.role == "정비원" and q.on_site and q.on_duty:
+			m = q
+	if m == null:
+		return
+	var text := "정제실 필터가 막혀 가요. 지금 30분 세우고 갈면 괜찮고, 그냥 두면 오늘 내내 느려질 거예요."
+	var choices := [
+		_choice("지금 세우고 간다", "fix", -1.0, "정제실 30분 정지"),
+		_choice("그냥 돌린다", "no", -1.0, "오늘 정제 −30%"),
+	]
+	_new_radio("filter", m.name, text, "refine", choices)
+
+
+var refine_slow_until := -1
+
+
+func _r_filter(_ev: Dictionary, key: String, _ok: bool) -> Dictionary:
+	if key == "fix":
+		for p in in_room("refine"):
+			if p.on_duty:
+				p.busy_until = now() + 30
+				p.busy_what = "필터 교체 중"
+		return {"text": "필터를 갈았다.", "tone": "good"}
+	refine_slow_until = now() + (Defs.SHIFT_MIN - t)
+	return {"text": "정제실이 오늘 내내 느리다.", "tone": "info"}
+
+
+func _radio_supply() -> void:
+	var off: Person = null
+	for q in people:
+		if q.role == "관리" and q.on_site:
+			off = q
+	if off == null:
+		return
+	var text := "방독 마스크랑 장갑 재고가 거의 없어요. 지금 주문할까요? 60이요."
+	var choices := [
+		_choice("주문한다", "buy", -1.0, "−60. 이번 주 오염이 덜 쌓인다 (×0.7)"),
+		_choice("다음 주에", "no", -1.0, ""),
+	]
+	_new_radio("supply", off.name, text, "office", choices)
+
+
+var mask_until_day := 0
+
+
+func _r_supply(_ev: Dictionary, key: String, _ok: bool) -> Dictionary:
+	if key == "buy":
+		_pay(60, "보호구")
+		mask_until_day = day + 7
+		return {"text": "보호구를 주문했다. (−60)", "tone": "info"}
+	return {"text": "미뤘다.", "tone": "info"}
 
 
 func _radio_drowsy(p: Person) -> void:
@@ -1370,7 +1726,12 @@ func _radio_noise() -> void:
 		return
 	var p: Person = ppl[rng.randi() % ppl.size()]
 	var where: String = ["창고", "원료 탱크", "출하장"][rng.randi() % 3]
-	var text := "%s 쪽에서 누가 제 이름을 불러요. 지금 거기 아무도 없을 텐데요." % where
+	var text := _pick_text("noise", [
+		"%s 쪽에서 누가 제 이름을 불러요. 지금 거기 아무도 없을 텐데요.",
+		"%s 쪽에서 우리 반장님 목소리가 들려요. 반장님은 조정실에 계시잖아요?",
+		"%s에서 누가 노래를 불러요. 옛날 노래요. 가사를 모르는데 따라 부르고 싶어요.",
+		"%s 쪽 스피커에서 제 이름이 방송돼요. 방송 설비는 꺼져 있는데.",
+	]) % where
 	var pct := 20.0 + p.eff_observe() * 0.6
 	var choices := [
 		_choice("가서 확인해 봐라", "check", pct, "성공하면 관찰 기록 +1. 실패하면 스트레스·오염"),
@@ -1400,7 +1761,11 @@ func _radio_park() -> void:
 		return
 	var p: Person = ppl[rng.randi() % ppl.size()]
 	var truth := rng.randf() < 0.7
-	var text := "공장장님, 방금 %s 씨가 정문 쪽으로 걸어오던데요? 혼자서요." % p.name
+	var text := _pick_text("park", [
+		"공장장님, 방금 %s 씨가 정문 쪽으로 걸어오던데요? 혼자서요.",
+		"%s 씨 퇴근했어요? 방금 정문 밖으로 나가는 걸 봤는데. 인사도 안 하고.",
+		"%s 씨가 경비실 창문을 두드리고 갔어요. 뭐라고 했는데 안 들렸어요.",
+	]) % p.name
 	var choices := [
 		_choice("반장에게 확인시킨다", "check", -1.0, "박 씨 말이 맞으면 데려온다"),
 		_choice("박 씨가 잘못 봤겠지", "ignore", -1.0, ""),
@@ -1715,34 +2080,30 @@ func _errand_back(p: Person) -> void:
 
 const TUTORIAL := [
 	{"day": 1, "shift": "day", "t": 1, "speaker": "박 씨", "room": "gate",
-		"text": "새 공장장님이시구먼. 저번 분은 밤에 오셨는데, 이번엔 낮에 오셨네.\n들어가 보세요. 김 반장이 기다려요."},
-	{"day": 1, "shift": "day", "t": 2, "speaker": "김 반장", "room": "control",
-		"text": "1조 반장 김입니다. 공장장님은 지시만 하시면 됩니다. 사람은 제가 움직입니다.\n\n한 바퀴 설명드리죠. 우리 공장은 원료를 받아서 세정액을 만들어 파는 곳입니다."},
-	{"day": 1, "shift": "day", "t": 3, "speaker": "김 반장", "room": "tank",
-		"text": "원료 탱크. 매일 아침 8시 반에 원료가 들어옵니다. 드럼당 20."},
-	{"day": 1, "shift": "day", "t": 4, "speaker": "김 반장", "room": "reactor",
-		"text": "반응실. 원료를 반응시킵니다. 가동률을 올리면 많이 나오는데, 80%를 넘기면 계기가 이상해집니다. 그땐 무전 드릴게요."},
-	{"day": 1, "shift": "day", "t": 5, "speaker": "김 반장", "room": "refine",
-		"text": "정제실. 반응실에서 나온 걸 세정액 드럼으로 만듭니다."},
-	{"day": 1, "shift": "day", "t": 6, "speaker": "김 반장", "room": "store",
-		"text": "창고. 정제실 드럼을 옮겨 쌓습니다. 여기 사람이 없으면 정제실 출구가 막혀서 전부 멈춥니다."},
-	{"day": 1, "shift": "day", "t": 7, "speaker": "김 반장", "room": "dock",
-		"text": "출하장. 10시랑 16시에 트럭이 와서 싣고 갑니다. 드럼당 60. 이게 우리 돈입니다.\n원료값이랑 월급은 교대 끝날 때 나갑니다."},
-	{"day": 1, "shift": "day", "t": 8, "speaker": "김 반장", "room": "control",
-		"text": "여긴 조정실, 제 자리입니다. 무슨 일 생기면 무전 드립니다. 고르시면 됩니다.\n\n오른쪽 위 수첩에 오늘 할 일이 적혀 있습니다. 시간은 스페이스로 멈추고, 1·2·3으로 빠르게 할 수 있어요."},
+		"text": "새 공장장님이시구먼. 저번 분은 밤에 오셨는데, 이번엔 낮에 오셨네.\n들어가 보세요. 1조가 지금 출근하고 있어요."},
+	{"day": 1, "shift": "day", "t": 25, "speaker": "김 반장", "room": "reactor",
+		"text": "1조 반장 김입니다. 공장장님은 지시만 하시면 됩니다. 사람은 제가 움직입니다.\n\n우리 공장은 맵 가운데 줄을 따라 흐릅니다.\n원료 탱크 → 반응실 → 정제실 → 창고 → 출하장 트럭.\n어느 방이든 마우스를 올리면 뭐 하는 곳인지 나옵니다."},
+	{"day": 1, "shift": "day", "t": 70, "speaker": "김 반장", "room": "store",
+		"text": "창고 사람이 드럼을 옮겨 줘야 정제실이 안 막힙니다. 10시에 첫 트럭이 와요.\n오른쪽 수첩에 오늘 할 일이 적혀 있으니 가끔 보세요."},
 	{"day": 1, "shift": "day", "t": 125, "speaker": "김 반장", "room": "dock",
-		"text": "방금 트럭 보셨죠? 돈은 저렇게 들어옵니다.\n낮엔 사람이 많고 바쁩니다. 밤엔... 밤엔 다섯 명이랑 박 씨뿐이에요."},
+		"text": "방금 트럭 보셨죠? 돈은 저렇게 들어옵니다. 드럼당 65.\n원료값이랑 월급은 교대 끝날 때 나갑니다. 일주일 모아서 적자면 본사가 시끄러워져요."},
+	{"day": 1, "shift": "day", "t": 200, "speaker": "김 반장", "room": "control",
+		"text": "평소엔 제가 알아서 합니다. 일이 생기면 무전 드릴게요. 그때 고르시면 됩니다.\n\n직접 시키고 싶으시면 왼쪽 명단에서 사람을 누르고 방을 누르세요.\n반응기 가동률은 화면 아래 막대로 언제든 바꿀 수 있습니다. 올리면 돈, 80% 넘기면 위험."},
 	{"day": 1, "shift": "night", "t": 2, "speaker": "윤 반장", "room": "control",
-		"text": "2조 반장 윤입니다. 오늘 밤은 저희 조예요.\n밤엔 순찰 한 명이 공장을 돕니다. 혼자 있는 방은 조심하셔야 해요. 이유는... 곧 아시게 될 겁니다."},
+		"text": "2조 반장 윤입니다. 오늘 밤은 저희 조예요.\n밤엔 저희 다섯이랑 정문 박 씨뿐입니다. 순찰 한 명이 공장을 돌아요."},
 	{"day": 2, "shift": "day", "t": 3, "speaker": "김 반장", "room": "control",
-		"text": "어젯밤 고생하셨죠. 보고서 보셨으면 아시겠지만, 밤에 생긴 일은 낮에 수습합니다.\n흔적을 조사하면 관찰 기록이 쌓이고, 연구소가 그걸로 대처법을 찾아요. 대신 조사에 사람을 빼면 생산이 줄어듭니다."},
+		"text": "어젯밤 고생하셨죠. 밤에 생긴 일은 낮에 수습합니다.\n흔적을 조사하면 관찰 기록이 쌓이고, 연구소가 그걸로 대처법을 찾아요. 대신 조사에 사람을 빼면 생산이 줄어듭니다."},
 	{"day": 2, "shift": "day", "t": 90, "speaker": "한 연구원", "room": "lab",
 		"text": "연구소 한입니다. 관찰 기록이 모이면 연구해서 근무 수칙을 만들게요. 지금 기록 %RECORDS%개.\n어떤 걸 먼저 연구할지는 아침 회의에서 정해 주세요."},
+	{"day": 2, "shift": "day", "t": 240, "speaker": "배 사원", "room": "office",
+		"text": "관리실 배입니다. 돈 쓸 데 생기면 회의 때 말씀하세요.\n비상 조명, CCTV, 휴게실 안마의자, 회식... 다 회의의 '설비 투자'에 있어요."},
+	{"day": 2, "shift": "night", "t": 2, "speaker": "윤 반장", "room": "control",
+		"text": "하나만 알려 드릴게요. 밤에 불 켜진 방을 보시다가, 이름표 없는 사람이 하나 더 서 있으면...\n그게 '한 명 더'입니다. 보이는 대로 누구든 그 방에 보내세요. 둘이 되면 사라져요."},
 	{"day": 2, "shift": "night", "t": 90, "special": "errand"},
 	{"day": 3, "shift": "day", "t": 3, "speaker": "최 반장", "room": "control",
-		"text": "3조 반장 최입니다. 반장 된 지 얼마 안 됐어요. 잘 부탁드립니다.\n근무표는 6일 주기로 돕니다. 주간 이틀, 야간 이틀, 휴무 이틀. 왼쪽 명단에 오늘 누가 서는지 보입니다."},
+		"text": "3조 반장 최입니다. 반장 된 지 얼마 안 됐어요. 잘 부탁드립니다.\n근무표는 6일 주기로 돕니다. 주간 이틀, 야간 이틀, 휴무 이틀. 왼쪽 명단 머리에 오늘·내일이 보여요."},
 	{"day": 3, "shift": "night", "t": 2, "speaker": "김 반장", "room": "control",
-		"text": "오늘 밤은 다시 저희 1조입니다.\n사람이 모자라면 휴무 조를 부를 수 있어요. 오는 데 한 시간쯤 걸리고, 위반 기록이 남습니다. 급할 때만 쓰세요."},
+		"text": "오늘 밤은 다시 저희 1조입니다.\n사람이 모자라면 쉬는 사람을 부를 수 있어요. 명단에서 집에 있는 사람을 누르면 됩니다. 오는 데 한 시간쯤, 위반 기록이 남습니다."},
 	{"day": 3, "shift": "night", "t": 150, "special": "extra_store"},
 ]
 
@@ -1847,7 +2208,7 @@ func notebook() -> Array:
 	for c in crises:
 		if c["kind"] == "pressure":
 			out.append("· [color=#f66]역압! %d분 안에 막아야 한다[/color]" % c["left"])
-	if entity_room != "" and research["extra"] >= 1:
+	if entity_room != "" and (research["extra"] >= 1 or owned.has("cctv")):
 		out.append("· [color=#f66]%s 인원 불일치[/color]" % Defs.ROOMS[entity_room]["name"])
 	var dark: Array = []
 	for id in Defs.ROOMS:

@@ -35,6 +35,7 @@ var gone := false
 var extra_shifts := 0     # 대타로 더 일한 횟수
 var patrol_i := 0
 var patrol_wait := 0
+var contam_k := 1.0       # 보호구가 있으면 오염이 덜 쌓인다
 
 
 func _init(d: Dictionary) -> void:
@@ -96,7 +97,7 @@ func add_stress(v: float) -> void:
 
 
 func add_contam(v: float) -> void:
-	contam = clampf(contam + v, 0.0, 100.0)
+	contam = clampf(contam + (v * contam_k if v > 0 else v), 0.0, 100.0)
 
 
 func status_text(now: int) -> String:
