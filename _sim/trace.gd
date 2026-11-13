@@ -18,16 +18,18 @@ func _init() -> void:
 	var max_gap := {"day": [], "night": []}
 	var per_hour := {}
 	var kinds := {}
-	var arrive := {"pressure_leader": [0, 0], "pressure_call": [0, 0], "pair": [0, 0]}
+	var arrive := {"pressure": [0, 0], "pair": [0, 0]}
 	var money_by_day := {}
 	var research_day := {}
 	var tut_day1 := 0
 	var first_free_decision := []
+	var memos := 0.0
 	var idle_people := 0.0
 	var idle_samples := 0
 	for i in runs:
 		var sim := Sim.new()
 		sim.setup(i * 13 + 5)
+		var ap := AutoPlayer.new(policy, i)
 		var guard := 0
 		while not sim.finished and guard < 100:
 			guard += 1
@@ -47,17 +49,15 @@ func _init() -> void:
 					if on > 0:
 						idle_people += float(idle) / on
 						idle_samples += 1
-				while not sim.radio_queue.is_empty():
-					var ev := sim.pop_radio()
-					sim.resolve(ev, _pick(sim, ev))
+				ap.step(sim)
 			# 이번 교대 무전 시각
 			var ts: Array = []
 			for h in sim.history.slice(n0):
-				if h["what"] == "radio" and h["day"] == sim.day and h["shift"] == sim.shift:
+				if h["what"] in ["radio", "alert"] and h["day"] == sim.day and h["shift"] == sim.shift:
 					if h["kind"] in ["result"]:
 						continue
 					ts.append(h["t"])
-					var key: String = h["kind"]
+					var key: String = h["what"] + ":" + str(h["kind"])
 					kinds[key] = kinds.get(key, 0) + 1
 					var hr: int = h["t"] / 60
 					var hk := "%s%02d" % [sim.shift, hr]
@@ -77,6 +77,8 @@ func _init() -> void:
 				prev = x
 			max_gap[sim.shift].append(mg)
 			var ws := sim.advance_to_next_shift()
+			if sim.finished:
+				memos += sim.story.memos_found.size()
 			if sim.shift == "day":
 				money_by_day[sim.day - 1] = money_by_day.get(sim.day - 1, 0.0) + sim.money
 				research_day[sim.day - 1] = research_day.get(sim.day - 1, 0.0) + sim.research["extra"] + sim.research["pressure"]
@@ -105,6 +107,7 @@ func _init() -> void:
 	for k in arrive:
 		var a: Array = arrive[k]
 		print("보낸 사람 도착 %s: %d번 중 제때 %d번" % [k, a[0], a[1]])
+	print("메모 판당 %.1f · 걱정거리 확인 생략" % (memos / n))
 	print("근무 중 일 안 하는 사람 비율: %.0f%%" % (idle_people / maxi(1, idle_samples) * 100.0))
 	var line2 := "날짜별 예산: "
 	var line3 := "날짜별 연구 단계 합: "

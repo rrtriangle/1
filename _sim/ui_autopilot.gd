@@ -40,6 +40,8 @@ func _tick() -> void:
 		print("%d일차 · 예산 %d · 기록 %d" % [main.sim.day, main.sim.money, main.sim.records])
 	if frames % 3 != 0:
 		return
+	if main.paused and not main.modal.visible and main.phase == "shift":
+		main.paused = false
 	if main.modal.visible:
 		var buttons: Array = []
 		_collect(main.modal_box, buttons)

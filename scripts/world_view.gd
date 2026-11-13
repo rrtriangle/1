@@ -11,6 +11,8 @@ const SUIT := Color(0.32, 0.36, 0.42)
 var sim: Sim
 var font: Font
 var selected: Person = null
+var build_item := ""        # 설비 놓기 모드
+var toasts: Array = []      # 맵 위쪽에 잠깐 뜨는 작은 알림
 var focus_room := ""
 var focus_until := 0.0
 var popups: Array = []      # [{text, pos, col, life}]
@@ -34,6 +36,12 @@ func add_popup(text: String, room: String, col: Color) -> void:
 	popups.append({"text": text, "pos": p, "col": col, "life": 3.0})
 
 
+func add_toast(text: String, tone: String) -> void:
+	toasts.append({"text": text, "tone": tone, "life": 7.0})
+	if toasts.size() > 4:
+		toasts.pop_front()
+
+
 func focus(room: String) -> void:
 	if room == "" or not Defs.ROOMS.has(room):
 		return
@@ -43,6 +51,10 @@ func focus(room: String) -> void:
 
 func _process(delta: float) -> void:
 	clock += delta
+	for q in toasts.duplicate():
+		q["life"] -= delta
+		if q["life"] <= 0.0:
+			toasts.erase(q)
 	for q in popups.duplicate():
 		q["life"] -= delta
 		q["pos"].y -= delta * 14.0
@@ -84,14 +96,14 @@ func _draw() -> void:
 			var i: int = counts.get(p.room, 0)
 			counts[p.room] = i + 1
 			pos = _slot(p.room, i)
-			if not sim.lit[p.room] and not sim.owned.has("cctv"):
+			if not sim.lit[p.room] and not sim.has_equip("cam", p.room):
 				# 불 꺼진 방은 안이 보이지 않는다 (CCTV가 있으면 흑백으로 보인다)
 				_person_spots.append([pos, p])
 				continue
 		_draw_person(pos, p)
 		_person_spots.append([pos, p])
 	# '한 명 더': 불이 켜져 있으면 사람이 하나 더 보인다 (이름표가 없다)
-	if sim.entity_room != "" and (sim.lit[sim.entity_room] or sim.owned.has("cctv")):
+	if sim.entity_room != "" and (sim.lit[sim.entity_room] or sim.has_equip("cam", sim.entity_room)):
 		var i2: int = counts.get(sim.entity_room, 0)
 		var ep := _slot(sim.entity_room, i2)
 		var ppl := sim.in_room(sim.entity_room)
@@ -101,6 +113,15 @@ func _draw() -> void:
 	var gp := Defs.room_center("gate") + Vector2(-70, 10)
 	_draw_figure(gp, Color(0.25, 0.25, 0.3), 0, false, Color(0.2, 0.22, 0.35))
 	_text(gp + Vector2(-14, 26), "박 씨", 11, Color(0.75, 0.75, 0.85))
+	# 작은 알림
+	var ty := 8.0
+	for q in toasts:
+		var a2: float = clampf(q["life"], 0.0, 1.0)
+		var tcol := Color(1.0, 0.8, 0.5, a2) if q["tone"] != "good" else Color(0.6, 1.0, 0.65, a2)
+		var tw := minf(font.get_string_size(q["text"], HORIZONTAL_ALIGNMENT_LEFT, -1, 16).x, Defs.MAP_SIZE.x - 40)
+		draw_rect(Rect2(Vector2(Defs.MAP_SIZE.x / 2 - tw / 2 - 10, ty), Vector2(tw + 20, 26)), Color(0, 0, 0, 0.7 * a2))
+		_text(Vector2(Defs.MAP_SIZE.x / 2 - tw / 2, ty + 19), q["text"], 16, tcol, Defs.MAP_SIZE.x - 40)
+		ty += 30.0
 	# 팝업
 	for q in popups:
 		var a: float = clampf(q["life"], 0.0, 1.0)
@@ -155,8 +176,23 @@ func _draw_room(id: String, night: bool) -> void:
 		draw_rect(Rect2(br.position, Vector2(br.size.x * k, br.size.y)), col)
 		if c["kind"] == "pressure":
 			_text(br.position + Vector2(0, 24), "역압! %d분 남음" % c["left"], 15, col)
-	if sim.entity_room == id and (sim.research["extra"] >= 1 or sim.owned.has("cctv")):
+	if sim.entity_room == id and (sim.research["extra"] >= 1 or sim.has_equip("cam", id)):
 		_text(r.position + Vector2(10, 64), "인원 불일치", 15, Color(1.0, 0.4, 0.4))
+	# 설비 표시
+	var tags: Array = []
+	for item in Defs.EQUIP:
+		if sim.has_equip(item, id):
+			tags.append(Defs.EQUIP[item]["name"])
+	if not tags.is_empty():
+		_text(r.position + Vector2(8, r.size.y - 8), " · ".join(tags), 12, Color(0.6, 0.85, 1.0), r.size.x - 12)
+	if sim.door_open.has(id):
+		_text(r.position + Vector2(r.size.x - 92, 22), "비상문 열림", 14, Color(1.0, 0.5, 0.4))
+		draw_line(Vector2(r.end.x - 4, r.position.y + 30), Vector2(r.end.x - 4, r.position.y + 70), Color(1.0, 0.4, 0.3), 4.0)
+	if build_item != "":
+		if Defs.EQUIP[build_item]["rooms"].has(id) and not sim.has_equip(build_item, id):
+			draw_rect(r.grow(2), Color(0.5, 0.9, 1.0, 0.5 + 0.3 * sin(clock * 5.0)), false, 3.0)
+		else:
+			draw_rect(r, Color(0, 0, 0, 0.35))
 	# 안내 강조
 	if focus_room == id and clock < focus_until:
 		var a := 0.5 + 0.5 * sin(clock * 6.0)
@@ -313,6 +349,11 @@ func _gui_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion:
 		hover_room = room_at(event.position)
 	if event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
+		if build_item != "":
+			var bid := room_at(event.position)
+			if bid != "":
+				room_clicked.emit(bid)
+			return
 		for spot in _person_spots:
 			if spot[0].distance_to(event.position) < 14.0:
 				person_clicked.emit(spot[1])
@@ -321,6 +362,7 @@ func _gui_input(event: InputEvent) -> void:
 		if id != "":
 			room_clicked.emit(id)
 	if event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_RIGHT:
+		build_item = ""
 		person_clicked.emit(null)
 
 

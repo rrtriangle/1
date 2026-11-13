@@ -36,6 +36,10 @@ var extra_shifts := 0     # 대타로 더 일한 횟수
 var patrol_i := 0
 var patrol_wait := 0
 var contam_k := 1.0       # 보호구가 있으면 오염이 덜 쌓인다
+var trust := 50.0         # 반장: 공장장을 얼마나 믿나. 지시를 따를 확률·위기 대응에 영향
+var thoughts: Array = []  # 최근 스트레스·오염의 원인 [{why, v, kind}]
+var relations := {}
+var task := ""             # 처리하러 간 방. 끝나면 자기 자리로 돌아간다       # 다른 사람 이름 → "사수"/"부사수"/"동기"/"앙숙"
 
 
 func _init(d: Dictionary) -> void:
@@ -87,17 +91,56 @@ func post_room() -> String:
 	return post
 
 
-func add_stress(v: float) -> void:
+func add_stress(v: float, why: String = "") -> void:
 	var k := 1.5 - nerve / 100.0
 	if has_trait("신입") or has_trait("예민함"):
 		k += 0.2
 	if has_trait("고집불통"):
 		k -= 0.2
-	stress = clampf(stress + v * k if v > 0 else stress + v, 0.0, 150.0)
+	var dv := v * k if v > 0 else v
+	stress = clampf(stress + dv, 0.0, 150.0)
+	_think(why, dv, "스트레스")
 
 
-func add_contam(v: float) -> void:
-	contam = clampf(contam + (v * contam_k if v > 0 else v), 0.0, 100.0)
+func add_contam(v: float, why: String = "") -> void:
+	var dv := v * contam_k if v > 0 else v
+	contam = clampf(contam + dv, 0.0, 100.0)
+	_think(why, dv, "오염")
+
+
+## 원인을 기억한다. 같은 원인은 합친다. 최근 8개.
+func _think(why: String, dv: float, kind: String) -> void:
+	if why == "" or absf(dv) < 0.5:
+		return
+	for th in thoughts:
+		if th["why"] == why and th["kind"] == kind:
+			th["v"] += dv
+			thoughts.erase(th)
+			thoughts.append(th)
+			return
+	thoughts.append({"why": why, "v": dv, "kind": kind})
+	if thoughts.size() > 8:
+		thoughts.pop_front()
+
+
+func top_reason() -> String:
+	var best := ""
+	var bv := 0.0
+	for th in thoughts:
+		if th["kind"] == "스트레스" and th["v"] > bv:
+			bv = th["v"]
+			best = th["why"]
+	return best if best != "" else "쌓인 피로"
+
+
+func thoughts_text() -> String:
+	if thoughts.is_empty():
+		return "최근 특별한 일 없음"
+	var lines: Array = []
+	for i in range(thoughts.size() - 1, -1, -1):
+		var th: Dictionary = thoughts[i]
+		lines.append("%s %+d  %s" % [th["kind"], int(round(th["v"])), th["why"]])
+	return "\n".join(lines)
 
 
 func status_text(now: int) -> String:

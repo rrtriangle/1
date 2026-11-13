@@ -50,8 +50,14 @@ func _tick() -> void:
 	if wait < 20:
 		return
 	wait = 0
+	if main.paused and not main.modal.visible and main.phase == "shift":
+		main.paused = false
 	match step:
 		0:
+			_shot("opening")
+			_press_first_choice()
+			step = 11
+		11:
 			_shot("meeting_day1")
 			main._start_shift()
 			step = 1
@@ -116,10 +122,10 @@ func _tick() -> void:
 					shot_done["errand"] = true
 					Engine.time_scale = 1.0
 					_shot("radio_errand")
-				if k == "extra" and not shot_done.has("extra"):
+				if k == "" and main.sim.entity_room != "" and main.sim.entity_reported and not shot_done.has("extra"):
 					shot_done["extra"] = true
 					Engine.time_scale = 1.0
-					_shot("radio_extra")
+					_shot("alert_extra")
 					_press_first_choice()
 					step = 9
 					return

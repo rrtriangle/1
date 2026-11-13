@@ -50,7 +50,15 @@ func _ready() -> void:
 	_build_ui()
 	sim.popup.connect(world.add_popup)
 	sim.highlight.connect(world.focus)
-	_open_meeting()
+	_opening()
+
+
+## 시작: 왜 이 공장에 왔는가
+func _opening() -> void:
+	_open_modal(820, 0)
+	_rich(modal_box, Story.OPENING, 19)
+	_button(modal_box, "공장으로 간다", _open_meeting).custom_minimum_size = Vector2(300, 44)
+	_fit_modal(820)
 
 
 func _process(delta: float) -> void:
@@ -61,10 +69,33 @@ func _process(delta: float) -> void:
 	if phase != "shift" or paused or radio_open or modal.visible:
 		return
 	sim.advance(delta * speed * 60.0 / Defs.HOUR_SEC)
+	while not sim.alerts.is_empty():
+		var a := sim.pop_alert()
+		if a["pause"]:
+			_show_alert(a)
+			return
+		world.add_toast(a["speaker"] + ": " + a["text"].split("\n")[0], a["tone"])
 	if not sim.radio_queue.is_empty():
 		_show_radio(sim.pop_radio())
 	elif sim.shift_done:
 		_on_shift_done()
+
+
+## 큰 일: 시간이 멈추고 알림을 띄운다. 닫아도 멈춘 채로 지시할 수 있다 (스페이스로 계속).
+func _show_alert(a: Dictionary) -> void:
+	paused = true
+	radio_open = true
+	world.focus(a["room"])
+	_open_modal(760, 0)
+	_label(modal_box, "%s · %s" % [a["clock"], a["speaker"]], 18, Color(1.0, 0.55, 0.5) if a["tone"] == "danger" else Color(1.0, 0.8, 0.5))
+	_label(modal_box, a["text"], 19, TEXT)
+	_sep(modal_box)
+	_label(modal_box, "시간이 멈춰 있다. 멈춘 채로 사람을 보내고, 준비되면 스페이스(또는 위 1x)로 계속한다.", 14, DIM)
+	var b := _button(modal_box, "확인", func() -> void:
+		_close_modal()
+		radio_open = false)
+	b.custom_minimum_size = Vector2(200, 40)
+	_fit_modal(760)
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -157,14 +188,14 @@ func _build_ui() -> void:
 	world.person_clicked.connect(_on_person_pressed)
 	ui.add_child(world)
 	var rate_row := HBoxContainer.new()
-	rate_row.position = Vector2(378, 990)
+	rate_row.position = Vector2(378, 988)
 	rate_row.size = Vector2(1140, 30)
 	ui.add_child(rate_row)
 	var rlab := Label.new()
 	rlab.text = "반응기 가동률"
 	rate_row.add_child(rlab)
 	live_rate = HSlider.new()
-	live_rate.min_value = 60
+	live_rate.min_value = 0
 	live_rate.max_value = 120
 	live_rate.step = 5
 	live_rate.value = sim.rate
@@ -177,10 +208,41 @@ func _build_ui() -> void:
 	live_rate_label = Label.new()
 	live_rate_label.add_theme_font_size_override("font_size", 15)
 	live_rate_label.text = _rate_text(sim.rate)
+	live_rate_label.custom_minimum_size = Vector2(620, 0)
 	rate_row.add_child(live_rate_label)
+	var hc := Button.new()
+	hc.text = "인원 점검"
+	hc.focus_mode = Control.FOCUS_NONE
+	hc.tooltip_text = "반장이 무전으로 점호한다. '한 명 더'가 있으면 대답이 하나 많다 (2시간에 한 번)"
+	hc.pressed.connect(func() -> void:
+		if phase != "shift":
+			return
+		var r := sim.headcount()
+		_log("[color=#9cf]인원 점검:[/color] " + r["text"].replace("\n", " "))
+		world.add_toast(r["text"].split("\n")[0], "good" if r["tone"] == "good" else "warn"))
+	rate_row.add_child(hc)
+	var eq_row := HBoxContainer.new()
+	eq_row.position = Vector2(378, 1020)
+	eq_row.size = Vector2(1140, 30)
+	ui.add_child(eq_row)
+	var el := Label.new()
+	el.text = "설비 놓기:"
+	el.add_theme_color_override("font_color", DIM)
+	eq_row.add_child(el)
+	for item in Defs.EQUIP:
+		var d: Dictionary = Defs.EQUIP[item]
+		var eb := Button.new()
+		eb.text = "%s %d" % [d["name"], d["cost"]]
+		eb.focus_mode = Control.FOCUS_NONE
+		eb.add_theme_font_size_override("font_size", 14)
+		eb.tooltip_text = "%s\n놓을 수 있는 곳: %s" % [d["what"], ", ".join(d["rooms"].map(func(r: String) -> String: return Defs.ROOMS[r]["name"]))]
+		eb.pressed.connect(func() -> void:
+			world.selected = null
+			world.build_item = "" if world.build_item == item else item)
+		eq_row.add_child(eb)
 	hint_label = Label.new()
-	hint_label.position = Vector2(378, 1028)
-	hint_label.size = Vector2(1140, 50)
+	hint_label.position = Vector2(378, 1054)
+	hint_label.size = Vector2(1140, 26)
 	hint_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	hint_label.add_theme_color_override("font_color", DIM)
 	hint_label.add_theme_font_size_override("font_size", 15)
@@ -203,6 +265,11 @@ func _build_ui() -> void:
 	notebook_label.add_theme_font_size_override("normal_font_size", 15)
 	notebook_label.add_theme_font_size_override("bold_font_size", 15)
 	right.add_child(notebook_label)
+	var mb := Button.new()
+	mb.text = "전임자 메모와 수수께끼 보기"
+	mb.focus_mode = Control.FOCUS_NONE
+	mb.pressed.connect(_show_memos)
+	right.add_child(mb)
 	var lg := Label.new()
 	lg.text = "무전·사건 기록"
 	lg.add_theme_font_size_override("font_size", 18)
@@ -333,7 +400,9 @@ func _refresh() -> void:
 	else:
 		speed_label.text = "회의 중"
 	notebook_label.text = "\n".join(sim.notebook())
-	if world.selected != null:
+	if world.build_item != "":
+		hint_label.text = "%s을(를) 놓을 방을 누른다 (밝게 표시된 방). 오른쪽 클릭으로 취소." % Defs.EQUIP[world.build_item]["name"]
+	elif world.selected != null:
 		hint_label.text = "%s 선택됨. 방을 누르면 그 방으로 보낸다 (불 꺼진 방이면 가서 켠다). 오른쪽 클릭이나 Esc로 취소." % world.selected.name
 	elif phase == "shift":
 		hint_label.text = "왼쪽 명단이나 맵에서 사람을 누른 뒤 방을 누르면 직접 지시. 쉬는 사람을 누르면 호출. 방 위에 마우스를 올리면 설명. 스페이스 멈춤 · 1·2·3 배속"
@@ -361,7 +430,9 @@ func _refresh_roster() -> void:
 		var where := person.status_text(now)
 		if person.injured_until_day > sim.day:
 			where = "부상 (%d일차까지 쉼)" % person.injured_until_day
-		b.text = "%s  %s\n   피로 %d · 스트레스 %d · 오염 %d%s" % [person.name, where, person.fatigue, person.stress, person.contam, st]
+		var tr := "  · 신뢰 %d" % person.trust if person.role == "반장" else ""
+		b.text = "%s  %s\n   피로 %d · 스트레스 %d · 오염 %d%s%s" % [person.name, where, person.fatigue, person.stress, person.contam, st, tr]
+		b.tooltip_text = _person_tip(person)
 		var on := person.on_site
 		b.modulate = Color(1, 1, 1) if on else Color(0.62, 0.62, 0.68)
 		if person == world.selected:
@@ -406,8 +477,39 @@ func _person_tip(p: Person) -> String:
 	var s := "%s (%d세, %s)\n숙련 %d · 관찰 %d · 담력 %d" % [p.name, p.age, p.role, p.skill, p.observe, p.nerve]
 	for t in p.traits:
 		s += "\n%s: %s" % [t, Defs.TRAIT_INFO.get(t, "")]
-	s += "\n\n피로 70 이상: 능력 −20%\n스트레스 100: 붕괴 (그 교대 일 못 함)\n오염: 25 다크서클 · 50 초점 없는 눈 · 75 검은 무늬 · 100 변이"
+	if p.role == "반장":
+		s += "\n공장장에 대한 신뢰 %d (30 미만이면 조원들이 지시를 잘 안 따른다. 대응 성공률 %+d%%p)" % [p.trust, (p.trust - 50.0) * 0.2]
+	if not p.relations.is_empty():
+		var rels: Array = []
+		for k in p.relations:
+			rels.append("%s %s" % [p.relations[k], k])
+		s += "\n관계: " + ", ".join(rels)
+	s += "\n\n[최근 일]\n" + p.thoughts_text()
+	s += "\n\n피로 70 이상: 능력 −20%  ·  스트레스 100: 붕괴\n오염: 25 다크서클 · 50 초점 없는 눈 · 75 검은 무늬 · 100 변이"
 	return s
+
+
+func _show_memos() -> void:
+	if phase != "shift" or radio_open:
+		return
+	paused = true
+	radio_open = true
+	_open_modal(820, 0)
+	_label(modal_box, "전임자 메모 %d/%d" % [sim.story.memos_found.size(), Story.MEMOS.size()], 22, Color(0.95, 0.85, 0.55))
+	for id in sim.story.memos_found:
+		var m: Dictionary = Story.MEMOS[id]
+		_label(modal_box, "[%s]" % m["title"], 16, DIM)
+		_label(modal_box, m["text"], 17, TEXT)
+	if sim.story.memos_found.is_empty():
+		_label(modal_box, "아직 찾은 메모가 없다.", 16, DIM)
+	_sep(modal_box)
+	_label(modal_box, "아직 모르는 것", 20, Color(0.7, 0.8, 0.95))
+	_label(modal_box, "· " + "\n· ".join(sim.story.open_questions()), 17, TEXT)
+	_button(modal_box, "닫기", func() -> void:
+		_close_modal()
+		radio_open = false
+		paused = false)
+	_fit_modal(820)
 
 
 func _log(text: String) -> void:
@@ -466,10 +568,22 @@ func _on_person_pressed(p: Person) -> void:
 	var row := HBoxContainer.new()
 	modal_box.add_child(row)
 	var post := "patrol" if sim.is_night() else "assist"
-	_button(row, "부른다 (%s)" % Defs.POST_NAMES[post], func() -> void:
-		sim._call_in(p, "공장장 지시", Defs.CALL_TRAVEL_MIN, post)
-		_close_modal()
-		paused = false)
+	if p.role == "정비원":
+		post = "maint"
+	var dests: Array = [post]
+	if sim._has_crisis("pressure"):
+		dests.push_front("reactor")
+	if sim.entity_room != "" and sim.entity_reported:
+		dests.push_front(sim.entity_room)
+	for id in sim.lit:
+		if not sim.lit[id] and not dests.has(id):
+			dests.append(id)
+	for dst in dests.slice(0, 4):
+		var label: String = Defs.POST_NAMES.get(dst, Defs.ROOMS.get(dst, {"name": dst})["name"])
+		_button(row, "부른다 → %s" % label, func() -> void:
+			sim._call_in(p, "공장장 지시", Defs.CALL_TRAVEL_MIN, dst)
+			_close_modal()
+			paused = false)
 	_button(row, "그만둔다", func() -> void:
 		_close_modal()
 		paused = false)
@@ -478,6 +592,13 @@ func _on_person_pressed(p: Person) -> void:
 
 func _on_room_clicked(id: String) -> void:
 	if phase != "shift" or radio_open:
+		return
+	if world.build_item != "":
+		var err := sim.install(world.build_item, id)
+		if err != "":
+			_log("[color=#f96]%s[/color]" % err)
+		else:
+			world.build_item = ""
 		return
 	if world.selected == null:
 		return
@@ -594,6 +715,9 @@ func _week_screen(week: Dictionary) -> void:
 		_label(modal_box, "흑자. 본사는 조용하다.", 20, TONE_COL["good"])
 	else:
 		_label(modal_box, "적자. 원래는 다음 주에 본사 감사관이 온다. (감사는 v0.7에서 다시 만든다. 이번 데모에서는 오지 않는다)", 20, TONE_COL["bad"])
+	if week.has("goal"):
+		var g: Dictionary = week["goal"]
+		_label(modal_box, g["text"], 20, TONE_COL["good"] if g["ok"] else TONE_COL["bad"])
 	if week["violations"] > 0:
 		_label(modal_box, "근무표 위반 기록 %d건: 대타(붙잡기·호출)를 쓸 때마다 남는다. 감사가 오면 이 장부를 본다." % week["violations"], 17, DIM)
 	sfx.play("week")
@@ -602,9 +726,12 @@ func _week_screen(week: Dictionary) -> void:
 
 func _end_screen(week: Dictionary) -> void:
 	phase = "over"
-	_open_modal(900, 700)
-	_label(modal_box, "데모 v0.6 끝 (%d일)" % Defs.DEMO_LAST_DAY, 30, Color(0.95, 0.85, 0.55))
+	_open_modal(900, 900)
+	_label(modal_box, sim.story.ending_text(), 21, Color(0.9, 0.88, 0.95))
+	_sep(modal_box)
+	_label(modal_box, "데모 v0.7 끝 (%d일)" % Defs.DEMO_LAST_DAY, 26, Color(0.95, 0.85, 0.55))
 	var lines: Array = []
+	lines.append("전임자 메모 %d/%d" % [sim.story.memos_found.size(), Story.MEMOS.size()])
 	lines.append("예산 %s (시작 %s)" % [_money(sim.money), _money(Defs.START_MONEY)])
 	if not week.is_empty():
 		lines.append("마지막 주 손익 %s" % _money(week["profit"]))
@@ -633,6 +760,11 @@ func _open_meeting() -> void:
 	if tip != "":
 		var tl := _label(modal_box, tip, 17, Color(0.95, 0.85, 0.55))
 		tl.add_theme_color_override("font_color", Color(0.95, 0.85, 0.55))
+	var worries: Array = sim.story.worries(d, sh, sim.default_posts(c, sh))
+	if not worries.is_empty():
+		_sep(modal_box)
+		_label(modal_box, "오늘 %s 걱정거리" % ("밤" if sh == "night" else "낮"), 20, Color(1.0, 0.7, 0.55))
+		_label(modal_box, "· " + "\n· ".join(worries), 16, TEXT)
 
 	# 지난 교대 보고서
 	if not last_report.is_empty():
@@ -777,12 +909,13 @@ func _meeting_substitutes(c: int) -> void:
 func _fill_shop(box: VBoxContainer) -> void:
 	for c in box.get_children():
 		c.queue_free()
-	for item in ["cctv", "chair", "party"]:
+	_label(box, "방에 놓는 설비(비상 조명, CCTV, 난로, 잠금장치…)는 근무 중 화면 아래 '설비 놓기'에서 고른다.", 15, DIM)
+	for item in ["party"]:
 		var d: Dictionary = Defs.SHOP[item]
 		var row := HBoxContainer.new()
 		box.add_child(row)
 		var owned_txt := ""
-		if item != "party" and sim.owned.has(item):
+		if item != "party" and sim.owned.has(item):  # 회의에서 사는 것 (지금은 회식뿐)
 			owned_txt = " (있음)"
 		elif item == "party" and not sim.can_buy("party") and sim.money >= d["cost"]:
 			owned_txt = " (이번 주 함)"
@@ -791,15 +924,7 @@ func _fill_shop(box: VBoxContainer) -> void:
 			_fill_shop(box), not sim.can_buy(item))
 		b.custom_minimum_size = Vector2(300, 0)
 		_label(row, d["what"], 15, DIM).custom_minimum_size = Vector2(760, 0)
-	var row2 := HBoxContainer.new()
-	box.add_child(row2)
-	_label(row2, "비상 조명 −%d (방마다):" % Defs.SHOP["em"]["cost"], 16).custom_minimum_size = Vector2(220, 0)
-	for id in Defs.EM_ROOMS:
-		var has: bool = sim.owned.has("em_" + id)
-		_button(row2, Defs.ROOMS[id]["name"] + (" ✓" if has else ""), func() -> void:
-			sim.buy("em", id)
-			_fill_shop(box), not sim.can_buy("em", id))
-	_label(box, "      " + Defs.SHOP["em"]["what"], 15, DIM)
+
 
 
 func _open_meeting_keep() -> void:
@@ -807,6 +932,8 @@ func _open_meeting_keep() -> void:
 
 
 func _rate_text(v: int) -> String:
+	if v == 0:
+		return "0% · 정지: 생산 없음. 역압이 진행 중이면 15분 뒤 안전하게 멈춘다"
 	var s := "%d%%" % v
 	if v <= 80:
 		s += "  · 안전 (역압 없음)"

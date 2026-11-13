@@ -29,6 +29,7 @@ func _run_policy(pol: String) -> void:
 	for i in runs:
 		var sim := Sim.new()
 		sim.setup(i * 7 + 1)
+		var ap := AutoPlayer.new(pol, i)
 		var day_r := 0
 		var night_r := 0
 		var day_n := 0
@@ -42,9 +43,7 @@ func _run_policy(pol: String) -> void:
 			while not sim.shift_done and steps < 20000:
 				steps += 1
 				sim.advance(1.0)
-				while not sim.radio_queue.is_empty():
-					var ev := sim.pop_radio()
-					sim.resolve(ev, _pick(sim, ev, pol))
+				ap.step(sim)
 			if sim.is_night():
 				night_r += sim.radio_count
 				night_n += 1
